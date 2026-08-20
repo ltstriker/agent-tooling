@@ -27,6 +27,19 @@ declared_repo="$(jq -er '.repository | select(type == "string" and length > 0)' 
   printf 'agent-tooling: repository must be a non-empty string in %s\n' "$profile_file" >&2
   exit 1
 }
+
+tooling_repo="$(jq -er '.tooling.repository | select(type == "string" and length > 0)' "$profile_file")" || {
+  printf 'agent-tooling: tooling.repository must be a non-empty string in %s\n' "$profile_file" >&2
+  exit 1
+}
+tooling_sha="$(jq -er '.tooling.sha | select(test("^[0-9a-f]{40}$"))' "$profile_file")" || {
+  printf 'agent-tooling: tooling.sha must be a full lowercase commit SHA in %s\n' "$profile_file" >&2
+  exit 1
+}
+[[ "$tooling_repo" == "boxlite-ai/agent-tooling" ]] || {
+  printf 'agent-tooling: unsupported tooling repository: %s\n' "$tooling_repo" >&2
+  exit 1
+}
 [[ "$declared_repo" == "$expected_repo" ]] || {
   printf 'agent-tooling: profile %s expects %s, got %s\n' "$profile" "$expected_repo" "$declared_repo" >&2
   exit 1
@@ -45,6 +58,32 @@ jq -e '
   all(.checks[]; (.name | type == "string" and length > 0) and (.command | type == "string" and length > 0))
 ' "$profile_file" >/dev/null || {
   printf 'agent-tooling: checks must be a non-empty array of name/command objects in %s\n' "$profile_file" >&2
+  exit 1
+}
+
+for settings_file in "$repo_root/.claude/settings.json" "$repo_root/.github/copilot/settings.json"; do
+  [[ -r "$settings_file" ]] || { printf 'agent-tooling: missing activation settings: %s\n' "$settings_file" >&2; exit 1; }
+  jq -e --arg sha "$tooling_sha" '
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.repo == "boxlite-ai/agent-tooling" and
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.ref == $sha and
+    .enabledPlugins["boxlite-agent-tooling@boxlite-agent-tooling"] == true
+  ' "$settings_file" >/dev/null || {
+    printf 'agent-tooling: activation settings do not match the pinned tooling revision: %s\n' "$settings_file" >&2
+    exit 1
+  }
+done
+
+codex_marketplace="$repo_root/.agents/plugins/marketplace.json"
+[[ -r "$codex_marketplace" ]] || { printf 'agent-tooling: missing Codex marketplace: %s\n' "$codex_marketplace" >&2; exit 1; }
+jq -e --arg sha "$tooling_sha" '
+  any(.plugins[];
+    .name == "boxlite-agent-tooling" and
+    .source.url == "https://github.com/boxlite-ai/agent-tooling.git" and
+    .source.sha == $sha and
+    .source.path == "./plugins/boxlite-agent-tooling" and
+    .policy.installation == "INSTALLED_BY_DEFAULT")
+' "$codex_marketplace" >/dev/null || {
+  printf 'agent-tooling: Codex marketplace does not match the pinned tooling revision: %s\n' "$codex_marketplace" >&2
   exit 1
 }
 
