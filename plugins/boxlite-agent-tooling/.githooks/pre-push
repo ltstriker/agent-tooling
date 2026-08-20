@@ -14,6 +14,16 @@ is_agent=0
 repo_root="$(git rev-parse --show-toplevel)"
 tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+verify_installation="$tooling_root/scripts/verify-installation.sh"
+[[ -x "$verify_installation" ]] || {
+  printf 'agent-tooling: installation verifier is unavailable; run ./.agent-tooling/install.sh\n' >&2
+  exit 1
+}
+"$verify_installation" "$repo_root" || {
+  printf 'agent-tooling: run ./.agent-tooling/install.sh before pushing\n' >&2
+  exit 1
+}
+
 # Resolve the delegated gate. A worktree checked out at a pre-migration commit
 # has no .agents/hooks/, yet it can still be THIS hook that runs. `make setup`
 # sets core.hooksPath RELATIVE, where each worktree uses its own copy and this

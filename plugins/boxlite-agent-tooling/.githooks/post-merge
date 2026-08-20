@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+"$tooling_root/scripts/sync-installation.sh" || true
+
+chained="$(git rev-parse --git-common-dir)/hooks/post-merge"
+if [[ -x "$chained" && "$(realpath "$chained" 2>/dev/null)" != "$(realpath "$0" 2>/dev/null)" ]]; then
+  "$chained" "$@"
+  exit $?
+fi
+exit 0

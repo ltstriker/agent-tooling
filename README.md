@@ -36,4 +36,7 @@ plugins/boxlite-agent-tooling/scripts/setup.sh /path/to/consumer
 Consumers copy `templates/install.sh` to `.agent-tooling/install.sh`. The
 bootstrap reads the consumer's pinned SHA, checks out that exact revision under
 the repository's common Git directory, validates the private profile, and then
-configures the shared Git hooks.
+configures worktree-local shared Git hooks. Run the bootstrap once for an
+ordinary clone. Later checkouts, merge-based pulls, rebases, and amended commits
+opportunistically install a changed pin; commits and pushes reject a stale
+installation until the bootstrap succeeds.
