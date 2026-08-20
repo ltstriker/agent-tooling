@@ -149,15 +149,16 @@ pre_push_command_for() {  # repo remote local_ref remote_ref
     "$remote" "$remote_url_hash" "$ref_updates_hash" "$pushed_diff_hash"
 }
 
-# Fixture repo with the real gate scripts copied in and hooksPath pointed at
-# its own .githooks (absolute, so hook execution is location-independent).
+# Fixture repo with the real gate scripts installed at the same pinned-cache
+# path used by consumers. A symlink keeps older assertions that address
+# $R/.githooks directly focused on that installed copy.
 setup() {
-  local d; d="$(mktemp -d)"
+  local d head plugin scratch checkout
+  d="$(mktemp -d)"
   git -C "$d" init -q
   git -C "$d" config user.email t@t.test
   git -C "$d" config user.name tester
-  mkdir -p "$d/.githooks" "$d/.agents/hooks" "$d/.agents/state"
-  cp "$REPO_ROOT/.githooks/pre-commit" "$REPO_ROOT/.githooks/pre-push" "$REPO_ROOT/.githooks/commit-msg" "$d/.githooks/"
+  mkdir -p "$d/.agents/hooks" "$d/.agents/state"
   cp "$REPO_ROOT/.agents/hooks/preflight-commit-push.sh" \
      "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" \
      "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
@@ -165,7 +166,27 @@ setup() {
   printf 'x\n' > "$d/f"
   git -C "$d" add -A
   git -C "$d" commit -qm base
-  git -C "$d" config core.hooksPath "$d/.githooks"
+
+  scratch="$(mktemp -d)"
+  plugin="$scratch/plugins/boxlite-agent-tooling"
+  mkdir -p "$plugin"
+  cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$plugin/"
+  git -C "$scratch" init -q
+  git -C "$scratch" config user.email t@t.test
+  git -C "$scratch" config user.name tester
+  git -C "$scratch" add -A
+  git -C "$scratch" commit -qm tooling
+  head="$(git -C "$scratch" rev-parse HEAD)"
+  checkout="$d/.git/agent-tooling/$head"
+  mkdir -p "$(dirname "$checkout")"
+  mv "$scratch" "$checkout"
+  plugin="$checkout/plugins/boxlite-agent-tooling"
+  ln -s "$plugin/.githooks" "$d/.githooks"
+  mkdir -p "$d/.agent-tooling"
+  printf '{"tooling":{"sha":"%s"}}\n' "$head" > "$d/.agent-tooling/profile.json"
+  printf '/.agent-tooling/\n' >> "$d/.git/info/exclude"
+  git -C "$d" config extensions.worktreeConfig true
+  git -C "$d" config --worktree core.hooksPath "$plugin/.githooks"
   printf '%s' "$d"
 }
 
@@ -902,7 +923,7 @@ check_eq "hooksPath set, delegate missing → fail closed (deny)" "$denied" "yes
 rm -rf "$R"
 
 # Without hooksPath, the PreToolUse layer gates as before (no regression).
-R="$(setup)"; git -C "$R" config --unset core.hooksPath
+R="$(setup)"; git -C "$R" config --worktree --unset core.hooksPath
 out="$(printf '{"tool_input":{"command":"git commit -m x"}}' \
       | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$R/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
 printf '%s' "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 && denied=yes || denied=no
@@ -982,7 +1003,7 @@ install_probe() {  # dir -> the configured value, or empty
   local dir="$1"
   [ -n "$dir" ] || { printf 'install_probe: empty target refused\n' >&2; return 1; }
   "$REPO_ROOT/scripts/setup.sh" "$dir" >/dev/null 2>&1
-  git -C "$dir" config --local core.hooksPath
+  git -C "$dir" config --worktree --get core.hooksPath
 }
 
 INST="$(mktemp -d)"
@@ -1056,14 +1077,14 @@ check_eq "setup points core.hooksPath at the installed plugin" \
 # named .git skipped installation in every worktree; ask git instead.
 git -C "$INST" worktree add -q "$INST-wt" -b installer-wt
 mkdir -p "$INST-wt/.githooks"
-git -C "$INST" config --unset core.hooksPath
+git -C "$INST-wt" config --worktree --unset core.hooksPath
 wt_dot_git="dir"; [ -f "$INST-wt/.git" ] && wt_dot_git="file"
 check_eq "a linked worktree's .git is a file (the case the guard must survive)" \
   "$wt_dot_git" "file"
 check_eq "setup installs from inside a linked worktree" \
   "$(install_probe "$INST-wt")" "$EXPECTED_HOOKS"
 
-git -C "$INST" config --unset core.hooksPath
+git -C "$INST" config --worktree --unset core.hooksPath
 check_eq "a second setup run is idempotent" \
   "$(install_probe "$INST")" "$EXPECTED_HOOKS"
 

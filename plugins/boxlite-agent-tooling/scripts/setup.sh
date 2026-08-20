@@ -7,15 +7,16 @@ repo_root="${1:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 
 PLUGIN_ROOT="$plugin_root" "$plugin_root/scripts/validate-profile.sh" "$repo_root"
 
-for hook in pre-commit commit-msg pre-push; do
+for hook in pre-commit commit-msg pre-push post-checkout post-merge post-rewrite; do
   [[ -x "$plugin_root/.githooks/$hook" ]] || {
     printf 'agent-tooling: required Git hook is not executable: %s\n' "$plugin_root/.githooks/$hook" >&2
     exit 1
   }
 done
 
-git -C "$repo_root" config core.hooksPath "$plugin_root/.githooks"
-configured="$(git -C "$repo_root" config --get core.hooksPath || true)"
+git -C "$repo_root" config extensions.worktreeConfig true
+git -C "$repo_root" config --worktree core.hooksPath "$plugin_root/.githooks"
+configured="$(git -C "$repo_root" config --worktree --get core.hooksPath || true)"
 [[ "$configured" == "$plugin_root/.githooks" ]] || {
   printf 'agent-tooling: failed to configure core.hooksPath\n' >&2
   exit 1
