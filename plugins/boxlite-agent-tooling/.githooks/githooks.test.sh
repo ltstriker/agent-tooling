@@ -1035,6 +1035,14 @@ jq -n --arg sha "$tooling_sha" '{
     policy: {installation: "INSTALLED_BY_DEFAULT", authentication: "ON_INSTALL"}
   }]
 }' > "$INST/.agents/plugins/marketplace.json"
+printf '%s\n' \
+  '.agents/state/' \
+  '.claude/.last-audit.json' \
+  '.claude/.last-audit-handoff.json' \
+  '.claude/.last-verdict.json' \
+  '.claude/.pr-reviewed.json' \
+  '.claude/.verdict-last-uuid' \
+  '.claude/.verdict-decisions.log' > "$INST/.gitignore"
 git -C "$INST" add -A
 git -C "$INST" commit -qm base
 

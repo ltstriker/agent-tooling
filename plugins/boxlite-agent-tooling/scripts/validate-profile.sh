@@ -51,6 +51,26 @@ case "$origin" in
   *) printf 'agent-tooling: origin does not match profile repository %s: %s\n' "$expected_repo" "$origin" >&2; exit 1 ;;
 esac
 
+for state_path in \
+  .agents/state/last-audit.json \
+  .agents/state/last-verdict.json \
+  .agents/state/last-verdict.prev.json \
+  .agents/state/pr-reviewed.json \
+  .agents/state/verdict-last-uuid \
+  .agents/state/verdict-audit.lock \
+  .agents/state/verdict-decisions.log \
+  .claude/.last-audit.json \
+  .claude/.last-audit-handoff.json \
+  .claude/.last-verdict.json \
+  .claude/.pr-reviewed.json \
+  .claude/.verdict-last-uuid \
+  .claude/.verdict-decisions.log; do
+  git -C "$repo_root" check-ignore -q "$state_path" || {
+    printf 'agent-tooling: runtime state path must be gitignored: %s\n' "$state_path" >&2
+    exit 1
+  }
+done
+
 jq -e '
   .schemaVersion == 1 and
   (.checks | type == "array") and
