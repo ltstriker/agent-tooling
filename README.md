@@ -14,7 +14,8 @@ activation settings, a pinned commit SHA, and a private profile manifest.
 .claude-plugin/marketplace.json         Claude-compatible marketplace
 .github/plugin/marketplace.json         Copilot marketplace
 plugins/boxlite-agent-tooling/          Shared multi-host plugin
-profiles/catalog.json                   Public profile identities only
+plugins/boxlite-agent-tooling/profiles/catalog.json
+                                        Public profile identities only
 templates/install.sh                    Thin consumer bootstrap
 ```
 
