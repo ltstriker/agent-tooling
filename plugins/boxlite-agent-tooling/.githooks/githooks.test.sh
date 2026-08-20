@@ -1002,9 +1002,39 @@ esac
 git -C "$INST" init -q
 git -C "$INST" config user.email t@t.test
 git -C "$INST" config user.name tester
-mkdir -p "$INST/.githooks"
-mkdir -p "$INST/.agent-tooling"
-printf '%s\n' '{"schemaVersion":1,"profile":"boxlite","repository":"boxlite-ai/boxlite","checks":[{"name":"test","command":"make test"}]}' > "$INST/.agent-tooling/profile.json"
+mkdir -p "$INST/.githooks" "$INST/.agent-tooling" "$INST/.agents/plugins" \
+  "$INST/.claude" "$INST/.github/copilot"
+tooling_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+jq -n --arg sha "$tooling_sha" '{
+  schemaVersion: 1,
+  profile: "boxlite",
+  repository: "boxlite-ai/boxlite",
+  tooling: {repository: "boxlite-ai/agent-tooling", sha: $sha},
+  checks: [{name: "test", command: "make test"}]
+}' > "$INST/.agent-tooling/profile.json"
+jq -n --arg sha "$tooling_sha" '{
+  extraKnownMarketplaces: {
+    "boxlite-agent-tooling": {
+      source: {source: "github", repo: "boxlite-ai/agent-tooling", ref: $sha}
+    }
+  },
+  enabledPlugins: {"boxlite-agent-tooling@boxlite-agent-tooling": true}
+}' > "$INST/.claude/settings.json"
+cp "$INST/.claude/settings.json" "$INST/.github/copilot/settings.json"
+jq -n --arg sha "$tooling_sha" '{
+  name: "fixture",
+  interface: {displayName: "Fixture"},
+  plugins: [{
+    name: "boxlite-agent-tooling",
+    source: {
+      source: "git-subdir",
+      url: "https://github.com/boxlite-ai/agent-tooling.git",
+      path: "./plugins/boxlite-agent-tooling",
+      sha: $sha
+    },
+    policy: {installation: "INSTALLED_BY_DEFAULT", authentication: "ON_INSTALL"}
+  }]
+}' > "$INST/.agents/plugins/marketplace.json"
 git -C "$INST" add -A
 git -C "$INST" commit -qm base
 
