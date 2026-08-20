@@ -1,0 +1,12 @@
+{
+  "name": "boxlite-agent-tooling",
+  "version": "0.1.0",
+  "description": "Shared BoxLite coding-agent skills, auditors, hooks, and repository tooling.",
+  "author": {
+    "name": "BoxLite"
+  },
+  "homepage": "https://github.com/boxlite-ai/agent-tooling",
+  "repository": "https://github.com/boxlite-ai/agent-tooling",
+  "license": "Apache-2.0",
+  "keywords": ["agent-tooling", "boxlite", "codex", "claude", "copilot"]
+}

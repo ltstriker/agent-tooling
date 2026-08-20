@@ -1,0 +1,25 @@
+{
+  "name": "boxlite-agent-tooling",
+  "version": "0.1.0",
+  "description": "Shared BoxLite coding-agent skills, auditors, hooks, and repository tooling.",
+  "author": {
+    "name": "BoxLite"
+  },
+  "homepage": "https://github.com/boxlite-ai/agent-tooling",
+  "repository": "https://github.com/boxlite-ai/agent-tooling",
+  "license": "Apache-2.0",
+  "keywords": ["agent-tooling", "boxlite", "codex", "claude", "copilot"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "BoxLite Agent Tooling",
+    "shortDescription": "Shared agent workflows and repository gates.",
+    "longDescription": "Installs BoxLite skills, auditors, lifecycle hooks, Git gates, and PR watchers from one versioned source.",
+    "developerName": "BoxLite",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Use the repository agent profile for this task.",
+      "Run the required verification and audit gates."
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "boxlite-agent-tooling",
+  "owner": {
+    "name": "BoxLite"
+  },
+  "metadata": {
+    "description": "Shared coding-agent tooling for BoxLite repositories",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "boxlite-agent-tooling",
+      "description": "Shared BoxLite coding-agent skills, auditors, hooks, and repository tooling.",
+      "version": "0.1.0",
+      "source": "./plugins/boxlite-agent-tooling"
+    }
+  ]
+}
