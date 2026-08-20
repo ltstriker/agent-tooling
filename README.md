@@ -19,10 +19,6 @@ plugins/boxlite-agent-tooling/profiles/catalog.json
 templates/install.sh                    Thin consumer bootstrap
 ```
 
-Private Commerce and Backoffice commands remain in their private consumer
-profile manifests. This public repository contains no private deployment,
-authentication, or infrastructure configuration.
-
 ## Validate
 
 ```sh
