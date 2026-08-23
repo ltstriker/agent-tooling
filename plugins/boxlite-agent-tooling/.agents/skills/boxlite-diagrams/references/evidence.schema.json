@@ -92,6 +92,9 @@
                 "type": "array",
                 "minItems": 1,
                 "items": { "$ref": "#/$defs/membership" }
+              },
+              "scope": {
+                "enum": ["external", "edge", "compute", "execution", "state", "observability"]
               }
             }
           }

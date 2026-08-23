@@ -18,6 +18,8 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 from validate_diagrams import _write_report
 from validator.changes import _parse_diff
 
+SCOPE_COMPUTE_STYLES = "fill:#dcfce7,stroke:#16a34a,color:#1f2933"
+
 
 class DiagramValidatorTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -306,12 +308,84 @@ class DiagramValidatorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assert_check_failed(report, "mermaid.structure_security")
 
-    def test_fixed_mermaid_styling_is_rejected_for_adaptive_themes(self) -> None:
+    def test_non_palette_classdef_is_rejected(self) -> None:
         document, manifest = architecture_only_fixture(self.head)
         document = document.replace("flowchart LR", "flowchart LR\n  classDef fixed fill:#fff,color:#000")
         result, report = self.validate(document, manifest)
         self.assertEqual(result.returncode, 1)
         self.assert_check_failed(report, "mermaid.structure_security")
+
+    def test_altered_palette_classdef_is_rejected(self) -> None:
+        document, manifest = architecture_only_fixture(self.head)
+        document = document.replace(
+            "flowchart LR", "flowchart LR\n  classDef scope_state fill:#ffffff,stroke:#000000,color:#000000"
+        )
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "mermaid.structure_security")
+
+    def test_style_directive_is_rejected(self) -> None:
+        document, manifest = architecture_only_fixture(self.head)
+        document = document.replace("flowchart LR", "flowchart LR\n  style start fill:#fff")
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "mermaid.structure_security")
+
+    def test_scope_class_on_node_is_rejected(self) -> None:
+        document, manifest = contained_architecture_fixture(self.head)
+        document = document.replace(
+            "flowchart TB", f"flowchart TB\nclassDef scope_compute {SCOPE_COMPUTE_STYLES}", 1
+        )
+        document = document.replace(
+            'start start_load@-->|"load"| load',
+            'start start_load@-->|"load"| load\nclass start scope_compute',
+            1,
+        )
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "mermaid.structure_security")
+
+    def test_classdef_in_sequence_is_rejected(self) -> None:
+        document, manifest = overview_fixture(self.head)
+        document = document.replace(
+            "sequenceDiagram", f"sequenceDiagram\n  classDef scope_compute {SCOPE_COMPUTE_STYLES}", 1
+        )
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "mermaid.structure_security")
+
+    def test_valid_scope_zone_palette(self) -> None:
+        result, report = self.validate(*scoped_zone_fixture(self.head))
+        self.assertEqual(result.returncode, 0, result.stderr + json.dumps(report, indent=2))
+        self.assertTrue(report["valid"])
+
+    def test_zone_scope_mismatch_is_rejected(self) -> None:
+        document, manifest = scoped_zone_fixture(self.head)
+        manifest["boundaries"][1]["scope"] = "state"
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "consistency.cross_view")
+
+    def test_declared_scope_without_drawn_class_is_rejected(self) -> None:
+        document, manifest = contained_architecture_fixture(self.head)
+        manifest["boundaries"][1]["scope"] = "compute"
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "consistency.cross_view")
+
+    def test_drawn_scope_without_declared_scope_is_rejected(self) -> None:
+        document, manifest = scoped_zone_fixture(self.head)
+        del manifest["boundaries"][1]["scope"]
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "consistency.cross_view")
+
+    def test_invalid_boundary_scope_value_is_rejected(self) -> None:
+        document, manifest = contained_architecture_fixture(self.head)
+        manifest["boundaries"][1]["scope"] = "banana"
+        result, report = self.validate(document, manifest)
+        self.assertEqual(result.returncode, 1)
+        self.assert_check_failed(report, "manifest.shape")
 
     def test_malformed_html_comment_is_rejected(self) -> None:
         document, manifest = overview_fixture(self.head)
@@ -456,7 +530,7 @@ class DiagramValidatorTests(unittest.TestCase):
         for content in (contract, skill, evals):
             self.assertIn("← BUG:", content)
 
-    def test_cloud_architecture_contract_requires_real_containment_and_adaptive_theme(self) -> None:
+    def test_cloud_architecture_contract_requires_containment_zones_and_palette(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         composition = (SKILL_ROOT / "references" / "architecture-composition.md").read_text(encoding="utf-8")
         contract = (SKILL_ROOT / "references" / "output-contract.md").read_text(encoding="utf-8")
@@ -466,6 +540,7 @@ class DiagramValidatorTests(unittest.TestCase):
             self.assertIn("EC2", content)
             self.assertIn("embedded BoxLite", content)
             self.assertIn("light/dark", content)
+            self.assertIn("scope_", content)
 
     def test_proposed_behavior_without_issue_evidence_is_rejected(self) -> None:
         document, manifest = issue_fixture(self.head)
@@ -699,6 +774,20 @@ start start_load@-->|"load"| load
             ],
         ),
     ]
+    return document, data
+
+
+def scoped_zone_fixture(head: str) -> tuple[str, dict[str, object]]:
+    document, data = contained_architecture_fixture(head)
+    document = document.replace(
+        "flowchart TB", f"flowchart TB\nclassDef scope_compute {SCOPE_COMPUTE_STYLES}", 1
+    )
+    document = document.replace(
+        'start start_load@-->|"load"| load',
+        'start start_load@-->|"load"| load\nclass inner scope_compute',
+        1,
+    )
+    data["boundaries"][1]["scope"] = "compute"
     return document, data
 
 

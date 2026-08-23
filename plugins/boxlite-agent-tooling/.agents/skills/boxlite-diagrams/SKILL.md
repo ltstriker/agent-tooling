@@ -43,7 +43,8 @@ composition are separate gates: pass both.
 7. Create `diagram.md` and `evidence.json` in a temporary task directory. Add
    stable canonical IDs for nodes, edges, and architecture boundaries. Declare
    immediate boundary membership so containment is validated rather than
-   inferred from indentation.
+   inferred from indentation, and declare each zone's `scope` so its palette
+   color is validated rather than decorative.
 8. Run the bundled validator. On failure, read `validation.json`, correct the
    evidence or diagram, and retry. Stop after three failed attempts and return
    the report instead of an unverified diagram.
@@ -199,20 +200,29 @@ hop cites the base revision; an added hop cites the head revision.
 - Call graph uses one hop per line:
   `symbol (Type · path/file.ext:line) — role`.
 - Prefer `flowchart TB` for a whole cloud deployment and `LR` for a short path.
-- Use subgraphs only for real boundaries. Make each parent physically surround
-  its immediate members; nested and sibling boundaries must be visually
-  disjoint in the rendered image.
+- Use subgraphs for real boundaries and for scope zones. Make each parent
+  physically surround its immediate members; nested and sibling subgraphs must
+  be visually disjoint in the rendered image.
+- Keep related components together: assign every architecture node to exactly
+  one scope zone — external, edge, compute, execution, state, or
+  observability — keep each zone one contiguous region in the render, and
+  order zones along the main request path.
+- Color each zone with the fixed house palette: the exact
+  `classDef scope_<name>` line plus `class <zone_id> scope_<name>`, with the
+  same scope declared in `evidence.json.boundaries[].scope`. Purely physical
+  boundaries and individual nodes stay unstyled. The palette is self-contained
+  and remains legible on light/dark hosts.
 - Use short labels with domain, protocol, port, implementation, or constraint
   details only where they change understanding.
 - Use semantic shapes consistently: rounded actors, rectangles for services,
   cylinders for state, and a distinct VM/runtime shape.
-- Keep meaning in text. Color may reinforce it but never carry it.
-- Keep README Mermaid unstyled so its host controls light/dark rendering. Do
-  not set a theme, `classDef`, `class`, `style`, or `linkStyle`; exported PNGs
-  are static previews, not adaptive replacements.
+- Keep meaning in text. Color reinforces the zone title but never carries
+  meaning alone.
 - Mermaid is limited to `flowchart`/`graph` and `sequenceDiagram`.
 - `<br/>` is allowed for deliberate label wrapping. Initialization directives,
-  clicks, links, other raw HTML, and JavaScript are forbidden.
+  clicks, links, other raw HTML, JavaScript, `themeVariables`, `style`,
+  `linkStyle`, and any non-palette `classDef` or `class` are forbidden;
+  sequence diagrams take no styling at all.
 
 ## Validation command
 

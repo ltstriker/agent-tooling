@@ -4,14 +4,14 @@
     {
       "id": 1,
       "prompt": "Create the entire BoxLite cloud deployment architecture in apps/README.md and give me a rendered picture. There is already a good architecture in apps/infra/docs/deployment.md#architecture; use it as the standard. Do not change production source.",
-      "expected_output": "A validated, visually inspected architecture-only overview that starts from the canonical deployment diagram, preserves one deployment altitude, uses truthful nested boundaries, and includes the complete hosted-cloud boundary and main paths without redundant views. The execution hierarchy is Runner fleet → EC2 instance × N → Runner daemon → embedded BoxLite runtime → box microVMs, and the README Mermaid remains light/dark adaptive.",
+      "expected_output": "A validated, visually inspected architecture-only overview that starts from the canonical deployment diagram, preserves one deployment altitude, uses truthful nested boundaries, groups related components into contiguous scope zones colored with the house palette, and includes the complete hosted-cloud boundary and main paths without redundant views. The execution hierarchy is Runner fleet → EC2 instance × N → Runner daemon → embedded BoxLite runtime → box microVMs, and the palette stays legible on light/dark hosts.",
       "files": [],
       "expectations": [
         "The agent searches existing BoxLite docs first and identifies apps/infra/docs/deployment.md#architecture as the composition baseline instead of rebuilding the system from low-level calls.",
         "evidence.json explicitly selects only the architecture view, and diagram.md does not add unrequested Sequence or Call graph sections.",
         "The architecture covers user and SDK entry points, external dependencies, public ingress, private compute and box execution, state, observability, and the main request/control/data/image routes at one deployment altitude.",
         "The Runner fleet surrounds a representative EC2 instance × N; EC2 surrounds the Runner daemon; Runner surrounds the embedded BoxLite runtime; BoxLite surrounds box microVMs. These immediate memberships are declared in evidence.json boundaries and validated against Mermaid nesting.",
-        "The README Mermaid contains no fixed theme or styling directives, remains light/dark adaptive on GitHub, and uses the PNG only as a static preview.",
+        "Related components form contiguous scope zones ordered along the main path; each zone subgraph carries its exact house palette class (classDef scope_* plus class assignment) with the matching scope declared in evidence.json boundaries, while physical boundaries and nodes stay unstyled and no style, linkStyle, theme, or non-palette classDef appears, keeping the diagram legible on light/dark hosts with the PNG used only as a static preview.",
         "validation.json reports valid=true and emits both SVG and PNG artifacts; the agent opens the PNG and checks readability, truthful containment, disjoint boundaries, routing, and label clipping before presenting it."
       ]
     },

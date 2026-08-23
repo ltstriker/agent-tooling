@@ -29,8 +29,10 @@ def validate_consistency(ctx: ValidationContext) -> None:
                     f"{view}/{state} edges disagree: missing={sorted(expected_edges - actual_edges)}, "
                     f"undeclared={sorted(actual_edges - expected_edges)}"
                 )
-            if view == "architecture" and "boundaries" in ctx.manifest:
-                _check_boundaries(ctx, state, errors)
+            if view == "architecture":
+                if "boundaries" in ctx.manifest:
+                    _check_boundaries(ctx, state, errors)
+                _check_scopes(ctx, state, errors)
             _check_endpoints(ctx, view, state, errors)
             _check_labels(ctx, view, state, errors)
     _check_mermaid_annotations(ctx, errors)
@@ -40,7 +42,7 @@ def validate_consistency(ctx: ValidationContext) -> None:
         ctx.add(
             "consistency.cross_view",
             "pass",
-            "canonical nodes, edges, boundaries, and immediate containment agree across all declared views",
+            "canonical nodes, edges, boundaries, zone scopes, and immediate containment agree across all declared views",
         )
 
 
@@ -140,6 +142,29 @@ def _check_boundaries(ctx: ValidationContext, state: str, errors: list[str]) -> 
             errors.append(
                 f"architecture/{state} boundary {boundary_id!r} label does not contain {expected!r}"
             )
+
+
+def _check_scopes(ctx: ValidationContext, state: str, errors: list[str]) -> None:
+    expected_scopes: dict[str, str] = {}
+    for item in ctx.manifest.get("boundaries", []):
+        if state not in item.get("states", []):
+            continue
+        scope = item.get("scope")
+        if isinstance(scope, str):
+            expected_scopes[item["id"]] = f"scope_{scope}"
+    actual_scopes = {
+        boundary_id: class_name
+        for (scope_state, boundary_id), class_name in ctx.parsed.architecture_scopes.items()
+        if scope_state == state
+    }
+    if actual_scopes != expected_scopes:
+        differences = sorted(
+            f"{boundary_id}: declared={expected_scopes.get(boundary_id)!r}, "
+            f"drawn={actual_scopes.get(boundary_id)!r}"
+            for boundary_id in set(expected_scopes) | set(actual_scopes)
+            if expected_scopes.get(boundary_id) != actual_scopes.get(boundary_id)
+        )
+        errors.append(f"architecture/{state} zone scopes disagree: {differences}")
 
 
 def _check_mermaid_annotations(ctx: ValidationContext, errors: list[str]) -> None:

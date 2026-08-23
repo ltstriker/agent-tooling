@@ -113,6 +113,29 @@ In a real manifest, every boundary has revision-aware source or issue evidence,
 just like a node or edge. One target may have only one immediate parent per
 state, and boundary cycles are invalid.
 
+A boundary that acts as a scope zone additionally declares its `scope` —
+`external`, `edge`, `compute`, `execution`, `state`, or `observability` — and
+the Mermaid block assigns the matching palette class:
+
+```json
+{
+  "id": "runner_fleet",
+  "label": "Runner fleet",
+  "scope": "execution",
+  "...": "states, views, proposed, members, evidence as usual"
+}
+```
+
+```text
+classDef scope_execution fill:#ffedd5,stroke:#ea580c,color:#1f2933
+class runner_fleet scope_execution
+```
+
+The `classDef` line must match the house palette exactly (the palette table is
+in `architecture-composition.md`), `class` targets must be declared subgraphs,
+and declared scopes must match drawn classes one-to-one per state. Boundaries
+without `scope` are purely physical and stay unstyled.
+
 ## Sequence IDs
 
 Participants use manifest node IDs. Every message is immediately preceded by a
@@ -210,7 +233,10 @@ allowed when it materially improves that view.
 Every parsed Mermaid node, Mermaid edge, sequence participant/message, and call
 graph hop/relationship must map to exactly one declared manifest item. When the
 manifest declares `boundaries`, every Mermaid subgraph and every immediate
-node/subgraph parent must match it exactly.
+node/subgraph parent must match it exactly. Scope classes are checked the same
+way: each boundary `scope` must be drawn as `class <id> scope_<name>` in every
+state where the boundary appears, and no drawn scope class may lack its
+manifest declaration.
 
 ## Annotation targets
 
@@ -234,6 +260,8 @@ diff hunk.
 The validator emits `.mmd`, `.svg`, and `.png` artifacts for every Mermaid
 block. The PNG exists for visual inspection. A successful validation report
 proves syntax and traceability, not composition; inspect the PNG before calling
-the result ready. Keep README Mermaid free of fixed themes and styles so GitHub
-controls light/dark rendering. Treat a PNG as a static preview and inspect both
+the result ready. The house scope palette is the only permitted styling: its
+muted fills with explicit dark text are self-contained and stay legible on
+light/dark hosts, and theme directives, `style`, `linkStyle`, and non-palette
+classes remain forbidden. Treat a PNG as a static preview and inspect both
 light and dark renders when the destination's contrast is important.
