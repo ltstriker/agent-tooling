@@ -48,7 +48,7 @@ write_consumer_profile() {
   local sha="$1"
   mkdir -p "$CONSUMER/.agent-tooling" "$CONSUMER/.agents/plugins" \
     "$CONSUMER/.claude" "$CONSUMER/.github/copilot"
-  jq -nc --arg sha "$sha" '{schemaVersion:1,profile:"commerce",repository:"boxlite-ai/boxlite-commerce",tooling:{repository:"boxlite-ai/agent-tooling",sha:$sha},checks:[{name:"test",command:"true"}]}' \
+  jq -nc --arg sha "$sha" '{schemaVersion:1,profile:"consumer",repository:"boxlite-ai/example-consumer",tooling:{repository:"boxlite-ai/agent-tooling",sha:$sha},checks:[{name:"test",command:"true"}]}' \
     > "$CONSUMER/.agent-tooling/profile.json"
   jq -nc --arg sha "$sha" '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{repo:"boxlite-ai/agent-tooling",ref:$sha}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
     > "$CONSUMER/.claude/settings.json"

@@ -1110,16 +1110,23 @@ git -C "$INST" config --worktree --unset core.hooksPath
 check_eq "a second setup run is idempotent" \
   "$(install_probe "$INST")" "$EXPECTED_HOOKS"
 
+# Identity is checked against the remote git actually has, not against a roster
+# shipped in this repo — a public plugin cannot carry a list of private repository
+# names. So the case that must fail closed is a manifest claiming to be a repository
+# this checkout is not.
 cp "$INST/.agent-tooling/profile.json" "$INST/.agent-tooling/profile.valid.json"
-jq '.profile="unknown"' "$INST/.agent-tooling/profile.valid.json" > "$INST/.agent-tooling/profile.json"
+git -C "$INST" remote add origin "https://github.com/boxlite-ai/some-repo.git"
+jq '.repository="boxlite-ai/a-different-repo"' "$INST/.agent-tooling/profile.valid.json" \
+  > "$INST/.agent-tooling/profile.json"
 if "$REPO_ROOT/scripts/setup.sh" "$INST" >/dev/null 2>"$INST/setup.err"; then
   invalid_result=allowed
 else
   invalid_result=blocked
 fi
-check_eq "an unknown profile fails closed" "$invalid_result" "blocked"
-grep -q 'unknown profile' "$INST/setup.err" && invalid_message=clear || invalid_message=missing
+check_eq "a repository that is not this checkout fails closed" "$invalid_result" "blocked"
+grep -q 'origin does not match declared repository' "$INST/setup.err" && invalid_message=clear || invalid_message=missing
 check_eq "an invalid profile names the error" "$invalid_message" "clear"
+git -C "$INST" remote remove origin
 
 git -C "$INST" worktree remove --force "$INST-wt"
 rm -rf "$INST"
