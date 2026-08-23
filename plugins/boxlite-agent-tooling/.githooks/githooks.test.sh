@@ -158,11 +158,16 @@ setup() {
   git -C "$d" init -q
   git -C "$d" config user.email t@t.test
   git -C "$d" config user.name tester
-  mkdir -p "$d/.agents/hooks" "$d/.agents/state"
+  mkdir -p "$d/.agents/hooks" "$d/.agents/state" "$d/.agents/lib" "$d/.agents/prompts"
   cp "$REPO_ROOT/.agents/hooks/preflight-commit-push.sh" \
      "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" \
      "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
      "$d/.agents/hooks/"
+  # The gate resolves its shared library and prompt documents from its own location,
+  # and refuses to gate without them rather than waving the commit through. A fake
+  # repo running a COPY of the hook therefore needs both staged beside it.
+  cp "$REPO_ROOT/.agents/lib/subagent.sh" "$d/.agents/lib/"
+  cp "$REPO_ROOT/.agents/prompts/"*.md "$d/.agents/prompts/"
   printf 'x\n' > "$d/f"
   git -C "$d" add -A
   git -C "$d" commit -qm base
@@ -886,11 +891,28 @@ handoff_reachable() {
   case "$n" in 0) printf 'no' ;; *) printf 'yes' ;; esac
 }
 
-out="$(printf '{"tool_input":{"command":"git commit -m '\''test(hooks): codex keep audit'\''"}}' \
+# The gate does not manufacture the audit. It denies, names every route to an auditor,
+# and whichever one the agent spawns writes the artifact — so this chain starts from an
+# artifact a producer wrote, exactly as a real session would reach it.
+KEEP_CMD="git commit -m 'test(hooks): codex keep audit'"
+
+out="$(printf '{"tool_input":{"command":%s}}' "$(printf '%s' "$KEEP_CMD" | jq -Rs .)" \
+      | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" bash "$R/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
+# With .githooks installed this layer defers rather than denying — the git-level gate
+# is the single consumer. What matters here is that deferring manufactures NOTHING:
+# the artifact only ever comes from an auditor the agent spawned.
+check_eq "PreToolUse defers without manufacturing an audit" \
+  "${out:-EMPTY}:$(audit_reachable "$R"):$(handoff_reachable "$R")" "EMPTY:no:yes"
+
+# Stand in for the subagent the agent would spawn.
+( cd "$R" && CLAUDE_PROJECT_DIR="$R" CODEX_BIN="$R/bin/codex" \
+    bash "$R/.agents/hooks/run-commit-push-audit.sh" commit "$KEEP_CMD" ) >/dev/null 2>&1 || true
+
+out="$(printf '{"tool_input":{"command":%s}}' "$(printf '%s' "$KEEP_CMD" | jq -Rs .)" \
       | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" bash "$R/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
 kept="$(audit_reachable "$R")"
 handoff="$(handoff_reachable "$R")"
-check_eq "Codex PreToolUse validates and keeps audit for .githooks" "${out:-EMPTY}:$kept:$handoff" "EMPTY:yes:yes"
+check_eq "PreToolUse defers and keeps the audit for .githooks" "${out:-EMPTY}:$kept:$handoff" "EMPTY:yes:yes"
 out="$(printf '{"tool_input":{"command":"git commit"}}' \
       | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" GITHOOK_DELEGATED=1 GITHOOK_KEEP_AUDIT=1 bash "$R/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
 kept_after_precommit="$(audit_reachable "$R")"
@@ -1088,16 +1110,23 @@ git -C "$INST" config --worktree --unset core.hooksPath
 check_eq "a second setup run is idempotent" \
   "$(install_probe "$INST")" "$EXPECTED_HOOKS"
 
+# Identity is checked against the remote git actually has, not against a roster
+# shipped in this repo — a public plugin cannot carry a list of private repository
+# names. So the case that must fail closed is a manifest claiming to be a repository
+# this checkout is not.
 cp "$INST/.agent-tooling/profile.json" "$INST/.agent-tooling/profile.valid.json"
-jq '.profile="unknown"' "$INST/.agent-tooling/profile.valid.json" > "$INST/.agent-tooling/profile.json"
+git -C "$INST" remote add origin "https://github.com/boxlite-ai/some-repo.git"
+jq '.repository="boxlite-ai/a-different-repo"' "$INST/.agent-tooling/profile.valid.json" \
+  > "$INST/.agent-tooling/profile.json"
 if "$REPO_ROOT/scripts/setup.sh" "$INST" >/dev/null 2>"$INST/setup.err"; then
   invalid_result=allowed
 else
   invalid_result=blocked
 fi
-check_eq "an unknown profile fails closed" "$invalid_result" "blocked"
-grep -q 'unknown profile' "$INST/setup.err" && invalid_message=clear || invalid_message=missing
+check_eq "a repository that is not this checkout fails closed" "$invalid_result" "blocked"
+grep -q 'origin does not match declared repository' "$INST/setup.err" && invalid_message=clear || invalid_message=missing
 check_eq "an invalid profile names the error" "$invalid_message" "clear"
+git -C "$INST" remote remove origin
 
 git -C "$INST" worktree remove --force "$INST-wt"
 rm -rf "$INST"

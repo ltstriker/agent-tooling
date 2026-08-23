@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env bash \"$CLAUDE_PROJECT_DIR/.agent-tooling/rule-recency.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -39,6 +39,17 @@ emit() {  # emit <session> <prompt> [interval]
 assert_emit() { [ -n "$2" ] && ok "$1" || bad "$1 (expected EMIT, got silent)"; }
 assert_skip() { [ -z "$2" ] && ok "$1" || bad "$1 (expected skip, got EMIT)"; }
 
+# The hook emits TWO blocks on different cadences, so "did it emit?" is no longer a
+# yes/no on stdout: REPLY SHAPE rides every non-ack prompt while WORKFLOW stays
+# periodic. Cadence assertions therefore target a block by marker. assert_skip keeps
+# its whole-stdout emptiness check — silence for an ack must mean BOTH blocks skipped,
+# which a marker-based check would not catch.
+has_style()    { case "$1" in *"REPLY SHAPE:"*)      return 0 ;; *) return 1 ;; esac; }
+has_workflow() { case "$1" in *"WORKFLOW REMINDER"*) return 0 ;; *) return 1 ;; esac; }
+assert_style()       { has_style    "$2" && ok "$1" || bad "$1 (expected REPLY SHAPE, absent)"; }
+assert_workflow()    { has_workflow "$2" && ok "$1" || bad "$1 (expected WORKFLOW, absent)"; }
+assert_no_workflow() { has_workflow "$2" && bad "$1 (expected no WORKFLOW, present)" || ok "$1"; }
+
 echo "## Ack filter: bare acknowledgements skip (fresh session => would be prompt #1 => would otherwise EMIT)"
 i=0
 for w in ok okay yes yep sure proceed continue thanks "thank you" thx "go ahead" done next nvm "OK." "Thanks!" "  proceed  "; do
@@ -53,17 +64,19 @@ assert_emit "inject: 'ok now fix the bug in pull()' (prefix ok != ack)" "$(emit 
 assert_emit "inject: 'fix pull()'"                                     "$(emit sub-3 "fix pull()")"
 
 echo
-echo "## Cadence (N=2): first emits, then every Nth; acks do not advance the counter"
-assert_emit "#1 substantive        -> EMIT"   "$(emit cad "task one"   2)"
-assert_skip "ack between           -> skip"   "$(emit cad "ok"         2)"
-assert_emit "#2 substantive        -> EMIT"   "$(emit cad "task two"   2)"
-assert_skip "ack between           -> skip"   "$(emit cad "thanks"     2)"
-assert_skip "#3 substantive        -> silent" "$(emit cad "task three" 2)"
-assert_emit "#4 substantive        -> EMIT"   "$(emit cad "task four"  2)"
+echo "## Cadence (N=2): WORKFLOW first then every Nth; REPLY SHAPE on every turn"
+out="$(emit cad "task one"   2)"; assert_style "#1 -> style" "$out"; assert_workflow    "#1 -> workflow"    "$out"
+assert_skip "ack between -> both blocks skip" "$(emit cad "ok"     2)"
+out="$(emit cad "task two"   2)"; assert_style "#2 -> style" "$out"; assert_workflow    "#2 -> workflow"    "$out"
+assert_skip "ack between -> both blocks skip" "$(emit cad "thanks" 2)"
+out="$(emit cad "task three" 2)"; assert_style "#3 -> style" "$out"; assert_no_workflow "#3 -> no workflow" "$out"
+out="$(emit cad "task four"  2)"; assert_style "#4 -> style" "$out"; assert_workflow    "#4 -> workflow"    "$out"
 
 echo
 echo "## Session keying: a new session re-anchors at its own first prompt"
-assert_emit "new session emits at #1" "$(emit fresh-session "walk me through the exec path" 5)"
+# Asserted on WORKFLOW, not on emptiness: REPLY SHAPE rides every turn, so a
+# whole-stdout check would pass here even if the cadence counter never reset.
+assert_workflow "new session re-anchors WORKFLOW at #1" "$(emit fresh-session "walk me through the exec path" 5)"
 
 echo
 echo "## Robustness: an unparseable prompt fails open (injects, is never mis-skipped)"
@@ -86,6 +99,29 @@ case "$(emit content-check "how should I design the new cache layer")" in
   *"CLAUDE.md's Workflow"*) ok "reminder points to CLAUDE.md's Workflow" ;;
   *)                        bad "reminder missing the CLAUDE.md Workflow pointer" ;;
 esac
+
+echo
+echo "## REPLY SHAPE survives the cadence gate (an absent cap is not a cap)"
+# The whole point of splitting the blocks: a word budget that lands on one turn in N
+# governs nothing. Drive past the gate and assert it is still there.
+_="$(emit style-off "one" 2)"; _="$(emit style-off "two" 2)"
+assert_style "style present on an off-cadence turn" "$(emit style-off "three" 2)"
+
+echo
+echo "## REPLY SHAPE content: the clauses the cap depends on"
+sty="$(emit clauses "how does the pull path work")"
+check() { case "$sty" in *"$2"*) ok "$1" ;; *) bad "$1 (missing: $2)" ;; esac; }
+check "budget clause"                       "<=80 words"
+check "exemption clause"                    "NOT counted"
+# The clause most likely to be dropped as redundant, and the one that matters most: a
+# budget prunes from the end, and caveats live at the end. Without this the cap
+# silently trades away hedges and failure detail, which is worse than being verbose.
+check "uncertainty/risk/failure exempted"   "uncertainty, risk, or a failing test"
+check "escape hatch"                        "cap lifts ONLY"
+check "bare-why leak closed"                'A bare "why" does not lift it'
+# Host-capability facts, not preferences — these formats are dropped or mangled by
+# the TUIs this plugin ships to, so a reply spent on them is a reply wasted.
+check "non-renderable formats named"        "Never mermaid, never images"
 
 echo
 echo "## session_id is untrusted: it is scraped from the payload, never a path"

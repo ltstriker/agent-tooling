@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CODEX_SANDBOX=${CODEX_SANDBOX:-seatbelt} /usr/bin/env bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/.agents/hooks/preflight-commit-push.sh\"",
+            "command": "/usr/bin/env bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/.agents/hooks/preflight-commit-push.sh\"",
             "statusMessage": "Checking commit and push audit"
           },
           {

@@ -34,6 +34,19 @@ unset CODEX_SANDBOX CLAUDECODE AGENT_GATED GITHOOK_DELEGATED GITHOOK_KEEP_AUDIT
 BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
+# Every fake repo that runs a COPY of the hook needs the shared library beside it: the
+# hook resolves it from its own location, and refuses to gate without it rather than
+# crash — a PreToolUse hook that merely errors is stepped over, which on a deny gate
+# lets the commit through unaudited. Tests that invoke the real $HOOK in place need
+# nothing; only the copies do.
+stage_lib() {  # $1 = fake repo root
+  mkdir -p "$1/.agents/lib" "$1/.agents/prompts"
+  cp "$REPO_ROOT/.agents/lib/subagent.sh" "$1/.agents/lib/"
+  # The prompts travel with the library: they are the text it loads, and the hook
+  # treats a missing prompt document as an error rather than improvising one.
+  cp "$REPO_ROOT/.agents/prompts/"*.md "$1/.agents/prompts/"
+}
+
 pass=0
 fail=0
 
@@ -260,6 +273,7 @@ git -C "$DELEG_REPO" config user.email t@t.test
 git -C "$DELEG_REPO" config user.name tester
 mkdir -p "$DELEG_REPO/.agents/hooks" "$DELEG_REPO/.agents/state" "$DELEG_REPO/.githooks"
 cp "$REPO_ROOT/.agents/hooks/preflight-commit-push.sh" "$DELEG_REPO/.agents/hooks/"
+stage_lib "$DELEG_REPO"
 printf 'base\n' > "$DELEG_REPO/f"
 git -C "$DELEG_REPO" add -A
 git -C "$DELEG_REPO" commit -qm base
@@ -302,19 +316,39 @@ git -C "$CODEX_REPO" config user.email t@t.test
 git -C "$CODEX_REPO" config user.name tester
 mkdir -p "$CODEX_REPO/.agents/hooks" "$CODEX_REPO/.agents/state"
 cp "$HOOK" "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" "$CODEX_REPO/.agents/hooks/"
+stage_lib "$CODEX_REPO"
 printf 'base\n' > "$CODEX_REPO/f"
 git -C "$CODEX_REPO" add -A
 git -C "$CODEX_REPO" commit -qm base
 printf 'change\n' >> "$CODEX_REPO/f"
 git -C "$CODEX_REPO" add -A
-out="$(printf '{"tool_input":{"command":"git commit -m '\''test(net): cover hook audit'\''"}}' \
-      | ( cd "$CODEX_REPO" && CLAUDE_PROJECT_DIR="$CODEX_REPO" CODEX_SANDBOX=seatbelt CODEX_COMMIT_PUSH_AUDIT_MODE=local bash "$CODEX_REPO/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
+LOCAL_CMD="git commit -m 'test(net): cover hook audit'"
+gate_local() {
+  printf '{"tool_input":{"command":%s}}' "$(printf '%s' "$LOCAL_CMD" | jq -Rs .)" \
+    | ( cd "$CODEX_REPO" && CLAUDE_PROJECT_DIR="$CODEX_REPO" \
+        bash "$CODEX_REPO/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null
+}
+
+# The gate produces nothing itself. First attempt must deny and leave no artifact —
+# an artifact appearing here would mean the gate audited on the agent's behalf.
+out="$(gate_local)"
+if [[ "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecision // "none"' 2>/dev/null)" == "deny" ]] \
+   && [[ ! -e "$CODEX_REPO/.agents/state/last-audit.json" ]]; then
+  pass=$((pass + 1)); printf '  PASS  no artifact yet → deny, and none manufactured\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  no artifact yet → deny, and none manufactured  (out=%s)\n' "${out:-EMPTY}"
+fi
+
+# Stand in for the auditor the agent spawns from the deny reason.
+( cd "$CODEX_REPO" && CLAUDE_PROJECT_DIR="$CODEX_REPO" CODEX_COMMIT_PUSH_AUDIT_MODE=local \
+    bash "$CODEX_REPO/.agents/hooks/run-commit-push-audit.sh" commit "$LOCAL_CMD" ) >/dev/null 2>&1 || true
+
+out="$(gate_local)"
 if [[ -z "$out" && ! -e "$CODEX_REPO/.agents/state/last-audit.json" ]]; then
-  pass=$((pass + 1))
-  printf '  PASS  Codex local audit allows and is consumed\n'
+  pass=$((pass + 1)); printf '  PASS  retry after the auditor ran allows and consumes\n'
 else
   fail=$((fail + 1))
-  printf '  FAIL  Codex local audit allows and is consumed  (out=%s audit_exists=%s)\n' "${out:-EMPTY}" "$([[ -e "$CODEX_REPO/.agents/state/last-audit.json" ]] && echo yes || echo no)"
+  printf '  FAIL  retry after the auditor ran allows and consumes  (out=%s audit_exists=%s)\n' "${out:-EMPTY}" "$([[ -e "$CODEX_REPO/.agents/state/last-audit.json" ]] && echo yes || echo no)"
 fi
 rm -rf "$CODEX_REPO"
 
@@ -329,6 +363,7 @@ cp "$HOOK" \
    "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" \
    "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
    "$AGENTIC_REPO/.agents/hooks/"
+stage_lib "$AGENTIC_REPO"
 printf 'base\n' > "$AGENTIC_REPO/f"
 git -C "$AGENTIC_REPO" add -A
 git -C "$AGENTIC_REPO" commit -qm base
@@ -394,11 +429,16 @@ jq -nc --arg b "$branch" --arg h "$head" --arg dh "$diff_hash" --arg ch "$comman
 FAKE_CODEX
 chmod +x "$AGENTIC_REPO/bin/codex"
 
-out="$(printf '{"tool_input":{"command":"git commit -m '\''test(hooks): codex audit'\''"}}' \
-      | ( cd "$AGENTIC_REPO" && CLAUDE_PROJECT_DIR="$AGENTIC_REPO" CODEX_SANDBOX=seatbelt CODEX_COMMIT_PUSH_AUDIT_MODE=agentic CODEX_BIN="$AGENTIC_REPO/bin/codex" bash "$AGENTIC_REPO/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
+# Driven through the producer directly. The gate no longer runs it — it denies and
+# names the routes — but what these assertions are actually about is the producer's
+# own contract: the sandbox flags, and that every secret shape in the staged diff is
+# redacted before any of it leaves the machine.
+out="$( ( cd "$AGENTIC_REPO" && CLAUDE_PROJECT_DIR="$AGENTIC_REPO" CODEX_COMMIT_PUSH_AUDIT_MODE=agentic \
+          CODEX_BIN="$AGENTIC_REPO/bin/codex" \
+          bash "$AGENTIC_REPO/.agents/hooks/run-commit-push-audit.sh" \
+            commit "git commit -m 'test(hooks): codex audit'" ) 2>/dev/null)"
 check_agentic=yes
-[[ -z "$out" ]] || check_agentic=no
-[[ ! -e "$AGENTIC_REPO/.agents/state/last-audit.json" ]] || check_agentic=no
+[[ -e "$AGENTIC_REPO/.agents/state/last-audit.json" ]] || check_agentic=no
 grep -q '^approval=never$' "$AGENTIC_REPO/fake-codex.args" || check_agentic=no
 grep -q '^exec_seen=yes$' "$AGENTIC_REPO/fake-codex.args" || check_agentic=no
 grep -q '^disable_hooks=yes$' "$AGENTIC_REPO/fake-codex.args" || check_agentic=no
@@ -436,6 +476,7 @@ mkdir -p "$BAD_REPO/.agents/hooks" "$BAD_REPO/.agents/state" "$BAD_REPO/bin"
 cp "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" \
    "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
    "$BAD_REPO/.agents/hooks/"
+stage_lib "$BAD_REPO"
 printf 'base\n' > "$BAD_REPO/f"
 git -C "$BAD_REPO" add -A
 git -C "$BAD_REPO" commit -qm base
@@ -503,6 +544,10 @@ mkdir -p "$LEAK_REPO/.agents/hooks" "$LEAK_REPO/.agents/state" "$LEAK_REPO/bin"
 cp "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" \
    "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
    "$LEAK_REPO/.agents/hooks/"
+# Without these the runner fails while building its prompt — a write_fail site BEFORE
+# the exec, which is precisely the "probe is inert but looks green" case the comment
+# below warns about.
+stage_lib "$LEAK_REPO"
 printf 'base\n' > "$LEAK_REPO/f"
 git -C "$LEAK_REPO" add -A
 git -C "$LEAK_REPO" commit -qm base
@@ -706,6 +751,7 @@ git -C "$STATE_REPO" config user.email t@t.test
 git -C "$STATE_REPO" config user.name tester
 mkdir -p "$STATE_REPO/.agents/hooks" "$STATE_REPO/.githooks"
 cp "$HOOK" "$STATE_REPO/.agents/hooks/"
+stage_lib "$STATE_REPO"
 cp "$REPO_ROOT/.githooks/pre-commit" "$STATE_REPO/.githooks/"
 printf 'x\n' > "$STATE_REPO/f"
 git -C "$STATE_REPO" add -A
@@ -748,6 +794,101 @@ else
   fail=$((fail + 1)); printf '  FAIL  an unwritable legacy mirror does not fail the gate  (rc=%s real_marker=%s)\n' "$mirror_rc" "$real_marker"
 fi
 rm -rf "$STATE_REPO"
+
+echo
+echo "## The deny reason offers BOTH hosts, whatever the environment says"
+# The regression this pins: the dispatch used to pick ONE host's instruction by
+# testing CODEX_SANDBOX, and hooks.json launches this hook with
+# `CODEX_SANDBOX=${CODEX_SANDBOX:-seatbelt}` — never empty — so Claude Code users were
+# always sent to the Codex producer and the Claude branch was dead in production.
+# Both branches passed their unit tests, because the tests call the script directly
+# and never through the wiring. Asserting on BOTH routes under BOTH environments is
+# what that pair of tests could not do.
+BOTH_REPO="$(mktemp -d)"
+git -C "$BOTH_REPO" init -q
+git -C "$BOTH_REPO" config user.email t@t.test
+git -C "$BOTH_REPO" config user.name tester
+mkdir -p "$BOTH_REPO/.agents/hooks" "$BOTH_REPO/.agents/state"
+cp "$HOOK" "$BOTH_REPO/.agents/hooks/"
+stage_lib "$BOTH_REPO"
+printf 'base\n' > "$BOTH_REPO/f"
+git -C "$BOTH_REPO" add -A
+git -C "$BOTH_REPO" commit -qm base
+printf 'change\n' >> "$BOTH_REPO/f"
+git -C "$BOTH_REPO" add -A
+
+both_reason() {  # $1 = value for CODEX_SANDBOX ("" = unset)
+  local env_desc="$1"
+  printf '{"tool_input":{"command":"git commit -m '\''test: x'\''"}}' \
+    | ( cd "$BOTH_REPO" && CLAUDE_PROJECT_DIR="$BOTH_REPO" \
+        ${env_desc:+CODEX_SANDBOX="$env_desc"} \
+        bash "$BOTH_REPO/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null \
+    | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null
+}
+
+reason="$(both_reason "")"
+case "$reason" in
+  *"Task(subagent_type='commit-push-auditor'"*) ok_claude=1 ;; *) ok_claude=0 ;;
+esac
+case "$reason" in
+  *"collaboration.spawn_agent("*) ok_codex=1 ;; *) ok_codex=0 ;;
+esac
+if [[ "$ok_claude" == 1 && "$ok_codex" == 1 ]]; then
+  pass=$((pass + 1)); printf '  PASS  the deny reason names both Task() and spawn_agent()\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  the deny reason names both Task() and spawn_agent()  (claude=%s codex=%s)\n' \
+    "$ok_claude" "$ok_codex"
+fi
+
+# CODEX_SANDBOX is deliberately NOT swept into the behavioural check above. Set, it
+# still routes this hook into its own pre-tool audit further down (codex_pretool_audit)
+# instead of emitting any instruction — a separate, untouched mechanism. What must
+# never come back is the variable choosing BETWEEN instruction texts, so that is
+# asserted against the source directly rather than through behaviour that the other
+# branch would mask.
+sel="$(sed 's/#.*//' "$HOOK" | grep -n 'invoke_instruction' | grep -c 'CODEX_SANDBOX' || true)"
+[[ "$sel" == "0" ]] && { pass=$((pass + 1)); printf '  PASS  no CODEX_SANDBOX branch selects the instruction text\n'; } \
+                    || { fail=$((fail + 1)); printf '  FAIL  no CODEX_SANDBOX branch selects the instruction text (%s found)\n' "$sel"; }
+# One instruction, built once. Two named variants was the shape that let them diverge.
+variants="$(sed 's/#.*//' "$HOOK" | grep -c '_invoke_instruction=' || true)"
+[[ "$variants" == "0" ]] && { pass=$((pass + 1)); printf '  PASS  no per-host instruction variants remain\n'; } \
+                         || { fail=$((fail + 1)); printf '  FAIL  no per-host instruction variants remain (%s found)\n' "$variants"; }
+
+# The headless route stays available for callers with no agent at all, but must not be
+# the only thing offered — that was the old always-Codex behaviour wearing a new name.
+reason="$(both_reason "")"
+case "$reason" in
+  *"run-commit-push-audit.sh"*) pass=$((pass + 1)); printf '  PASS  headless route still offered as a third option\n' ;;
+  *)                            fail=$((fail + 1)); printf '  FAIL  headless route still offered as a third option\n' ;;
+esac
+
+echo
+echo "## A missing shared library blocks rather than waving the commit through"
+# Fail direction matters more than the failure here. A PreToolUse hook that merely
+# crashes is reported and stepped over, so on a DENY gate a broken install would let
+# the commit proceed unaudited. Exit 2 is the only status that blocks.
+rm -f "$BOTH_REPO/.agents/lib/subagent.sh"
+out="$(printf '{"tool_input":{"command":"git commit -m '\''test: x'\''"}}' \
+        | ( cd "$BOTH_REPO" && CLAUDE_PROJECT_DIR="$BOTH_REPO" \
+            bash "$BOTH_REPO/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
+rc=$?
+if [[ "$rc" == 2 && -z "$out" ]]; then
+  pass=$((pass + 1)); printf '  PASS  missing library exits 2 (blocks) rather than passing through\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  missing library exits 2 (blocks) rather than passing through  (rc=%s out=%s)\n' "$rc" "${out:-EMPTY}"
+fi
+# An unrelated Bash call must still sail past: the library is sourced after the
+# non-git early exit precisely so a broken install cannot gate every command.
+out="$(printf '{"tool_input":{"command":"ls -la"}}' \
+        | ( cd "$BOTH_REPO" && CLAUDE_PROJECT_DIR="$BOTH_REPO" \
+            bash "$BOTH_REPO/.agents/hooks/preflight-commit-push.sh" ) 2>/dev/null)"
+rc=$?
+if [[ "$rc" == 0 && -z "$out" ]]; then
+  pass=$((pass + 1)); printf '  PASS  non-git commands unaffected by a missing library\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  non-git commands unaffected by a missing library  (rc=%s out=%s)\n' "$rc" "${out:-EMPTY}"
+fi
+rm -rf "$BOTH_REPO"
 
 echo
 echo "RESULT: $pass passed, $fail failed"
