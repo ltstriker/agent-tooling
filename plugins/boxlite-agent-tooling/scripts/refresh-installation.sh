@@ -61,6 +61,10 @@ tooling_ref="$(jq -er '.tooling.ref | select(type == "string" and length > 0)' "
   printf 'agent-tooling: tooling.ref must name the branch to float on\n' >&2
   exit 1
 }
+[[ ! "$tooling_ref" =~ ^[0-9a-f]{40}$ ]] || {
+  printf 'agent-tooling: tooling.ref names a branch; to freeze a revision write it to .agent-tooling/hold\n' >&2
+  exit 1
+}
 if [[ "$tooling_ref" == -* ]] || ! git check-ref-format "refs/heads/$tooling_ref" >/dev/null 2>&1; then
   printf 'agent-tooling: tooling.ref is not a valid branch name: %s\n' "$tooling_ref" >&2
   exit 1

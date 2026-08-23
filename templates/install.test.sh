@@ -225,6 +225,16 @@ grep -q 'could not resolve' "$TMP/err" && ok "refresh says it kept the record" \
                                        || bad "refresh says it kept the record"
 check_eq "record survives the failed refresh" "$(record)" "$TIP_FOUR"
 point_remote "$REMOTE"
+# A SHA-shaped ref must fail the refresh the same way it fails the bootstrap and
+# the profile validation — loudly, before resolution, without stamping last-check —
+# not resolve to nothing and read as an ordinary offline interval.
+jq --arg sha "$TIP_ONE" '.tooling.ref = $sha' "$CONSUMER/.agent-tooling/profile.json" > "$TMP/p" && cp "$TMP/p" "$CONSUMER/.agent-tooling/profile.json"
+bash "$REFRESH" "$CONSUMER" >/dev/null 2> "$TMP/err"
+check_eq "refresh refuses a revision as the ref" "$?" 1
+grep -q 'write it to .agent-tooling/hold' "$TMP/err" && ok "refresh points a pinner at the hold file" \
+                                                    || bad "refresh points a pinner at the hold file"
+check_eq "record survives the refused ref" "$(record)" "$TIP_FOUR"
+jq '.tooling.ref = "main"' "$CONSUMER/.agent-tooling/profile.json" > "$TMP/p" && cp "$TMP/p" "$CONSUMER/.agent-tooling/profile.json"
 
 echo
 echo "## Lifecycle sync spawns the refresh, throttled"

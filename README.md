@@ -5,7 +5,9 @@ Canonical, versioned coding-agent resources shared by BoxLite repositories.
 The repository packages one `boxlite-agent-tooling` plugin for Codex, Claude
 Code, and GitHub Copilot. It owns reusable skills, audit agents, lifecycle
 hooks, Git gates, and PR watchers. Consumer repositories keep only thin
-activation settings, a pinned commit SHA, and a private profile manifest.
+activation settings, the branch they float on (`tooling.ref`), and a private
+profile manifest; the adopted revision is recorded locally in
+`.git/agent-tooling/current`.
 
 ## Layout
 

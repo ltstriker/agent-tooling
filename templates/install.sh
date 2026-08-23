@@ -131,7 +131,11 @@ setup="$checkout/plugins/boxlite-agent-tooling/scripts/setup.sh"
 [[ -x "$setup" ]] || { printf 'agent-tooling: fetched checkout has no executable setup script\n' >&2; exit 1; }
 "$setup" "$repo_root"
 
-# Adopt: everything above succeeded, so this revision is now "current".
+# Adopt: everything above succeeded, so this revision is now "current". The record
+# moves FIRST, then the metadata — deliberately. A crash between these writes can
+# cost the history a line for an adoption that DID happen (a detectable gap: current
+# has no matching tail entry); metadata-first would let the history claim an adoption
+# that never happened, and a trail that can lie is worse than one that can skip.
 tmp_record="$cache_parent/.current.$$"
 printf '%s\n' "$target_sha" > "$tmp_record"
 mv "$tmp_record" "$record_file"
