@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# PostToolUse hook: after a successful remote write, tell the agent to arm a
-# Monitor on the pr-watch event stream.
+# PostToolUse hook: after a successful remote write, tell WHICHEVER agent is
+# running to attach a consumer to the pr-watch event stream.
 #
-# This is the Claude Code *consumer* of the watch. The producer is universal —
+# This is the in-session *consumer* of the watch. The producer is universal —
 # .githooks/pre-push starts .agents/watch/pr-watch.sh for every agent and every
-# human. This hook only bridges that stream into a Claude session. Codex,
-# opencode, and humans read the same log directly.
+# human. This hook bridges that stream into whichever session ran the remote
+# write. Humans keep reading the log directly.
 #
-# Registered from .claude/settings.json (hooks.PostToolUse, matcher "Bash"):
-# the vendor directory registers, .agents/ implements.
+# Registered from hooks/hooks.json (PostToolUse, matcher "Bash") — Claude Code
+# resolves it through the generic plugin.json, Codex through
+# .codex-plugin/plugin.json: the vendor manifests register, .agents/ implements.
+#
+# The context names one attach route PER capability — Monitor for Claude Code, a
+# background shell for Codex, a plain drain for anything else — and the agent
+# self-selects. It deliberately does NOT sniff the host to emit only "its" route:
+# the one gate that did (CODEX_SANDBOX) picked wrong on every host, because env
+# vars report sandbox state, not which agent is running. See the post-mortem in
+# .agents/lib/subagent.sh.
 #
 # Design notes
 # ------------
@@ -71,6 +79,12 @@ if [[ "$response" =~ $failure_re ]]; then
 fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# The stream script and the escalation policy live in the TOOLING tree (this
+# script's own plugin), never at the consumer's repo root — an installed
+# consumer carries only .agent-tooling/ and the pinned cache under .git/. An
+# earlier version addressed both as ${repo_root}/.agents/… , which exists in
+# neither layout; the tests missed it by asserting bare filenames.
+tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || echo '')"
 [[ -z "$branch" ]] && exit 0
 
@@ -98,34 +112,46 @@ fi
 context="A remote write just succeeded on branch '${branch}'.
 ${pr_line}
 
-.githooks/pre-push has armed the watcher. Arm a Monitor on its event stream now,
-in this exact form:
+.githooks/pre-push has armed the watcher. It appends one JSON event per line to
+  ${event_log}
+Kinds: check (one per check as it concludes), checks_done, comment, review,
+review_comment, watch_start, watch_end. The stream ends itself at watch_end.
 
-  Monitor({
-    command: 'bash ${repo_root}/.agents/watch/pr-watch-stream.sh \"${event_log}\"',
-    description: 'CI checks + PR comments on ${branch}',
-    persistent: true,
-  })
+Attach ONE consumer to it now, using WHICHEVER of these your harness provides —
+do not attach a second one for this branch, and do not poll \`gh pr checks\` by
+hand while it runs:
 
-Each line is one JSON event. Kinds: check (one per check as it concludes),
-checks_done, comment, review, review_comment, watch_start, watch_end.
-The stream ends itself at watch_end — do not arm a second Monitor for this
-branch, and do not poll \`gh pr checks\` by hand while it runs.
+  Claude Code
+    Monitor({
+      command: 'bash ${tooling_root}/.agents/watch/pr-watch-stream.sh \"${event_log}\"',
+      description: 'CI checks + PR comments on ${branch}',
+      persistent: true,
+    })
+
+  Codex (any harness with background shells)
+    Start in a BACKGROUND shell, and read its new output at every natural pause:
+      bash ${tooling_root}/.agents/watch/pr-watch-stream.sh '${event_log}'
+    It replays history, follows new events, and exits by itself at watch_end.
+
+  No background primitive at all
+    Drain what has landed so far before you end each turn:
+      cat '${event_log}'
 
 When an event arrives:
   * bucket 'fail' or 'cancel' -> read the real failure with
       gh run view <run-id> --log-failed
-    then follow ${repo_root}/.agents/watch/escalation-policy.md, which decides
+    then follow ${tooling_root}/.agents/watch/escalation-policy.md, which decides
     what you may fix unattended and what needs the human. Read it before editing.
   * a new comment or review    -> summarize it for the user; apply the same
     policy before acting on it.
-  * send a PushNotification for a failing required check ('Lint (conclusion)',
+  * alert the human — PushNotification on Claude Code, otherwise the FIRST line
+    of your next reply — for a failing required check ('Lint (conclusion)',
     'Test (conclusion)') AND for every new comment,
     review, or inline review thread — bots included. Reviewers are why the
     watch exists; an unread bot finding is the failure mode it is meant to
     prevent. Routine passing checks stay silent.
 
-If the user asked you not to watch this one, skip the Monitor and say so."
+If the user asked you not to watch this one, skip the consumer and say so."
 
 jq -nc --arg c "$context" '{
   hookSpecificOutput: {
