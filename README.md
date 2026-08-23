@@ -42,10 +42,18 @@ Claude Code needs a **merge**, not a copy — `.claude/settings.json` also carri
 such as `env`, and overwriting it would drop them:
 
 ```sh
-jq -s '.[0] * .[1]' "$consumer/.claude/settings.json" templates/claude-settings.json \
-  > "$consumer/.claude/settings.json.new" && \
-  mv "$consumer/.claude/settings.json.new" "$consumer/.claude/settings.json"
+mkdir -p "$consumer/.claude"
+if [ -f "$consumer/.claude/settings.json" ]; then
+  jq -s '.[0] * .[1]' "$consumer/.claude/settings.json" templates/claude-settings.json \
+    > "$consumer/.claude/settings.json.new" &&
+    mv "$consumer/.claude/settings.json.new" "$consumer/.claude/settings.json"
+else
+  cp templates/claude-settings.json "$consumer/.claude/settings.json"
+fi
 ```
+
+A fresh consumer has neither the file nor its parent directory, and `jq -s` on a
+missing path fails rather than treating it as empty.
 
 The two wirings differ in exactly one respect: Claude Code exports
 `$CLAUDE_PROJECT_DIR`, while Codex has no project-root variable and substitutes

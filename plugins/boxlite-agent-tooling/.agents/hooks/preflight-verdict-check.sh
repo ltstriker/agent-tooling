@@ -471,6 +471,13 @@ claims, so anything the fix newly asserts is still caught."
   # instruction attached, which is the meaningless-loop class this file's header exists
   # to eliminate. A turn that ends unaudited with a loud notice is recoverable; an agent
   # that can never finish a turn is not.
+  # %q, not hand-placed quotes: transcript_path arrives from the hook payload, and a
+  # path containing a quote would otherwise re-tokenize the command an agent is being
+  # told to run. This hook never executes it — the reader might.
+  local headless_command
+  printf -v headless_command 'bash %q %q' \
+    "$tooling_root/.agents/hooks/run-verdict-audit.sh" "$transcript_path"
+
   local lib="$tooling_root/.agents/lib/subagent.sh"
   if [[ -r "$lib" ]]; then
     # shellcheck source=../lib/subagent.sh
@@ -481,14 +488,14 @@ claims, so anything the fix newly asserts is still caught."
       --description 'verdict proof check' \
       --artifact "$verdict_file" \
       --task "$(subagent_prompt verdict-task "$tooling_root" "transcript_path=${transcript_path}")" \
-      --headless "bash '${tooling_root}/.agents/hooks/run-verdict-audit.sh' '${transcript_path}'"
+      --headless "$headless_command"
   else
     printf 'preflight-verdict-check: missing %s — emitting the headless route only\n' "$lib" >&2
     cat <<EOF
 Audit before ending — run the audit SYNCHRONOUSLY (the dossier must exist before you
 end):
 
-  bash '${tooling_root}/.agents/hooks/run-verdict-audit.sh' '${transcript_path}'
+  ${headless_command}
 
 The AUDITOR — not you — writes ${verdict_file}; do not write it yourself.
 EOF

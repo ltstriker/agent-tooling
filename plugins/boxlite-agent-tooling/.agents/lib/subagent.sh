@@ -67,9 +67,9 @@ subagent_spec_path() {  # $1 = agent name, $2 = tooling root
 # no envsubst: the values are branch names, file paths, and commit text, and a prompt
 # is the last place to let an unreviewed `$(...)` become executable.
 #
-# Exit 3 when a {{placeholder}} survives. That is the failure worth catching loudly —
-# a model handed the literal text "{{branch}}" will cheerfully treat it as a value and
-# produce a confident answer about nothing.
+# Exit 3 when the template names a placeholder the caller supplied no value for. That
+# is the failure worth catching loudly — a model handed the literal text "{{branch}}"
+# will cheerfully treat it as a value and answer confidently about nothing.
 subagent_prompt() {  # $1 = prompt name, $2 = tooling root, then key=value pairs
   local name="${1:-}" root="${2:-}"
   if [[ -z "$name" || -z "$root" ]]; then
@@ -84,19 +84,35 @@ subagent_prompt() {  # $1 = prompt name, $2 = tooling root, then key=value pairs
     return 2
   fi
 
-  local text pair key value
+  local text pair key value supplied="" needed missing=""
   text="$(subagent_strip_frontmatter "$file")"
+
+  for pair in "$@"; do
+    supplied="$supplied ${pair%%=*}"
+  done
+
+  # Checked against the TEMPLATE, before any value is substituted in. Scanning the
+  # finished text instead would read a {{ }} occurring inside a VALUE as an unfilled
+  # placeholder — and one of these values is sanitized diff text, so any repository
+  # with a Vue, Handlebars, Jinja, Mustache, or Go template in its change set would
+  # fail its own commit audit citing a placeholder nobody wrote.
+  needed="$(printf '%s' "$text" | grep -o '{{[A-Za-z_][A-Za-z0-9_]*}}' | tr -d '{}' | sort -u)"
+  for key in $needed; do
+    case " $supplied " in
+      *" $key "*) ;;
+      *) missing="$missing {{$key}}" ;;
+    esac
+  done
+  if [[ -n "$missing" ]]; then
+    printf 'subagent_prompt: no value supplied for placeholder(s) in %s:%s\n' "$name" "$missing" >&2
+    return 3
+  fi
+
   for pair in "$@"; do
     key="${pair%%=*}"
     value="${pair#*=}"
     text="${text//\{\{$key\}\}/$value}"
   done
-
-  if [[ "$text" == *'{{'* ]]; then
-    printf 'subagent_prompt: unsubstituted placeholder in %s: %s\n' "$name" \
-      "$(printf '%s' "$text" | grep -o '{{[A-Za-z_][A-Za-z0-9_]*}}' | sort -u | tr '\n' ' ')" >&2
-    return 3
-  fi
 
   printf '%s\n' "$text"
 }

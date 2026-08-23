@@ -136,6 +136,16 @@ out="$(subagent_prompt t "$TMP" 'who=a&b\1$(touch '"$TMP"'/PWNED)')"
 check "passes shell/sed metacharacters through as text" 'a&b\1$(touch' "$out"
 [ -e "$TMP/PWNED" ] && bad "a substituted value cannot execute" || ok "a substituted value cannot execute"
 
+# A substituted VALUE may legitimately contain {{ }}: one of them is sanitized diff
+# text, so any repository with a Vue, Handlebars, Jinja, Mustache, or Go template in
+# its change set puts template syntax straight into the prompt. Validating after
+# substitution read that as an unfilled placeholder and failed the commit audit citing
+# a placeholder nobody wrote — a repo blocked from committing by its own frontend.
+out="$(subagent_prompt t "$TMP" 'who=<div>{{ user.name }}</div>')"; rc=$?
+[ "$rc" = "0" ] && ok "a value containing {{ }} is not mistaken for a placeholder" \
+                || bad "a value containing {{ }} is not mistaken for a placeholder (rc=$rc)"
+check "the templated value survives verbatim" "{{ user.name }}" "$out"
+
 echo
 echo "## An unfilled placeholder is an error, not a literal handed to a model"
 # The failure this prevents is quiet: a model given the text "{{branch}}" treats it as
@@ -145,6 +155,8 @@ out="$(subagent_prompt t "$TMP" 2>/dev/null)"; rc=$?
                                  || bad "missing value exits 3 and prints nothing (rc=$rc)"
 err="$(subagent_prompt t "$TMP" 2>&1 >/dev/null)"
 check "names the placeholder it could not fill" "{{who}}" "$err"
+# Named from the TEMPLATE, so the message stays accurate no matter what the values hold.
+check "says a value was not supplied"          "no value supplied"  "$err"
 
 out="$(subagent_prompt nope "$TMP" 2>/dev/null)"; rc=$?
 [ "$rc" = "2" ] && ok "a missing prompt document exits 2" || bad "a missing prompt document exits 2 (rc=$rc)"
