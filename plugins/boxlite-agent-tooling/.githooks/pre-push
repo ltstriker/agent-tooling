@@ -24,6 +24,13 @@ verify_installation="$tooling_root/scripts/verify-installation.sh"
   exit 1
 }
 
+# Same guidance-block check as pre-commit: the second mounting point, so a commit
+# made with --no-verify still cannot push a missing or hand-edited block.
+sync_guidance="$tooling_root/scripts/sync-guidance.sh"
+if [[ -x "$sync_guidance" ]]; then
+  "$sync_guidance" --check "$repo_root" || exit 1
+fi
+
 # Resolve the delegated gate. A worktree checked out at a pre-migration commit
 # has no .agents/hooks/, yet it can still be THIS hook that runs. `make setup`
 # sets core.hooksPath RELATIVE, where each worktree uses its own copy and this

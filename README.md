@@ -16,10 +16,50 @@ profile manifest; the adopted revision is recorded locally in
 .claude-plugin/marketplace.json         Claude-compatible marketplace
 .github/plugin/marketplace.json         Copilot marketplace
 plugins/boxlite-agent-tooling/          Shared multi-host plugin
+plugins/boxlite-agent-tooling/guidance/ Canonical engineering-workflow guidance
 templates/install.sh                    Thin consumer bootstrap
 templates/codex-hooks.json              Scoped Codex prompt-rule wiring
 templates/claude-settings.json          Scoped Claude Code prompt-rule wiring
 ```
+
+## Shared engineering guidance
+
+`plugins/boxlite-agent-tooling/guidance/workflow.md` is the canonical, domain-neutral
+engineering workflow (understand → research → design → implement → test → verify) that
+consumers used to hand-copy into their CLAUDE.md. `scripts/sync-guidance.sh` splices it
+into each consumer's committed instructions files between HTML-comment markers:
+
+```text
+AGENTS.md    the consumer's own domain knowledge, then:
+             <!-- agent-tooling:guidance:begin rev=<sha> sha256=<hash> -->
+             …shared workflow, replaced in place on adoption…
+             <!-- agent-tooling:guidance:end -->
+CLAUDE.md    @AGENTS.md bridge (plus Claude-specific lines) — exempt from the block
+```
+
+Committed text is the one channel every host reads natively — Codex recognizes only
+AGENTS.md by default, Claude Code only CLAUDE.md (which inlines the `@AGENTS.md`
+import), Copilot either — and it reaches clones that never ran an install, cloud
+agents included. Claude Code strips block-level HTML comments before injection, so
+the markers cost no context. A consumer whose two files are one file (a symlink
+either direction) gets exactly one splice; a repository with neither file gets this
+layout created.
+
+The splice runs only on an EXPLICIT `./.agent-tooling/install.sh` (or a direct
+`setup.sh`): lifecycle-triggered installs defer it, so a background refresh can never
+dirty a worktree, and a target with uncommitted tracked modifications is skipped with
+a warning. The commit and push gates run `sync-guidance.sh --check`: a missing,
+malformed, or hand-edited block — the begin marker's `sha256` no longer matching the
+body — fails closed, while a block merely behind the adopted revision only warns
+(consumers float same-ref, not same-revision, like the host activations). Overwrite a
+hand-edited block deliberately with
+`AGENT_TOOLING_GUIDANCE_FORCE=1 ./.agent-tooling/install.sh`.
+
+The canonical text is pinned by `scripts/sync-guidance.test.sh` to stay under 150
+lines and free of repo-specific residue — concrete exemplars belong in each
+consumer's own half of the file. A consumer CI backstop is two commands:
+`./.agent-tooling/install.sh && git diff --exit-code -- AGENTS.md CLAUDE.md`
+(a stale block becomes a diff, a hand-edited one fails the install itself).
 
 ## Scoped prompt rules
 

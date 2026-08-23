@@ -169,19 +169,30 @@ setup() {
   cp "$REPO_ROOT/.agents/lib/subagent.sh" "$d/.agents/lib/"
   cp "$REPO_ROOT/.agents/prompts/"*.md "$d/.agents/prompts/"
   printf 'x\n' > "$d/f"
-  git -C "$d" add -A
-  git -C "$d" commit -qm base
 
   scratch="$(mktemp -d)"
   plugin="$scratch/plugins/boxlite-agent-tooling"
   mkdir -p "$plugin"
-  cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$plugin/"
+  cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$REPO_ROOT/guidance" "$plugin/"
   git -C "$scratch" init -q
   git -C "$scratch" config user.email t@t.test
   git -C "$scratch" config user.name tester
   git -C "$scratch" add -A
   git -C "$scratch" commit -qm tooling
   head="$(git -C "$scratch" rev-parse HEAD)"
+
+  # A real installed consumer carries the guidance block (setup.sh splices it on
+  # adoption), so the fixture must too, or the gate under test rejects every
+  # commit for the missing block instead of the property each case pins. Spliced
+  # BEFORE the ungated base commit, so the files ride every branch: left
+  # untracked, a later `git add -A` would commit them on one branch and the next
+  # backward checkout would drop them from the worktree, tripping the gate
+  # mid-fixture.
+  env -u AGENT_TOOLING_SYNC_ACTIVE -u AGENT_TOOLING_GUIDANCE_FORCE \
+    bash "$plugin/scripts/sync-guidance.sh" "$d" >/dev/null 2>&1
+  git -C "$d" add -A
+  git -C "$d" commit -qm base
+
   checkout="$d/.git/agent-tooling/$head"
   mkdir -p "$(dirname "$checkout")"
   mv "$scratch" "$checkout"

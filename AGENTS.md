@@ -21,6 +21,13 @@
 - Host-specific assets reach the generic layout through symlinks: `skills` ->
   `.agents/skills` and `agents` -> `.claude/agents`. Add a host by pointing a manifest
   at those names, not by copying the trees.
+- `guidance/workflow.md` is the canonical engineering workflow every consumer's
+  AGENTS.md/CLAUDE.md carries in a marker-fenced block (`scripts/sync-guidance.sh`
+  splices on explicit install; the commit/push gates verify with `--check` —
+  integrity fails closed, staleness warns). It must stay domain-neutral and under
+  150 lines: never write a consumer repo's names, paths, or commands into it —
+  `scripts/sync-guidance.test.sh` pins both. Keep the rendered block byte-stable;
+  the begin marker's content hash is what tells tampering from staleness.
 - `plugins/boxlite-agent-tooling/host-parity.test.sh` pins the cross-host contract:
   same identity in every manifest, marketplaces advertising the shipped version, one
   skills tree, one agent-spec set, one hooks file inside the schema both hosts parse.
