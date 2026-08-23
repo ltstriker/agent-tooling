@@ -27,14 +27,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WATCHER="$REPO_ROOT/.agents/watch/pr-watch.sh"
 PREPUSH="$REPO_ROOT/.githooks/pre-push"
 TMP="$(mktemp -d)"
-# Match ONLY this suite's scratch watcher. A bare "pr-watch.sh --branch" pattern
-# also matches a real watcher following a real PR on this machine, so running the
-# tests would silently kill it. Set once $REPO exists; the trap reads it lazily.
-# The fallback matters: this trap is armed before $REPO is assigned, and an empty
-# pattern is never the cleanup being asked for. On this host (BSD pkill) it errors
-# with "empty (sub)expression"; do not rely on that being the failure mode
-# everywhere.
-watcher_pat() { printf '%s' "${REPO:-__pr_watch_no_repo__}/.agents/watch/pr-watch.sh"; }
+# Match ONLY this suite's scratch watcher — the pinned install's copy, the one
+# file both the direct launches and the pre-push arm run. A bare
+# "pr-watch.sh --branch" pattern also matches a real watcher following a real PR
+# on this machine, so running the tests would silently kill it. Set once the
+# pinned install exists; the trap reads it lazily. The fallback matters: this
+# trap is armed before SCRATCH_WATCHER is assigned, and an empty pattern is
+# never the cleanup being asked for. On this host (BSD pkill) it errors with
+# "empty (sub)expression"; do not rely on that being the failure mode everywhere.
+watcher_pat() { printf '%s' "${SCRATCH_WATCHER:-__pr_watch_no_scratch__}"; }
 trap 'pkill -f "$(watcher_pat)" 2>/dev/null; rm -rf "$TMP"' EXIT
 
 pass=0
@@ -59,11 +60,33 @@ git init -q --bare "$TMP/origin.git"
 git -C "$REPO" remote add origin "$TMP/origin.git"
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 
-# pre-push resolves the watcher against ITS repo root, so the scratch repo needs
-# its own copy — the hook under test must find it where a real checkout would.
-mkdir -p "$REPO/.agents/watch"
-cp "$WATCHER" "$REPO/.agents/watch/pr-watch.sh"
-SCRATCH_WATCHER="$REPO/.agents/watch/pr-watch.sh"
+# pre-push refuses to run in an uninstalled consumer (scripts/verify-installation.sh)
+# and resolves BOTH the verifier and the watcher against its own tooling root. So
+# the suite builds the same pinned-cache installation githooks.test.sh setup()
+# builds, and drives THAT copy of the hook. Invoking $REPO_ROOT/.githooks/pre-push
+# directly can never pass verification — the configured hooks path must sit inside
+# .git/agent-tooling/<pinned sha>/, and the working checkout does not — which is
+# exactly the 3-failure state this suite sat in after the verifier landed.
+scratch="$TMP/tooling-src"
+plugin_rel="plugins/boxlite-agent-tooling"
+mkdir -p "$scratch/$plugin_rel/.agents"
+cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$scratch/$plugin_rel/"
+cp -R "$REPO_ROOT/.agents/watch" "$scratch/$plugin_rel/.agents/watch"
+git -C "$scratch" init -q
+git -C "$scratch" -c user.email=t@t -c user.name=t add -A
+git -C "$scratch" -c user.email=t@t -c user.name=t commit -qm tooling
+PIN_SHA="$(git -C "$scratch" rev-parse HEAD)"
+mkdir -p "$REPO/.git/agent-tooling"
+mv "$scratch" "$REPO/.git/agent-tooling/$PIN_SHA"
+PIN="$REPO/.git/agent-tooling/$PIN_SHA/$plugin_rel"
+mkdir -p "$REPO/.agent-tooling"
+printf '{"tooling":{"sha":"%s"}}\n' "$PIN_SHA" > "$REPO/.agent-tooling/profile.json"
+git -C "$REPO" config extensions.worktreeConfig true
+git -C "$REPO" config --worktree core.hooksPath "$PIN/.githooks"
+# From here on, the hook under test IS the pinned copy — and so is the watcher it
+# arms, which is why the scratch watcher lives in the pin rather than beside $REPO.
+PREPUSH="$PIN/.githooks/pre-push"
+SCRATCH_WATCHER="$PIN/.agents/watch/pr-watch.sh"
 
 STUB="$TMP/bin"
 mkdir -p "$STUB"
@@ -392,7 +415,7 @@ term_kills_daemon() {
 }
 
 kill_tooling_arm() {
-  local pattern="$WATCHER --branch feat --sha $SHA"
+  local pattern="$SCRATCH_WATCHER --branch feat --sha $SHA"
   pkill -f "$pattern" 2>/dev/null || true
   local deadline=$(( SECONDS + 15 ))
   while (( SECONDS < deadline )); do
@@ -414,7 +437,7 @@ arm() {
       bash "$PREPUSH" origin "$TMP/origin.git" >/dev/null 2>&1)
   sleep 1
   local result
-  if pgrep -f "$WATCHER --branch feat --sha $SHA" >/dev/null 2>&1; then result=armed; else result=idle; fi
+  if pgrep -f "$SCRATCH_WATCHER --branch feat --sha $SHA" >/dev/null 2>&1; then result=armed; else result=idle; fi
   kill_tooling_arm
   kill_watchers
   printf '%s' "$result"

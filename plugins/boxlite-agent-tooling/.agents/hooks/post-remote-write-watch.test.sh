@@ -162,6 +162,25 @@ else
   fail=$((fail + 1)); printf '  FAIL  context names the stream script and the policy\n'
 fi
 
+# One attach route per capability, self-selected — the subagent.sh doctrine.
+# Guards the Codex-consumer regression: a context that names only Monitor()
+# reads as Claude-only wiring the moment another host registers this hook.
+if [[ "$got" == *"Monitor({"* && "$got" == *"Codex"* && "$got" == *"WHICHEVER"* ]]; then
+  pass=$((pass + 1)); printf '  PASS  context names an attach route for every host\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  context names an attach route for every host\n'
+fi
+
+# The stream script must be addressed in the TOOLING tree (the hook's own
+# plugin), not at the consumer repo root: an installed consumer has no .agents/
+# checkout, and this suite's scratch repo root is not $REPO_ROOT. Asserting the
+# full path is what the bare-filename checks above cannot do.
+if [[ "$got" == *"bash $REPO_ROOT/.agents/watch/pr-watch-stream.sh"* ]]; then
+  pass=$((pass + 1)); printf '  PASS  stream script addressed at the tooling root\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  stream script addressed at the tooling root (got: %.120s)\n' "$got"
+fi
+
 echo
 printf 'post-remote-write-watch: %d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
