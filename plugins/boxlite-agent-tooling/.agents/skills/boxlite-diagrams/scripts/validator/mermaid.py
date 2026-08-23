@@ -9,20 +9,21 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .models import StateBlock, ValidationContext
+from .models import SCOPE_PALETTE, StateBlock, ValidationContext
 
 VERSION = "11.16.0"
 UNSAFE_PATTERNS = [
     (re.compile(r"%%\{"), "initialization directives"),
     (re.compile(r"(?im)^\s*click\s+"), "click directives"),
     (
-        re.compile(r"(?im)^\s*(?:classDef|class|style|linkStyle)\b"),
-        "fixed styling that breaks host-controlled light/dark themes",
+        re.compile(r"(?im)^\s*(?:style|linkStyle)\b"),
+        "per-element style overrides; the scope palette classes are the only permitted styling",
     ),
     (re.compile(r"(?i)\bthemeVariables\b"), "fixed theme variables"),
     (re.compile(r"(?i)javascript\s*:"), "javascript URLs"),
     (re.compile(r"(?i)https?://|\bhref\s*="), "external links"),
 ]
+SEQUENCE_STYLE_RE = re.compile(r"(?im)^\s*(?:classDef|class)\b")
 MERMAID_LEFT_ARROWS = ("<-->", "<-.->", "<==>")
 MERMAID_RIGHT_ARROWS = ("-->", "---", "-.->", "==>", "--o", "--x")
 NODE_RE = re.compile(r'^\s*([a-z][a-z0-9_]*)\s*(?:\[\[|\[\(|\[|\(\(|\(|\{\{\{|\{\{|\{|>)\s*["\']?(.+?)["\']?\s*(?:\]\]|\)\]|\]|\)\)|\)|\}\}\}|\}\}|\}|\])\s*$')
@@ -34,6 +35,8 @@ EDGE_RE = re.compile(
     r'(?:\|["\']?([^|]+?)["\']?\|)?\s*([a-z][a-z0-9_]*)\s*$'
 )
 PARTICIPANT_RE = re.compile(r"^\s*(?:participant|actor)\s+([a-z][a-z0-9_]*)\s+as\s+(.+?)\s*$")
+CLASSDEF_RE = re.compile(r"^\s*classDef\s+([a-z][a-z0-9_]*)\s+(\S+)\s*$")
+CLASS_RE = re.compile(r"^\s*class\s+([a-z][a-z0-9_]*(?:\s*,\s*[a-z][a-z0-9_]*)*)\s+([a-z][a-z0-9_]*)\s*$")
 EDGE_COMMENT_RE = re.compile(r"^\s*%%\s*edge:([a-z][a-z0-9_]*)\s*$")
 MESSAGE_RE = re.compile(
     r"^\s*([a-z][a-z0-9_]*)\s*(?:-->>|->>|-->|->|-x|--x|-\)|--\))\s*([a-z][a-z0-9_]*)\s*:\s*(.+?)\s*$"
@@ -56,6 +59,11 @@ def validate_mermaid(ctx: ValidationContext) -> None:
         if view == "architecture":
             _parse_architecture(ctx, state, block, errors)
         else:
+            if SEQUENCE_STYLE_RE.search(block.content):
+                errors.append(
+                    f"{view}/{state} contains forbidden styling statements; "
+                    "scope palette classes apply only to architecture zones"
+                )
             _parse_sequence(ctx, state, block, errors)
     if errors:
         ctx.add("mermaid.structure_security", "fail", "Mermaid structure or security checks failed", errors)
@@ -66,9 +74,26 @@ def validate_mermaid(ctx: ValidationContext) -> None:
 
 def _parse_architecture(ctx: ValidationContext, state: str, block: StateBlock, errors: list[str]) -> None:
     boundary_stack: list[str] = []
+    declared_classdefs: set[str] = set()
+    class_assignments: list[tuple[int, str, str]] = []
     for offset, line in enumerate(block.content.splitlines()[1:], start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("%%") or stripped.startswith("direction "):
+            continue
+        if stripped.startswith("classDef"):
+            _collect_classdef(state, block.start_line + offset, line, declared_classdefs, errors)
+            continue
+        if stripped.startswith("class "):
+            statement = CLASS_RE.match(line)
+            if statement is None:
+                errors.append(
+                    f"architecture/{state} line {block.start_line + offset} has a malformed class "
+                    "statement; use 'class <zone_id> scope_<name>'"
+                )
+                continue
+            targets, class_name = statement.groups()
+            for target in (value.strip() for value in targets.split(",")):
+                class_assignments.append((block.start_line + offset, target, class_name))
             continue
         if stripped == "end":
             if not boundary_stack:
@@ -118,6 +143,75 @@ def _parse_architecture(ctx: ValidationContext, state: str, block: StateBlock, e
         errors.append(
             f"architecture/{state} leaves boundaries open at end of block: {boundary_stack}"
         )
+    _resolve_class_assignments(ctx, state, declared_classdefs, class_assignments, errors)
+
+
+def _collect_classdef(
+    state: str, line_number: int, line: str, declared_classdefs: set[str], errors: list[str]
+) -> None:
+    definition = CLASSDEF_RE.match(line)
+    if definition is None:
+        errors.append(
+            f"architecture/{state} line {line_number} has a malformed classDef; "
+            "use 'classDef scope_<name> <exact-palette-definition>'"
+        )
+        return
+    name, styles = definition.groups()
+    expected = SCOPE_PALETTE.get(name)
+    if expected is None:
+        errors.append(
+            f"architecture/{state} line {line_number} defines non-palette class {name!r}; "
+            f"only the house scope classes {sorted(SCOPE_PALETTE)} are allowed"
+        )
+    elif styles != expected:
+        errors.append(
+            f"architecture/{state} line {line_number} alters the house palette for {name!r}; "
+            f"expected 'classDef {name} {expected}'"
+        )
+    elif name in declared_classdefs:
+        errors.append(f"architecture/{state} line {line_number} duplicates classDef {name!r}")
+    else:
+        declared_classdefs.add(name)
+
+
+def _resolve_class_assignments(
+    ctx: ValidationContext,
+    state: str,
+    declared_classdefs: set[str],
+    class_assignments: list[tuple[int, str, str]],
+    errors: list[str],
+) -> None:
+    for line_number, target, class_name in class_assignments:
+        if class_name not in SCOPE_PALETTE:
+            errors.append(
+                f"architecture/{state} line {line_number} assigns non-palette class {class_name!r}; "
+                f"only the house scope classes {sorted(SCOPE_PALETTE)} are allowed"
+            )
+            continue
+        if class_name not in declared_classdefs:
+            errors.append(
+                f"architecture/{state} line {line_number} uses {class_name!r} without its "
+                "palette classDef in the same block"
+            )
+        if (state, target) in ctx.parsed.architecture_nodes:
+            errors.append(
+                f"architecture/{state} line {line_number} puts a scope class on node {target!r}; "
+                "scope colors apply to zone subgraphs, not nodes"
+            )
+            continue
+        if (state, target) not in ctx.parsed.architecture_boundaries:
+            errors.append(
+                f"architecture/{state} line {line_number} assigns a scope class to unknown "
+                f"subgraph {target!r}"
+            )
+            continue
+        key = (state, target)
+        if key in ctx.parsed.architecture_scopes:
+            errors.append(
+                f"architecture/{state} subgraph {target!r} has more than one scope class"
+            )
+            continue
+        ctx.parsed.architecture_scopes[key] = class_name
 
 
 def _parse_sequence(ctx: ValidationContext, state: str, block: StateBlock, errors: list[str]) -> None:

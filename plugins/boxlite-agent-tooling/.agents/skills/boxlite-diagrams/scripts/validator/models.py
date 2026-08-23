@@ -6,6 +6,16 @@ from typing import Any, Literal
 
 Status = Literal["pass", "fail", "error"]
 
+SCOPE_NAMES = ("external", "edge", "compute", "execution", "state", "observability")
+SCOPE_PALETTE = {
+    "scope_external": "fill:#eceff1,stroke:#607d8b,color:#1f2933",
+    "scope_edge": "fill:#dbeafe,stroke:#2563eb,color:#1f2933",
+    "scope_compute": "fill:#dcfce7,stroke:#16a34a,color:#1f2933",
+    "scope_execution": "fill:#ffedd5,stroke:#ea580c,color:#1f2933",
+    "scope_state": "fill:#ede9fe,stroke:#7c3aed,color:#1f2933",
+    "scope_observability": "fill:#fef3c7,stroke:#d97706,color:#1f2933",
+}
+
 
 @dataclass(frozen=True)
 class Check:
@@ -42,6 +52,7 @@ class ParsedDocument:
     architecture_edge_labels: dict[tuple[str, str], str] = field(default_factory=dict)
     architecture_boundaries: dict[tuple[str, str], str] = field(default_factory=dict)
     architecture_parents: dict[tuple[str, str], str] = field(default_factory=dict)
+    architecture_scopes: dict[tuple[str, str], str] = field(default_factory=dict)
     sequence_nodes: dict[tuple[str, str], str] = field(default_factory=dict)
     sequence_edges: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     sequence_edge_labels: dict[tuple[str, str], str] = field(default_factory=dict)

@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .models import ValidationContext
+from .models import SCOPE_NAMES, ValidationContext
 
 ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 KINDS = {"overview", "issue", "pr", "commit", "branch", "working-tree-change"}
@@ -23,7 +23,7 @@ SOURCE_KEYS = {"repository", "issue", "pr", "base_revision", "head_revision"}
 STATE_KEYS = {"id", "label", "revision", "proposed"}
 ITEM_KEYS = {"id", "label", "states", "views", "proposed", "evidence"}
 EDGE_KEYS = ITEM_KEYS | {"from", "to", "kind"}
-BOUNDARY_KEYS = ITEM_KEYS | {"members"}
+BOUNDARY_KEYS = ITEM_KEYS | {"members", "scope"}
 MEMBERSHIP_KEYS = {"target", "states"}
 MEMBERSHIP_TARGET_RE = re.compile(r"^(node|boundary):([a-z][a-z0-9_]*)$")
 SOURCE_EVIDENCE_KEYS = {"type", "state", "revision", "path", "line_start", "line_end", "symbol", "tokens"}
@@ -188,6 +188,9 @@ def validate_manifest(ctx: ValidationContext) -> None:
                 if item.get("kind") not in EDGE_KINDS:
                     errors.append(f"{where}.kind must be one of {sorted(EDGE_KINDS)}")
             elif item_type == "boundary":
+                scope = item.get("scope")
+                if scope is not None and scope not in SCOPE_NAMES:
+                    errors.append(f"{where}.scope must be one of {sorted(SCOPE_NAMES)}")
                 _validate_boundary_members(
                     item,
                     where,
