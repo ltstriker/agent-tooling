@@ -5,6 +5,8 @@
 #   scripts/verify-installation.sh        gates hold commits to the RECORD, offline
 #   scripts/refresh-installation.sh       advances the record when the branch moves
 #   scripts/sync-installation.sh          spawns the refresh in the background, throttled
+#   scripts/sync-guidance.sh              splices the guidance block on adoption; the
+#                                         commit gate holds it intact end-to-end
 #
 # Hermetic by construction: a gitconfig (GIT_CONFIG_GLOBAL) rewrites the one
 # hard-coded tooling URL to a local fixture remote via url.insteadOf, and pins
@@ -116,6 +118,10 @@ check_eq "history logs the adoption source" \
 [ -e "$CACHE/last-check" ] && ok "stamps last-check" || bad "stamps last-check"
 run_verify >/dev/null 2>&1
 check_eq "fresh installation verifies" "$?" 0
+grep -q '^<!-- agent-tooling:guidance:begin ' "$CONSUMER/AGENTS.md" 2>/dev/null \
+  && ok "install splices the guidance block into AGENTS.md" \
+  || bad "install splices the guidance block into AGENTS.md"
+check_eq "install creates the CLAUDE.md bridge" "$(head -n1 "$CONSUMER/CLAUDE.md" 2>/dev/null)" "@AGENTS.md"
 
 echo
 echo "## Re-running against an unmoved branch is a cheap no-op"
@@ -250,6 +256,30 @@ check_eq "AGENT_TOOLING_REFRESH=0 disables the refresh" "$(record)" "$TIP_FOUR"
 (cd "$CONSUMER" && AGENT_TOOLING_REFRESH_MINUTES=0 bash "$SYNC") 2>/dev/null
 for _ in $(seq 1 100); do [[ "$(record)" == "$TIP_FIVE" ]] && break; sleep 0.1; done
 check_eq "a due sync adopts the moved tip in the background" "$(record)" "$TIP_FIVE"
+grep -q '^<!-- agent-tooling:guidance:begin ' "$CONSUMER/AGENTS.md" \
+  && ok "background adoption left the committed block alone" \
+  || bad "background adoption left the committed block alone"
+
+echo
+echo "## The commit gate holds the guidance block intact end-to-end"
+# The agent markers are stripped so the audited-dossier branch of the gate stays
+# out of the way: verify + guidance check run for humans and agents alike.
+commit_c() { (cd "$CONSUMER" && env -u CLAUDECODE -u CODEX_SANDBOX -u AGENT_GATED git commit -qm "$1"); }
+(cd "$CONSUMER" && git add AGENTS.md CLAUDE.md)
+commit_c guidance 2> "$TMP/err"
+check_eq "guidance files commit cleanly" "$?" 0
+awk '{print} /^<!-- agent-tooling:guidance:begin /{print "TAMPERED"}' "$CONSUMER/AGENTS.md" > "$TMP/tampered"
+cp "$TMP/tampered" "$CONSUMER/AGENTS.md"
+(cd "$CONSUMER" && git add AGENTS.md)
+commit_c tamper 2> "$TMP/err"
+check_eq "a hand-edited block cannot be committed" "$?" 1
+grep -q 'edited by hand' "$TMP/err" && ok "the gate names the hand edit" \
+                                    || bad "the gate names the hand edit"
+"$(installed_plugin "$(record)")/scripts/sync-guidance.sh" --force "$CONSUMER" >/dev/null 2>&1
+check_eq "forced resync restores the block" "$?" 0
+(cd "$CONSUMER" && git add AGENTS.md)
+commit_c restored 2> "$TMP/err"
+check_eq "the restored block commits cleanly" "$?" 0
 
 echo
 printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"

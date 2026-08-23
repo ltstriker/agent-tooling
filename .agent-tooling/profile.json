@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "profile": "agent-tooling",
+  "repository": "boxlite-ai/agent-tooling",
+  "tooling": {
+    "repository": "boxlite-ai/agent-tooling",
+    "ref": "main"
+  },
+  "checks": [
+    {
+      "name": "host-parity",
+      "command": "bash plugins/boxlite-agent-tooling/host-parity.test.sh"
+    },
+    {
+      "name": "sync-guidance",
+      "command": "bash plugins/boxlite-agent-tooling/scripts/sync-guidance.test.sh"
+    }
+  ]
+}

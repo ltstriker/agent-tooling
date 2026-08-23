@@ -14,6 +14,13 @@ for hook in pre-commit commit-msg pre-push post-checkout post-merge post-rewrite
   }
 done
 
+# Materialize the shared engineering guidance into the consumer's committed
+# instructions files (AGENTS.md / CLAUDE.md). The script itself defers on
+# lifecycle-triggered installs (AGENT_TOOLING_SYNC_ACTIVE=1): implicit paths
+# never mutate committed files — the commit gate nags and a manual
+# ./.agent-tooling/install.sh performs the splice.
+"$plugin_root/scripts/sync-guidance.sh" "$repo_root"
+
 git -C "$repo_root" config extensions.worktreeConfig true
 git -C "$repo_root" config --worktree core.hooksPath "$plugin_root/.githooks"
 configured="$(git -C "$repo_root" config --worktree --get core.hooksPath || true)"
