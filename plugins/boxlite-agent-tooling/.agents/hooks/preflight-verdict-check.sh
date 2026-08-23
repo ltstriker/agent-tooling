@@ -461,28 +461,44 @@ Re-check THOSE findings against what changed and carry forward the proof entries
 whose evidence still holds, rather than re-deriving every claim from scratch. Still
 read the WHOLE turn — narrowing applies to re-verification only, never to finding
 claims, so anything the fix newly asserts is still caught."
-  cat <<EOF
-Audit before ending — run the audit SYNCHRONOUSLY (the dossier
-must exist before you end), via WHICHEVER of these your harness supports:
+  # The route list comes from .agents/lib/subagent.sh so this gate and the commit-push
+  # gate cannot drift apart on how an auditor is spawned. Each host uses its own
+  # built-in — Task() or collaboration.spawn_agent — and the headless runner is offered
+  # only for callers with no agent runtime at all.
+  #
+  # Degrades rather than blocks when the library is missing. Unlike the commit-push
+  # gate, this is a Stop hook: refusing here would deny turn-end forever with no usable
+  # instruction attached, which is the meaningless-loop class this file's header exists
+  # to eliminate. A turn that ends unaudited with a loud notice is recoverable; an agent
+  # that can never finish a turn is not.
+  local lib="$tooling_root/.agents/lib/subagent.sh"
+  if [[ -r "$lib" ]]; then
+    # shellcheck source=../lib/subagent.sh
+    source "$lib"
+    subagent_instruction \
+      --agent verdict-auditor \
+      --root "$tooling_root" \
+      --description 'verdict proof check' \
+      --artifact "$verdict_file" \
+      --task "$(subagent_prompt verdict-task "$tooling_root" "transcript_path=${transcript_path}")" \
+      --headless "bash '${tooling_root}/.agents/hooks/run-verdict-audit.sh' '${transcript_path}'"
+  else
+    printf 'preflight-verdict-check: missing %s — emitting the headless route only\n' "$lib" >&2
+    cat <<EOF
+Audit before ending — run the audit SYNCHRONOUSLY (the dossier must exist before you
+end):
 
-Claude Code:
-  Task(subagent_type='verdict-auditor',
-       description='verdict proof check',
-       prompt='Audit my final turn — every assistant message since the last real user
-               message: each claim it presents as established, mid-turn or closing, must have
-               concrete, direct proof in the evidence — the working-tree diff, the
-               commands and their output in the transcript, or cited files/logs. A claim
-               backed only by guessing or indirect inference is NOT proven. A turn that
-               asserts nothing verifiable is a PASS. transcript_path: ${transcript_path}')
-       (run_in_background: false)
-
-Any other agent (no Task tool):
   bash '${tooling_root}/.agents/hooks/run-verdict-audit.sh' '${transcript_path}'
 
-The AUDITOR — not you — writes ${verdict_file}; do not write it yourself. If you are
-pausing or asking the user something, have it record IN_PROGRESS with what remains;
-if a claim genuinely cannot be proven here, it can mark that proof 'blocked' with the
-residual risk. Then end your turn again.${prior}
+The AUDITOR — not you — writes ${verdict_file}; do not write it yourself.
+EOF
+  fi
+
+  cat <<EOF
+
+If you are pausing or asking the user something, have the auditor record IN_PROGRESS
+with what remains; if a claim genuinely cannot be proven here, it can mark that proof
+'blocked' with the residual risk. Then end your turn again.${prior}
 EOF
 }
 # ─────────────────────────────────────────────────────────────────────────────

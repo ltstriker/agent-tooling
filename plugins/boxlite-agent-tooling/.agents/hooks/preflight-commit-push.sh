@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # PreToolUse hook: gate `git commit` / `git push` on a fresh audit verdict.
 #
-# Claude Code produces that verdict through the commit-push-auditor subagent
-# (see .claude/agents/commit-push-auditor.md). Codex produces the same artifact
-# by running .agents/hooks/run-commit-push-audit.sh, whose default mode invokes
-# `codex exec` with hooks disabled.
+# The verdict comes from the commit-push-auditor spec
+# (.claude/agents/commit-push-auditor.md), spawned by whichever built-in the running
+# agent has. This gate never produces it.
 #
 # Flow on a denied attempt:
 #   1. Hook denies the git tool call.
-#   2. Reason text instructs the parent agent to run the right audit producer.
-#   3. The producer writes .agents/state/last-audit.json.
+#   2. Reason text names every route to an auditor; the agent takes the one it has.
+#   3. That auditor writes .agents/state/last-audit.json.
 #   4. Parent retries -> hook reads the artifact and allows on PASS.
 #
 # Wired in .claude/settings.json under hooks.PreToolUse with matcher "Bash".
@@ -197,23 +196,35 @@ valid_handoff_command_hash() {
   return 1
 }
 
-claude_invoke_instruction="Invoke the commit-push-auditor subagent now:
-  Task(subagent_type='commit-push-auditor',
-       description='CLAUDE.md audit',
-       prompt='Audit the exact blocked Bash tool_input.command for this git ${kind} on branch ${branch}; copy the command from the tool input, do not paraphrase it.')
-The subagent will write its verdict to .agents/state/last-audit.json. Retry the
-same git command after it reports PASS."
-
-codex_invoke_instruction="Run the Codex audit producer now:
-  CODEX_COMMIT_PUSH_AUDIT_MODE=agentic bash '${tooling_root}/.agents/hooks/run-commit-push-audit.sh' ${kind} '<target command>'
-The producer invokes codex exec with hooks disabled and writes its verdict to
-.agents/state/last-audit.json. Retry the same git command after it reports PASS.
-Set CODEX_BIN to a working Codex CLI binary if the default codex command is not usable."
-
-invoke_instruction="$claude_invoke_instruction"
-if [[ -n "${CODEX_SANDBOX:-}" ]]; then
-  invoke_instruction="$codex_invoke_instruction"
+# ── Re-audit instruction ─────────────────────────────────────────────────────
+# Sourced HERE rather than at the top of the file so the two early exits above still
+# apply: a missing library must not turn every unrelated Bash call into an error, only
+# the git commands this gate actually guards.
+#
+# And it exits 2 rather than continuing without the library. A PreToolUse hook that
+# merely crashes is reported and stepped over, which on a DENY gate means the commit
+# proceeds unaudited — the one outcome worse than a noisy failure. Exit 2 blocks.
+subagent_lib="$tooling_root/.agents/lib/subagent.sh"
+if [[ ! -r "$subagent_lib" ]]; then
+  printf 'preflight-commit-push: missing %s — refusing to gate without it\n' "$subagent_lib" >&2
+  exit 2
 fi
+# shellcheck source=../lib/subagent.sh
+source "$subagent_lib"
+
+# One instruction, naming every route. Nothing here inspects the environment to choose
+# between hosts: capability is something the agent knows about itself, while an
+# environment variable can be set by whatever launched the hook.
+invoke_instruction="$(subagent_instruction \
+  --agent commit-push-auditor \
+  --root "$tooling_root" \
+  --description 'CLAUDE.md audit' \
+  --artifact '.agents/state/last-audit.json' \
+  --task "$(subagent_prompt commit-push-task "$tooling_root" "kind=${kind}" "branch=${branch}")" \
+  --headless "CODEX_COMMIT_PUSH_AUDIT_MODE=agentic bash '${tooling_root}/.agents/hooks/run-commit-push-audit.sh' ${kind} '<target command>'
+    (set CODEX_BIN if the default codex command is not usable)")
+
+Retry the same git command after the verdict reports PASS."
 
 validate_audit() {
   local consume_on_pass="${1:-consume}"
@@ -332,29 +343,10 @@ ${advisories}" '{
   fi
 }
 
-# Codex should not shell out to the Claude CLI to manufacture the audit
-# artifact. When Codex calls this as a PreToolUse hook, run the Codex audit
-# producer first; the git-level hook then consumes the same .last-audit.json
-# contract below.
-codex_pretool_audit=0
-if [[ -n "${CODEX_SANDBOX:-}" && -z "${GITHOOK_DELEGATED:-}" ]]; then
-  defer_push_to_git_hook=0
-  if [[ "$kind" == "push" ]]; then
-    hooks_path_for_codex="$(git config core.hooksPath 2>/dev/null || true)"
-    if [[ "$hooks_path_for_codex" == *".githooks" ]]; then
-      [[ "$hooks_path_for_codex" != /* ]] && hooks_path_for_codex="$repo_root/$hooks_path_for_codex"
-      [[ -x "$hooks_path_for_codex/pre-push" ]] && defer_push_to_git_hook=1
-    fi
-  fi
-
-  if [[ "$defer_push_to_git_hook" != 1 ]]; then
-    codex_pretool_audit=1
-    codex_auditor="$tooling_root/.agents/hooks/run-commit-push-audit.sh"
-    if [[ -r "$codex_auditor" ]]; then
-      bash "$codex_auditor" "$kind" "$command" >/dev/null 2>&1 || true
-    fi
-  fi
-fi
+# This gate never produces the audit itself. It denies, names every way to spawn an
+# auditor, and the agent uses whichever its runtime provides — Task() under Claude
+# Code, collaboration.spawn_agent under Codex, the headless producer when neither
+# exists. One path for every host, and no environment sniffing to get it wrong.
 
 # Delegate to the git-level gate when installed: with core.hooksPath pointing at
 # .githooks, the same contract is enforced by .githooks/pre-commit|pre-push for
@@ -372,20 +364,24 @@ if [[ -z "${GITHOOK_DELEGATED:-}" ]]; then
   if [[ "$hooks_path" == *".githooks" ]]; then
     [[ "$hooks_path" != /* ]] && hooks_path="$repo_root/$hooks_path"
     if [[ -x "$hooks_path/pre-$kind" ]]; then
-      if [[ "$codex_pretool_audit" == 1 ]]; then
-        # Validate without consuming: the git-level hook is the single consumer.
-        validate_audit keep
-      fi
+      # No validation here: the git-level gate runs this same script with
+      # GITHOOK_DELEGATED set, and that pass is the single consumer of the artifact.
       write_command_handoff
       exit 0
     fi
   fi
 fi
 
+# A push audit can only be produced HERE. validate_audit refuses any push dossier not
+# bound to pushed_diff_sha256, and that hash comes from the ref-update stdin git hands
+# the pre-push hook — input that exists for the duration of this call and cannot be
+# reconstructed on a retry. Denying and asking the agent to audit afterwards would ask
+# it to bind to data that no longer exists, so the producer runs at the one moment the
+# exact ref update is known.
 if [[ -n "${CODEX_SANDBOX:-}" && -n "${GITHOOK_DELEGATED:-}" && "$kind" == "push" ]]; then
-  codex_auditor="$tooling_root/.agents/hooks/run-commit-push-audit.sh"
-  if [[ -r "$codex_auditor" ]]; then
-    bash "$codex_auditor" "$kind" "$command" >/dev/null 2>&1 || true
+  headless_auditor="$tooling_root/.agents/hooks/run-commit-push-audit.sh"
+  if [[ -r "$headless_auditor" ]]; then
+    bash "$headless_auditor" "$kind" "$command" >/dev/null 2>&1 || true
   fi
 fi
 

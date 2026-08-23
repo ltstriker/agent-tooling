@@ -61,13 +61,28 @@ strip_frontmatter() {  # $1 = spec file
   awk 'BEGIN{fm=0} NR==1 && /^---$/{fm=1; next} fm==1 && /^---$/{fm=2; next} fm!=1' "$1"
 }
 
-audit_prompt="Audit the final turn in the session transcript — every assistant
-message since the last real user message: each claim
-it presents as established must have concrete, direct proof in the evidence — the
-working-tree diff, the commands and their output in the transcript, or cited
-files/logs. A claim backed only by guessing or indirect inference is NOT proven. A
-turn that asserts nothing verifiable is a PASS. Follow your procedure and write the
-dossier to ${verdict_file}. transcript_path: ${transcript_path}"
+# The prompt is a document, not a string literal: .agents/prompts/verdict-runner.md.
+# Loaded through the shared library so this runner and the Stop gate that offers the
+# in-agent route cannot drift apart on what "proven" means.
+#
+# The document is the only copy. A second one drifting out of date would not announce
+# itself — the audit would run and return a confident verdict against a superseded
+# standard of proof. A missing document is therefore exit 2, the code this script
+# already uses for "no runner available", rather than something to improvise around.
+# The prompts ship in this same pinned tree, so their absence means the gates that
+# reach this script are equally broken.
+subagent_lib="$tooling_root/.agents/lib/subagent.sh"
+if [[ ! -r "$subagent_lib" ]]; then
+  printf 'run-verdict-audit.sh: missing %s — cannot build the audit prompt.\n' "$subagent_lib" >&2
+  exit 2
+fi
+# shellcheck source=../lib/subagent.sh
+source "$subagent_lib"
+if ! audit_prompt="$(subagent_prompt verdict-runner "$tooling_root" \
+                      "verdict_file=${verdict_file}" "transcript_path=${transcript_path}")"; then
+  printf 'run-verdict-audit.sh: could not load .agents/prompts/verdict-runner.md.\n' >&2
+  exit 2
+fi
 
 # The audit must be attributable to a fresh run, not a leftover dossier, so each
 # runner removes any existing one first and EXISTENCE alone then proves freshness.

@@ -12,8 +12,13 @@
 # itself: the rule is self-gating (it only shapes code/architecture turns, inert
 # otherwise) and carries a one-line self-check for the retroactive "if you just forgot".
 #
-# Cadence: emit on the first prompt of a session, then every Nth. Override N with
-# RULE_RECENCY_INTERVAL (default 5). Best-effort — never blocks a prompt, always exits 0.
+# Two blocks, two lifetimes. REPLY SHAPE governs the reply being generated right now,
+# so it is emitted on EVERY non-ack prompt: a cadence would leave it absent on most
+# turns, and an absent cap is not a cap. WORKFLOW is task-start guidance, so it keeps
+# the periodic cadence — emit on the first prompt of a session, then every Nth
+# (override N with RULE_RECENCY_INTERVAL, default 5). Repeating the long block every
+# turn buys nothing and trains the reader to skim the whole injection.
+# Best-effort — never blocks a prompt, always exits 0.
 
 # Same treatment as the counter below, and for the same reason: this reaches an
 # arithmetic context (`count % interval`), so a non-numeric value is evaluated as
@@ -91,14 +96,36 @@ case "$count" in ''|*[!0123456789]*) count=0 ;; esac
 count=$((10#$count + 1))
 printf '%s' "$count" > "$state_file" 2>/dev/null || true
 
+# Every non-ack prompt. Ordering inside the block is load-bearing: the exemptions
+# follow the budget immediately, so the cap is already qualified when it is read. Put
+# them last and there is a beat where the constraint reads as absolute — which is
+# exactly when caveats and failure detail get pruned to fit.
+#
+# The renderable-output line is a hard fact about the destination terminal, not a
+# preference: mermaid, inline images, and task-list checkboxes are dropped or mangled
+# by the TUIs this plugin ships to. Naming them keeps the model from spending the
+# reply on a picture nobody will see.
+cat <<'EOF'
+REPLY SHAPE:
+• <=80 words of prose. NOT counted: code, diagrams, tables, file paths, and any
+  statement of uncertainty, risk, or a failing test — never trim those to fit.
+• No preamble, no recap of the question, no "great question", no closing offer.
+• 3+ entities, or any relationship between them → draw it, don't narrate it.
+  Code paths: one line per hop, `fn (Type · file:LOC) — role`, then one **Key:** line.
+  If a prior reply explained code without one, open the next code reply with the fix.
+• Renderable here: ASCII inside a fenced block, and NARROW tables. Nothing else.
+  Never mermaid, never images, never "- [x]" — they vanish or mangle on this host.
+• The cap lifts ONLY on an explicit ask for depth — "explain", "in detail", "walk me
+  through", "thorough", "full version", a word count — or an equivalent request.
+  A bare "why" does not lift it.
+EOF
+
+# First prompt of a session, then every Nth.
 { [ "$count" -eq 1 ] || [ $((count % interval)) -eq 0 ]; } || exit 0
 
 cat <<'EOF'
-RULES REMINDER (re-anchoring — the full rules live in CLAUDE.md):
-• Reply shape (code / architecture questions): lead with a compact call graph —
-  one line per hop `fn_name  (Type · file:LOC)  — role`, flow by arrows/indent — then one **Key:** line.
-  If a prior reply explained code without one, open your next code reply with the corrected version.
-• Minimal words: no preamble, no question-recap, no "great question". Prose only for a "why" a graph can't carry.
+
+WORKFLOW REMINDER (re-anchoring — the full rules live in CLAUDE.md):
 • Before non-trivial work: follow CLAUDE.md's Workflow (understand → research → design → implement → test → verify). Research prior art across as many projects as possible BEFORE any design — mandatory.
 EOF
 exit 0
