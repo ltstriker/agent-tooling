@@ -28,14 +28,34 @@ tooling_repo="$(jq -er '.tooling.repository | select(type == "string" and length
   printf 'agent-tooling: tooling.repository must be a non-empty string in %s\n' "$profile_file" >&2
   exit 1
 }
-tooling_sha="$(jq -er '.tooling.sha | select(test("^[0-9a-f]{40}$"))' "$profile_file")" || {
-  printf 'agent-tooling: tooling.sha must be a full lowercase commit SHA in %s\n' "$profile_file" >&2
+tooling_ref="$(jq -er '.tooling.ref | select(type == "string" and length > 0)' "$profile_file")" || {
+  printf 'agent-tooling: tooling.ref must name the branch to float on in %s\n' "$profile_file" >&2
   exit 1
 }
+[[ ! "$tooling_ref" =~ ^[0-9a-f]{40}$ ]] || {
+  printf 'agent-tooling: tooling.ref names a branch; to freeze a revision write it to .agent-tooling/hold\n' >&2
+  exit 1
+}
+# check-ref-format allows a leading dash (it is legal REF syntax); refuse it anyway
+# so the ref can never read as an option to anything downstream.
+if [[ "$tooling_ref" == -* ]] || ! git check-ref-format "refs/heads/$tooling_ref" >/dev/null 2>&1; then
+  printf 'agent-tooling: tooling.ref is not a valid branch name: %s\n' "$tooling_ref" >&2
+  exit 1
+fi
 [[ "$tooling_repo" == "boxlite-ai/agent-tooling" ]] || {
   printf 'agent-tooling: unsupported tooling repository: %s\n' "$tooling_repo" >&2
   exit 1
 }
+# The emergency brake is validated wherever the profile is: a hold that cannot be
+# obeyed must fail the installation, never let it quietly keep floating.
+hold_file="$repo_root/.agent-tooling/hold"
+if [[ -e "$hold_file" ]]; then
+  hold_sha="$(tr -d '\n' < "$hold_file")"
+  { [[ "$hold_sha" =~ ^[0-9a-f]{40}$ ]] && [[ "$(wc -c < "$hold_file")" -le 41 ]]; } || {
+    printf 'agent-tooling: %s must contain exactly one full lowercase commit SHA\n' "$hold_file" >&2
+    exit 1
+  }
+fi
 # The repository a consumer declares is checked against the remote it actually has,
 # not against a list shipped here. Git is the authority on which repository this is,
 # and a central roster would have to name private repositories inside a public plugin
@@ -77,29 +97,32 @@ jq -e '
   exit 1
 }
 
+# Every host floats on the SAME ref the git gates float on. This is a weaker
+# agreement than the old same-revision pin — hosts re-resolve the ref on their own
+# schedules — but same-ref is the strongest property a floating fleet can declare.
 for settings_file in "$repo_root/.claude/settings.json" "$repo_root/.github/copilot/settings.json"; do
   [[ -r "$settings_file" ]] || { printf 'agent-tooling: missing activation settings: %s\n' "$settings_file" >&2; exit 1; }
-  jq -e --arg sha "$tooling_sha" '
+  jq -e --arg ref "$tooling_ref" '
     .extraKnownMarketplaces["boxlite-agent-tooling"].source.repo == "boxlite-ai/agent-tooling" and
-    .extraKnownMarketplaces["boxlite-agent-tooling"].source.ref == $sha and
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.ref == $ref and
     .enabledPlugins["boxlite-agent-tooling@boxlite-agent-tooling"] == true
   ' "$settings_file" >/dev/null || {
-    printf 'agent-tooling: activation settings do not match the pinned tooling revision: %s\n' "$settings_file" >&2
+    printf 'agent-tooling: activation settings do not float on tooling.ref: %s\n' "$settings_file" >&2
     exit 1
   }
 done
 
 codex_marketplace="$repo_root/.agents/plugins/marketplace.json"
 [[ -r "$codex_marketplace" ]] || { printf 'agent-tooling: missing Codex marketplace: %s\n' "$codex_marketplace" >&2; exit 1; }
-jq -e --arg sha "$tooling_sha" '
+jq -e --arg ref "$tooling_ref" '
   any(.plugins[];
     .name == "boxlite-agent-tooling" and
     .source.url == "https://github.com/boxlite-ai/agent-tooling.git" and
-    .source.sha == $sha and
+    .source.ref == $ref and
     .source.path == "./plugins/boxlite-agent-tooling" and
     .policy.installation == "INSTALLED_BY_DEFAULT")
 ' "$codex_marketplace" >/dev/null || {
-  printf 'agent-tooling: Codex marketplace does not match the pinned tooling revision: %s\n' "$codex_marketplace" >&2
+  printf 'agent-tooling: Codex marketplace does not float on tooling.ref: %s\n' "$codex_marketplace" >&2
   exit 1
 }
 
