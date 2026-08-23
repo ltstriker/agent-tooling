@@ -188,7 +188,8 @@ setup() {
   plugin="$checkout/plugins/boxlite-agent-tooling"
   ln -s "$plugin/.githooks" "$d/.githooks"
   mkdir -p "$d/.agent-tooling"
-  printf '{"tooling":{"sha":"%s"}}\n' "$head" > "$d/.agent-tooling/profile.json"
+  printf '{"tooling":{"repository":"boxlite-ai/agent-tooling","ref":"main"}}\n' > "$d/.agent-tooling/profile.json"
+  printf '%s\n' "$head" > "$d/.git/agent-tooling/current"
   printf '/.agent-tooling/\n' >> "$d/.git/info/exclude"
   git -C "$d" config extensions.worktreeConfig true
   git -C "$d" config --worktree core.hooksPath "$plugin/.githooks"
@@ -1047,24 +1048,23 @@ git -C "$INST" config user.email t@t.test
 git -C "$INST" config user.name tester
 mkdir -p "$INST/.githooks" "$INST/.agent-tooling" "$INST/.agents/plugins" \
   "$INST/.claude" "$INST/.github/copilot"
-tooling_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-jq -n --arg sha "$tooling_sha" '{
+jq -n '{
   schemaVersion: 1,
   profile: "boxlite",
   repository: "boxlite-ai/boxlite",
-  tooling: {repository: "boxlite-ai/agent-tooling", sha: $sha},
+  tooling: {repository: "boxlite-ai/agent-tooling", ref: "main"},
   checks: [{name: "test", command: "make test"}]
 }' > "$INST/.agent-tooling/profile.json"
-jq -n --arg sha "$tooling_sha" '{
+jq -n '{
   extraKnownMarketplaces: {
     "boxlite-agent-tooling": {
-      source: {source: "github", repo: "boxlite-ai/agent-tooling", ref: $sha}
+      source: {source: "github", repo: "boxlite-ai/agent-tooling", ref: "main"}
     }
   },
   enabledPlugins: {"boxlite-agent-tooling@boxlite-agent-tooling": true}
 }' > "$INST/.claude/settings.json"
 cp "$INST/.claude/settings.json" "$INST/.github/copilot/settings.json"
-jq -n --arg sha "$tooling_sha" '{
+jq -n '{
   name: "fixture",
   interface: {displayName: "Fixture"},
   plugins: [{
@@ -1073,7 +1073,7 @@ jq -n --arg sha "$tooling_sha" '{
       source: "git-subdir",
       url: "https://github.com/boxlite-ai/agent-tooling.git",
       path: "./plugins/boxlite-agent-tooling",
-      sha: $sha
+      ref: "main"
     },
     policy: {installation: "INSTALLED_BY_DEFAULT", authentication: "ON_INSTALL"}
   }]

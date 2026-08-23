@@ -44,22 +44,32 @@ make_tooling() {
   printf '%s' "$sha"
 }
 
+# Floating consumer: the profile and every host activation carry the BRANCH; the
+# adopted revision lives only in the record the installer writes.
 write_consumer_profile() {
-  local sha="$1"
   mkdir -p "$CONSUMER/.agent-tooling" "$CONSUMER/.agents/plugins" \
     "$CONSUMER/.claude" "$CONSUMER/.github/copilot"
-  jq -nc --arg sha "$sha" '{schemaVersion:1,profile:"consumer",repository:"boxlite-ai/example-consumer",tooling:{repository:"boxlite-ai/agent-tooling",sha:$sha},checks:[{name:"test",command:"true"}]}' \
+  jq -nc '{schemaVersion:1,profile:"consumer",repository:"boxlite-ai/example-consumer",tooling:{repository:"boxlite-ai/agent-tooling",ref:"main"},checks:[{name:"test",command:"true"}]}' \
     > "$CONSUMER/.agent-tooling/profile.json"
-  jq -nc --arg sha "$sha" '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{repo:"boxlite-ai/agent-tooling",ref:$sha}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
+  jq -nc '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{repo:"boxlite-ai/agent-tooling",ref:"main"}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
     > "$CONSUMER/.claude/settings.json"
   cp "$CONSUMER/.claude/settings.json" "$CONSUMER/.github/copilot/settings.json"
-  jq -nc --arg sha "$sha" '{plugins:[{name:"boxlite-agent-tooling",source:{url:"https://github.com/boxlite-ai/agent-tooling.git",sha:$sha,path:"./plugins/boxlite-agent-tooling"},policy:{installation:"INSTALLED_BY_DEFAULT"}}]}' \
+  jq -nc '{plugins:[{name:"boxlite-agent-tooling",source:{url:"https://github.com/boxlite-ai/agent-tooling.git",ref:"main",path:"./plugins/boxlite-agent-tooling"},policy:{installation:"INSTALLED_BY_DEFAULT"}}]}' \
     > "$CONSUMER/.agents/plugins/marketplace.json"
 }
 
+write_record() {
+  printf '%s\n' "$1" > "$COMMON/agent-tooling/current"
+}
+
+# Lifecycle events must not dial out mid-suite: the refresh spawn is exercised by
+# templates/install.test.sh against a local remote, not against github.com.
+export AGENT_TOOLING_REFRESH=0
+
 printf '/.agents/state/\n/.claude/.*\n' > "$CONSUMER/.gitignore"
 SHA_ONE="$(make_tooling one)"
-write_consumer_profile "$SHA_ONE"
+write_consumer_profile
+write_record "$SHA_ONE"
 cp "$(cd "$PLUGIN_ROOT/../.." && pwd -P)/templates/install.sh" "$CONSUMER/.agent-tooling/install.sh"
 chmod +x "$CONSUMER/.agent-tooling/install.sh"
 
@@ -78,13 +88,17 @@ printf '#!/usr/bin/env bash\nprintf "checkout %s %s %s\\n" "$1" "$2" "$3" >> "%s
   '%s' '%s' '%s' "$ROOT/chained.log" > "$COMMON/hooks/post-checkout"
 chmod +x "$COMMON/hooks/post-checkout"
 
+# A hold is how a floating consumer names a revision explicitly; the cache already
+# holds it (make_tooling), so adoption needs no network — exactly a laptop that
+# fetched earlier and then went offline.
 SHA_TWO="$(make_tooling two)"
-write_consumer_profile "$SHA_TWO"
+printf '%s\n' "$SHA_TWO" > "$CONSUMER/.agent-tooling/hold"
 (cd "$CONSUMER" && "$HOOKS_ONE/post-checkout" old new 1) 2> "$ROOT/sync.err"
 HOOKS_TWO="$COMMON/agent-tooling/$SHA_TWO/plugins/boxlite-agent-tooling/.githooks"
-check_eq "checkout synchronizes a changed pin" "$(git -C "$CONSUMER" config --worktree --get core.hooksPath)" "$HOOKS_TWO"
+check_eq "checkout adopts a new hold" "$(git -C "$CONSUMER" config --worktree --get core.hooksPath)" "$HOOKS_TWO"
+check_eq "checkout records the adopted revision" "$(head -n1 "$COMMON/agent-tooling/current")" "$SHA_TWO"
 check_eq "checkout preserves chained hook arguments" "$(cat "$ROOT/chained.log")" "checkout old new 1"
-check_eq "checkout reports synchronization" "$(grep -c 'synchronized the pinned tooling revision' "$ROOT/sync.err")" 1
+check_eq "checkout reports synchronization" "$(grep -c 'synchronized the recorded tooling revision' "$ROOT/sync.err")" 1
 
 # shellcheck disable=SC2016 # $1 belongs to the generated hook.
 printf '#!/usr/bin/env bash\nprintf "rewrite %s\\n" "$1" >> "%s"\ncat >> "%s"\n' \
@@ -100,7 +114,7 @@ check_eq "installer explains the lock" "$(grep -c 'another installation is alrea
 rmdir "$COMMON/agent-tooling/.install.lock"
 
 BOGUS_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-write_consumer_profile "$BOGUS_SHA"
+printf '%s\n' "$BOGUS_SHA" > "$CONSUMER/.agent-tooling/hold"
 printf '#!/usr/bin/env bash\nexit 7\n' > "$CONSUMER/.agent-tooling/install.sh"
 chmod +x "$CONSUMER/.agent-tooling/install.sh"
 (cd "$CONSUMER" && "$HOOKS_TWO/post-merge" 0) 2> "$ROOT/failure.err"

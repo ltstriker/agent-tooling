@@ -80,7 +80,8 @@ mkdir -p "$REPO/.git/agent-tooling"
 mv "$scratch" "$REPO/.git/agent-tooling/$PIN_SHA"
 PIN="$REPO/.git/agent-tooling/$PIN_SHA/$plugin_rel"
 mkdir -p "$REPO/.agent-tooling"
-printf '{"tooling":{"sha":"%s"}}\n' "$PIN_SHA" > "$REPO/.agent-tooling/profile.json"
+printf '{"tooling":{"repository":"boxlite-ai/agent-tooling","ref":"main"}}\n' > "$REPO/.agent-tooling/profile.json"
+printf '%s\n' "$PIN_SHA" > "$REPO/.git/agent-tooling/current"
 git -C "$REPO" config extensions.worktreeConfig true
 git -C "$REPO" config --worktree core.hooksPath "$PIN/.githooks"
 # From here on, the hook under test IS the pinned copy — and so is the watcher it
