@@ -134,10 +134,21 @@ set_target_mode() {  # $1 = temp file, $2 = destination (need not exist yet)
   }
 }
 
-write_block() {  # emit the full marker-wrapped block on stdout
-  printf '%srev=%s sha256=%s -->\n' "$BEGIN_PREFIX" "$tooling_rev" "$canonical_sha12"
+# Presentation is separate from content. The blank line after the begin marker is
+# required by Markdown composition, not by us: a formatter treats an HTML comment
+# butted against the following block as a mistake, and being formatter-clean is
+# what keeps the block out of a consumer's CI failures. Integrity ignores these
+# separators — classify_target trims the body's blank edges before hashing — so
+# the recorded sha256 stays the hash of the canonical itself, and `git show
+# <rev>:guidance/workflow.md` still reproduces what a reader sees.
+render_block() {  # $1 = revision to stamp; emits the full marker-wrapped block
+  printf '%srev=%s sha256=%s -->\n\n' "$BEGIN_PREFIX" "$1" "$canonical_sha12"
   cat "$canonical"
   printf '%s\n' "$END_MARKER"
+}
+
+write_block() {  # the block as it should be written now
+  render_block "$tooling_rev"
 }
 
 resolve_file() {  # follow symlinks (bounded), print the physical path of a regular file
@@ -238,7 +249,11 @@ classify_target() {
   fi
   inner_tmp="$(mktemp "${TMPDIR:-/tmp}/agent-tooling-guidance.XXXXXX")"
   tmp_files+=("$inner_tmp")
-  awk -v s="$begin_ln" -v e="$end_ln" 'NR > s && NR < e' "$f" > "$inner_tmp"
+  # Content is the body with its blank edges trimmed, so the separators that
+  # Markdown composition requires never read as a hand-edit or as staleness.
+  awk -v s="$begin_ln" -v e="$end_ln" '
+    NR > s && NR < e { line[++n] = $0; if ($0 ~ /[^[:space:]]/) { if (!first) first = n; last = n } }
+    END { for (i = first; i <= last; i++) print line[i] }' "$f" > "$inner_tmp"
   begin_line="$(sed -n "${begin_ln}p" "$f")"
   if ! printf '%s\n' "$begin_line" | grep -qE "$BEGIN_RE"; then
     block_state=hand-edited
@@ -249,10 +264,26 @@ classify_target() {
   inner_sha="$(shasum -a 256 "$inner_tmp" | awk '{print $1}')"
   if [[ "$marker_sha" != "${inner_sha:0:12}" ]]; then
     block_state=hand-edited
-  elif ! cmp -s "$inner_tmp" "$canonical"; then
+    return 0
+  fi
+  if ! cmp -s "$inner_tmp" "$canonical"; then
     block_state=stale
-  else
+    return 0
+  fi
+  # Right content, possibly rendered by an older layout. Compare against what
+  # would be written now, holding the recorded rev fixed so a mere revision bump
+  # still produces no write — byte-stability applies to layout too, and without
+  # this a presentation fix could never reach a block whose content matches.
+  local actual_tmp expected_tmp
+  actual_tmp="$(mktemp "${TMPDIR:-/tmp}/agent-tooling-guidance.XXXXXX")"
+  expected_tmp="$(mktemp "${TMPDIR:-/tmp}/agent-tooling-guidance.XXXXXX")"
+  tmp_files+=("$actual_tmp" "$expected_tmp")
+  awk -v s="$begin_ln" -v e="$end_ln" 'NR >= s && NR <= e' "$f" > "$actual_tmp"
+  render_block "$block_rev" > "$expected_tmp"
+  if cmp -s "$actual_tmp" "$expected_tmp"; then
     block_state=current
+  else
+    block_state=stale
   fi
 }
 

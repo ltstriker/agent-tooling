@@ -83,6 +83,31 @@ run_sync "$SYNC" "$R" >/dev/null 2>&1
 check_eq "one block despite the bridge annotation" "$(grep -c '^<!-- agent-tooling:guidance:begin ' "$R/CLAUDE.md" || true)" 0
 
 echo
+echo "## The rendered block composes with Markdown formatters"
+# The canonical being formatter-clean is not enough: a formatter judges the
+# COMPOSITION, and an HTML comment butted against the following block is a
+# formatting error. Consumers whose formatter covers root markdown fail CI on it.
+check_eq "a blank line follows the begin marker" \
+  "$(awk '/^<!-- agent-tooling:guidance:begin /{getline; print ($0 == "" ? "yes" : "no"); exit}' "$R/AGENTS.md")" "yes"
+check_eq "the end marker follows content directly" \
+  "$(awk '/^<!-- agent-tooling:guidance:end -->$/{print (prev == "" ? "blank" : "text"); exit} {prev = $0}' "$R/AGENTS.md")" "text"
+# Layout drift must be repairable even though the content already matches —
+# otherwise byte-stability would freeze every block ever written in the old shape.
+OLD="$TMP/old-layout"; mkrepo "$OLD"
+run_sync "$SYNC" "$OLD" >/dev/null 2>&1
+awk '/^<!-- agent-tooling:guidance:begin /{print; getline; next} {print}' "$OLD/AGENTS.md" > "$OLD/tmp" && mv "$OLD/tmp" "$OLD/AGENTS.md"
+check_eq "the old layout is detectably different" \
+  "$(awk '/^<!-- agent-tooling:guidance:begin /{getline; print ($0 == "" ? "yes" : "no"); exit}' "$OLD/AGENTS.md")" "no"
+run_sync "$SYNC" --check "$OLD" >/dev/null 2>&1
+check_eq "check does not call an old layout hand-edited" "$?" 0
+run_sync "$SYNC" "$OLD" > "$TMP/out" 2>&1
+check_eq "sync repairs the layout" \
+  "$(awk '/^<!-- agent-tooling:guidance:begin /{getline; print ($0 == "" ? "yes" : "no"); exit}' "$OLD/AGENTS.md")" "yes"
+run_sync "$SYNC" --check "$OLD" >/dev/null 2> "$TMP/err"
+check_eq "the repaired block checks clean" "$?" 0
+[[ ! -s "$TMP/err" ]] && ok "and silently" || bad "and silently"
+
+echo
 echo "## Re-running is a byte-stable no-op"
 cp "$R/AGENTS.md" "$TMP/snap"
 run_sync "$SYNC" "$R" > "$TMP/out" 2>/dev/null
