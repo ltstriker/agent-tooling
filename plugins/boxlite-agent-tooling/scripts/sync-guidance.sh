@@ -78,12 +78,61 @@ fi
 canonical_sha="$(shasum -a 256 "$canonical" | awk '{print $1}')"
 canonical_sha12="${canonical_sha:0:12}"
 tooling_rev="$(git -C "$plugin_root" rev-parse --short=12 HEAD 2>/dev/null || echo unversioned)"
+# The stamp's whole value to a reviewer is that `git show <rev>:guidance/workflow.md`
+# reproduces the block. That holds for every production splice, which runs from an
+# immutable fetched checkout — but not when someone splices from a working tree whose
+# canonical is modified, where the stamp would name a revision that never held this
+# text. Say so in the stamp rather than letting it quietly lie; the next clean splice
+# drops the suffix. (Marker parsing is unaffected: rev is matched as [^ ]+.)
+#
+# Sync-only: the stamp is written here, and only a splice can record a misleading
+# one. Running it in --check too would put this warning in front of every commit
+# made in the tooling repository, where a modified canonical is the normal state.
+if [[ "$mode" == sync && "$tooling_rev" != unversioned ]] \
+   && [[ -n "$(git -C "$plugin_root" status --porcelain -- guidance/workflow.md 2>/dev/null)" ]]; then
+  tooling_rev="$tooling_rev-dirty"
+  printf 'agent-tooling: canonical guidance is modified in %s; stamping %s\n' \
+    "$plugin_root" "$tooling_rev" >&2
+fi
 
 tmp_files=()
 cleanup() {
   [[ ${#tmp_files[@]} -eq 0 ]] || rm -f -- ${tmp_files[@]+"${tmp_files[@]}"}
 }
 trap cleanup EXIT INT TERM
+
+# mktemp creates 0600, and mv carries that mode to the destination — so every splice
+# would silently turn a committed, group/world-readable instructions file into an
+# owner-only one. Git hides it (it records only the exec bit), but CI runners,
+# containers, and any other uid that reads these files do not. Stamp the temp file
+# with the mode of what it replaces, or the umask default when creating.
+#
+# GNU `-c` is tried first because it FAILS on BSD/macOS stat, while BSD's `-f` means
+# "filesystem status" to GNU stat and would succeed with the wrong answer.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+# Fails closed, and deliberately: every failure here ends with mv giving the
+# destination mktemp's 0600 — the exact defect this function exists to prevent.
+# Guessing the umask default for a file that already exists is just as wrong,
+# since a consumer may keep its instructions at 640 on purpose.
+set_target_mode() {  # $1 = temp file, $2 = destination (need not exist yet)
+  local mode
+  if [[ -e "$2" ]]; then
+    mode="$(file_mode "$2")" || mode=""
+    [[ -n "$mode" ]] || {
+      printf 'agent-tooling: cannot read the mode of %s; refusing to replace it\n' "$2" >&2
+      return 1
+    }
+  else
+    mode="$(printf '%o' "$(( 0666 & ~0$(umask) ))")"
+  fi
+  chmod "$mode" "$1" || {
+    printf 'agent-tooling: cannot set mode %s for %s\n' "$mode" "$2" >&2
+    return 1
+  }
+}
 
 write_block() {  # emit the full marker-wrapped block on stdout
   printf '%srev=%s sha256=%s -->\n' "$BEGIN_PREFIX" "$tooling_rev" "$canonical_sha12"
@@ -158,16 +207,19 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   tmp="$(mktemp "$repo_root/.agent-tooling-guidance.XXXXXX")"
   tmp_files+=("$tmp")
   write_block > "$tmp"
+  set_target_mode "$tmp" "$agents_file" || exit 1
   mv "$tmp" "$agents_file"
   printf 'agent-tooling: created AGENTS.md with the guidance block (rev %s)\n' "$tooling_rev"
   targets=("$agents_file")
   created_fresh="$agents_file"
 fi
 
-# classify_target: sets block_state (missing|current|stale|hand-edited|malformed).
+# classify_target: sets block_state (missing|current|stale|hand-edited|malformed) and
+# block_rev (the marker's recorded revision, empty when there is no parsable marker).
 classify_target() {
   local f="$1" begins ends begin_ln end_ln begin_line marker_sha inner_sha inner_tmp
   block_state=""
+  block_rev=""
   begins="$(grep -c "^$BEGIN_PREFIX" "$f")" || true
   ends="$(grep -cxF "$END_MARKER" "$f")" || true
   if [[ "$begins" == 0 && "$ends" == 0 ]]; then
@@ -192,6 +244,7 @@ classify_target() {
     block_state=hand-edited
     return 0
   fi
+  block_rev="$(printf '%s\n' "$begin_line" | sed -E 's/.* rev=([^ ]+) sha256=.*/\1/')"
   marker_sha="$(printf '%s\n' "$begin_line" | sed -E 's/.* sha256=([0-9a-f]{12}) -->$/\1/')"
   inner_sha="$(shasum -a 256 "$inner_tmp" | awk '{print $1}')"
   if [[ "$marker_sha" != "${inner_sha:0:12}" ]]; then
@@ -214,9 +267,13 @@ splice_target() {  # replace or append the block in $1; $2 = block_state
   tmp="$(mktemp "$(dirname "$f")/.agent-tooling-guidance.XXXXXX")"
   tmp_files+=("$tmp")
   if [[ "$state" == missing ]]; then
-    cat "$f" > "$tmp"
     if [[ -s "$f" ]]; then
-      [[ "$(tail -c1 "$f" | wc -l | tr -d ' ')" == 1 ]] || printf '\n' >> "$tmp"
+      # Drop trailing blank lines, then separate with exactly one. Appending blindly
+      # stacks a blank line per strip-and-resplice cycle, and since the splicer never
+      # rewrites an up-to-date block, whatever lands here is what consumers commit.
+      # awk also terminates a final line that had no newline of its own.
+      awk '{ line[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR }
+           END { for (i = 1; i <= last; i++) print line[i] }' "$f" > "$tmp"
       printf '\n' >> "$tmp"
     fi
     write_block >> "$tmp"
@@ -231,6 +288,7 @@ splice_target() {  # replace or append the block in $1; $2 = block_state
                         { print }
     ' "$f" > "$tmp"
   fi
+  set_target_mode "$tmp" "$f" || return 1
   mv "$tmp" "$f"
   printf 'agent-tooling: guidance updated in %s (rev %s)\n' "$rel" "$tooling_rev"
 }
@@ -254,7 +312,16 @@ for f in "${targets[@]}"; do
       fail "guidance block in $rel was edited by hand; it is managed by boxlite-ai/agent-tooling — revert the edit (or apply it in the tooling repo), then run ./.agent-tooling/install.sh"
       ;;
     sync:current)
-      printf 'agent-tooling: guidance in %s is up to date\n' "$rel"
+      # Byte-stability says matching content is never rewritten — with one exception.
+      # A `-dirty` stamp names a revision that never held this text, and since the
+      # body already matches, no later content change is guaranteed to ever correct
+      # it. Refresh the marker once, now that the canonical is committed; a normal
+      # stamp still produces no write, so consumers keep their churn-free diffs.
+      if [[ "$block_rev" == *-dirty && "$tooling_rev" != *-dirty ]]; then
+        splice_target "$f" stale
+      else
+        printf 'agent-tooling: guidance in %s is up to date\n' "$rel"
+      fi
       ;;
     sync:malformed)
       fail "guidance markers in $rel are malformed (exactly one begin and one end, in order); restore them by hand, then rerun"
@@ -282,6 +349,7 @@ if [[ "$mode" == sync ]]; then
       printf '<!-- Claude Code inlines AGENTS.md through the import above; add Claude-specific\n'
       printf '     instructions below this line. Other hosts read AGENTS.md directly. -->\n'
     } > "$tmp"
+    set_target_mode "$tmp" "$repo_root/CLAUDE.md" || exit 1
     mv "$tmp" "$repo_root/CLAUDE.md"
     printf 'agent-tooling: created the CLAUDE.md bridge (@AGENTS.md)\n'
   fi
