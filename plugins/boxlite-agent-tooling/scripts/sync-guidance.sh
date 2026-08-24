@@ -110,14 +110,28 @@ trap cleanup EXIT INT TERM
 # GNU `-c` is tried first because it FAILS on BSD/macOS stat, while BSD's `-f` means
 # "filesystem status" to GNU stat and would succeed with the wrong answer.
 file_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
 }
 
+# Fails closed, and deliberately: every failure here ends with mv giving the
+# destination mktemp's 0600 — the exact defect this function exists to prevent.
+# Guessing the umask default for a file that already exists is just as wrong,
+# since a consumer may keep its instructions at 640 on purpose.
 set_target_mode() {  # $1 = temp file, $2 = destination (need not exist yet)
-  local mode=""
-  [[ ! -e "$2" ]] || mode="$(file_mode "$2")"
-  [[ -n "$mode" ]] || mode="$(printf '%o' "$(( 0666 & ~0$(umask) ))")"
-  chmod "$mode" "$1" 2>/dev/null || true
+  local mode
+  if [[ -e "$2" ]]; then
+    mode="$(file_mode "$2")" || mode=""
+    [[ -n "$mode" ]] || {
+      printf 'agent-tooling: cannot read the mode of %s; refusing to replace it\n' "$2" >&2
+      return 1
+    }
+  else
+    mode="$(printf '%o' "$(( 0666 & ~0$(umask) ))")"
+  fi
+  chmod "$mode" "$1" || {
+    printf 'agent-tooling: cannot set mode %s for %s\n' "$mode" "$2" >&2
+    return 1
+  }
 }
 
 write_block() {  # emit the full marker-wrapped block on stdout
@@ -193,7 +207,7 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   tmp="$(mktemp "$repo_root/.agent-tooling-guidance.XXXXXX")"
   tmp_files+=("$tmp")
   write_block > "$tmp"
-  set_target_mode "$tmp" "$agents_file"
+  set_target_mode "$tmp" "$agents_file" || exit 1
   mv "$tmp" "$agents_file"
   printf 'agent-tooling: created AGENTS.md with the guidance block (rev %s)\n' "$tooling_rev"
   targets=("$agents_file")
@@ -274,7 +288,7 @@ splice_target() {  # replace or append the block in $1; $2 = block_state
                         { print }
     ' "$f" > "$tmp"
   fi
-  set_target_mode "$tmp" "$f"
+  set_target_mode "$tmp" "$f" || return 1
   mv "$tmp" "$f"
   printf 'agent-tooling: guidance updated in %s (rev %s)\n' "$rel" "$tooling_rev"
 }
@@ -335,7 +349,7 @@ if [[ "$mode" == sync ]]; then
       printf '<!-- Claude Code inlines AGENTS.md through the import above; add Claude-specific\n'
       printf '     instructions below this line. Other hosts read AGENTS.md directly. -->\n'
     } > "$tmp"
-    set_target_mode "$tmp" "$repo_root/CLAUDE.md"
+    set_target_mode "$tmp" "$repo_root/CLAUDE.md" || exit 1
     mv "$tmp" "$repo_root/CLAUDE.md"
     printf 'agent-tooling: created the CLAUDE.md bridge (@AGENTS.md)\n'
   fi

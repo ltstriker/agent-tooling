@@ -199,6 +199,29 @@ R="$TMP/modes-fresh"; mkrepo "$R"
 run_sync "$SYNC" "$R" >/dev/null 2>&1
 check_eq "a created AGENTS.md uses the umask default" "$(mode_of "$R/AGENTS.md")" "$default_mode"
 
+# Both mode operations must fail the splice rather than fall through to mv,
+# which would hand the destination mktemp's 0600 — the defect being fixed. The
+# stubs shadow one command each on PATH; everything else still resolves.
+stub_dir() {  # $1 = command to break, prints a PATH prefix directory
+  local d="$TMP/stub-$1"
+  mkdir -p "$d"
+  printf '#!/bin/sh\nexit 1\n' > "$d/$1"
+  chmod +x "$d/$1"
+  printf '%s' "$d"
+}
+R="$TMP/modes-fail"; mkrepo "$R"
+printf '# Fail\n' > "$R/AGENTS.md"
+chmod 644 "$R/AGENTS.md"
+PATH="$(stub_dir stat):$PATH" run_sync "$SYNC" "$R" >/dev/null 2> "$TMP/err"
+check_eq "unreadable mode aborts the splice" "$?" 1
+grep -q 'cannot read the mode' "$TMP/err" && ok "names the unreadable mode" || bad "names the unreadable mode"
+check_eq "the destination is left untouched" "$(mode_of "$R/AGENTS.md")" "644"
+check_eq "no block was written" "$(grep -c '^<!-- agent-tooling:guidance:begin ' "$R/AGENTS.md")" 0
+PATH="$(stub_dir chmod):$PATH" run_sync "$SYNC" "$R" >/dev/null 2> "$TMP/err"
+check_eq "a failed chmod aborts the splice" "$?" 1
+grep -q 'cannot set mode' "$TMP/err" && ok "names the failed chmod" || bad "names the failed chmod"
+check_eq "still no block written" "$(grep -c '^<!-- agent-tooling:guidance:begin ' "$R/AGENTS.md")" 0
+
 echo
 echo "## A splice from a modified canonical says so in the stamp"
 # The stamp is only useful if `git show <rev>:guidance/workflow.md` reproduces the
