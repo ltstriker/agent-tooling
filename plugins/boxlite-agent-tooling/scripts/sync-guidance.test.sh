@@ -168,6 +168,34 @@ grep -q 'Second extra rule' "$R/AGENTS.md" && ok "block advanced under the edit"
                                            || bad "block advanced under the edit"
 
 echo
+echo "## A splice from a modified canonical says so in the stamp"
+# The stamp is only useful if `git show <rev>:guidance/workflow.md` reproduces the
+# block. Splicing from a working tree whose canonical is modified would name a
+# revision that never held the text — the exact way a misleading stamp reached a
+# consumer during the first rollout.
+PLUGIN3="$TMP/plugin3"
+cp -R "$PLUGIN_ROOT" "$PLUGIN3"
+git init -q "$PLUGIN3"
+git -C "$PLUGIN3" config user.email t@t.test
+git -C "$PLUGIN3" config user.name tester
+git -C "$PLUGIN3" add -A
+git -C "$PLUGIN3" commit -qm plugin
+R="$TMP/dirty-canon"; mkrepo "$R"
+printf -- '- Uncommitted rule.\n' >> "$PLUGIN3/guidance/workflow.md"
+run_sync "$PLUGIN3/scripts/sync-guidance.sh" "$R" >/dev/null 2> "$TMP/err"
+check_eq "sync from a modified canonical succeeds" "$?" 0
+grep -q 'canonical guidance is modified' "$TMP/err" && ok "warns about the modified canonical" \
+                                                    || bad "warns about the modified canonical"
+head -1 "$R/AGENTS.md" | grep -q -- '-dirty sha256=' && ok "stamp is marked -dirty" \
+                                                     || bad "stamp is marked -dirty"
+run_sync "$PLUGIN3/scripts/sync-guidance.sh" --check "$R" >/dev/null 2>&1
+check_eq "a -dirty stamp still parses as a valid block" "$?" 0
+git -C "$PLUGIN3" add -A && git -C "$PLUGIN3" commit -qm canon
+run_sync "$PLUGIN3/scripts/sync-guidance.sh" "$R" >/dev/null 2> "$TMP/err"
+head -1 "$R/AGENTS.md" | grep -q -- '-dirty' && bad "a clean re-splice drops the suffix" \
+                                             || ok "a clean re-splice drops the suffix"
+
+echo
 echo "## A hand-edited block fails closed until forced"
 R="$TMP/tamper"; mkrepo "$R"
 run_sync "$SYNC" "$R" >/dev/null 2>&1

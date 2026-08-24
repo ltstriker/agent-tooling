@@ -78,6 +78,18 @@ fi
 canonical_sha="$(shasum -a 256 "$canonical" | awk '{print $1}')"
 canonical_sha12="${canonical_sha:0:12}"
 tooling_rev="$(git -C "$plugin_root" rev-parse --short=12 HEAD 2>/dev/null || echo unversioned)"
+# The stamp's whole value to a reviewer is that `git show <rev>:guidance/workflow.md`
+# reproduces the block. That holds for every production splice, which runs from an
+# immutable fetched checkout — but not when someone splices from a working tree whose
+# canonical is modified, where the stamp would name a revision that never held this
+# text. Say so in the stamp rather than letting it quietly lie; the next clean splice
+# drops the suffix. (Marker parsing is unaffected: rev is matched as [^ ]+.)
+if [[ "$tooling_rev" != unversioned ]] \
+   && [[ -n "$(git -C "$plugin_root" status --porcelain -- guidance/workflow.md 2>/dev/null)" ]]; then
+  tooling_rev="$tooling_rev-dirty"
+  printf 'agent-tooling: canonical guidance is modified in %s; stamping %s\n' \
+    "$plugin_root" "$tooling_rev" >&2
+fi
 
 tmp_files=()
 cleanup() {
@@ -164,10 +176,12 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   created_fresh="$agents_file"
 fi
 
-# classify_target: sets block_state (missing|current|stale|hand-edited|malformed).
+# classify_target: sets block_state (missing|current|stale|hand-edited|malformed) and
+# block_rev (the marker's recorded revision, empty when there is no parsable marker).
 classify_target() {
   local f="$1" begins ends begin_ln end_ln begin_line marker_sha inner_sha inner_tmp
   block_state=""
+  block_rev=""
   begins="$(grep -c "^$BEGIN_PREFIX" "$f")" || true
   ends="$(grep -cxF "$END_MARKER" "$f")" || true
   if [[ "$begins" == 0 && "$ends" == 0 ]]; then
@@ -192,6 +206,7 @@ classify_target() {
     block_state=hand-edited
     return 0
   fi
+  block_rev="$(printf '%s\n' "$begin_line" | sed -E 's/.* rev=([^ ]+) sha256=.*/\1/')"
   marker_sha="$(printf '%s\n' "$begin_line" | sed -E 's/.* sha256=([0-9a-f]{12}) -->$/\1/')"
   inner_sha="$(shasum -a 256 "$inner_tmp" | awk '{print $1}')"
   if [[ "$marker_sha" != "${inner_sha:0:12}" ]]; then
@@ -254,7 +269,16 @@ for f in "${targets[@]}"; do
       fail "guidance block in $rel was edited by hand; it is managed by boxlite-ai/agent-tooling — revert the edit (or apply it in the tooling repo), then run ./.agent-tooling/install.sh"
       ;;
     sync:current)
-      printf 'agent-tooling: guidance in %s is up to date\n' "$rel"
+      # Byte-stability says matching content is never rewritten — with one exception.
+      # A `-dirty` stamp names a revision that never held this text, and since the
+      # body already matches, no later content change is guaranteed to ever correct
+      # it. Refresh the marker once, now that the canonical is committed; a normal
+      # stamp still produces no write, so consumers keep their churn-free diffs.
+      if [[ "$block_rev" == *-dirty && "$tooling_rev" != *-dirty ]]; then
+        splice_target "$f" stale
+      else
+        printf 'agent-tooling: guidance in %s is up to date\n' "$rel"
+      fi
       ;;
     sync:malformed)
       fail "guidance markers in $rel are malformed (exactly one begin and one end, in order); restore them by hand, then rerun"
