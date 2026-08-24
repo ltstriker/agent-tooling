@@ -84,7 +84,11 @@ tooling_rev="$(git -C "$plugin_root" rev-parse --short=12 HEAD 2>/dev/null || ec
 # canonical is modified, where the stamp would name a revision that never held this
 # text. Say so in the stamp rather than letting it quietly lie; the next clean splice
 # drops the suffix. (Marker parsing is unaffected: rev is matched as [^ ]+.)
-if [[ "$tooling_rev" != unversioned ]] \
+#
+# Sync-only: the stamp is written here, and only a splice can record a misleading
+# one. Running it in --check too would put this warning in front of every commit
+# made in the tooling repository, where a modified canonical is the normal state.
+if [[ "$mode" == sync && "$tooling_rev" != unversioned ]] \
    && [[ -n "$(git -C "$plugin_root" status --porcelain -- guidance/workflow.md 2>/dev/null)" ]]; then
   tooling_rev="$tooling_rev-dirty"
   printf 'agent-tooling: canonical guidance is modified in %s; stamping %s\n' \
@@ -96,6 +100,25 @@ cleanup() {
   [[ ${#tmp_files[@]} -eq 0 ]] || rm -f -- ${tmp_files[@]+"${tmp_files[@]}"}
 }
 trap cleanup EXIT INT TERM
+
+# mktemp creates 0600, and mv carries that mode to the destination — so every splice
+# would silently turn a committed, group/world-readable instructions file into an
+# owner-only one. Git hides it (it records only the exec bit), but CI runners,
+# containers, and any other uid that reads these files do not. Stamp the temp file
+# with the mode of what it replaces, or the umask default when creating.
+#
+# GNU `-c` is tried first because it FAILS on BSD/macOS stat, while BSD's `-f` means
+# "filesystem status" to GNU stat and would succeed with the wrong answer.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true
+}
+
+set_target_mode() {  # $1 = temp file, $2 = destination (need not exist yet)
+  local mode=""
+  [[ ! -e "$2" ]] || mode="$(file_mode "$2")"
+  [[ -n "$mode" ]] || mode="$(printf '%o' "$(( 0666 & ~0$(umask) ))")"
+  chmod "$mode" "$1" 2>/dev/null || true
+}
 
 write_block() {  # emit the full marker-wrapped block on stdout
   printf '%srev=%s sha256=%s -->\n' "$BEGIN_PREFIX" "$tooling_rev" "$canonical_sha12"
@@ -170,6 +193,7 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   tmp="$(mktemp "$repo_root/.agent-tooling-guidance.XXXXXX")"
   tmp_files+=("$tmp")
   write_block > "$tmp"
+  set_target_mode "$tmp" "$agents_file"
   mv "$tmp" "$agents_file"
   printf 'agent-tooling: created AGENTS.md with the guidance block (rev %s)\n' "$tooling_rev"
   targets=("$agents_file")
@@ -229,9 +253,13 @@ splice_target() {  # replace or append the block in $1; $2 = block_state
   tmp="$(mktemp "$(dirname "$f")/.agent-tooling-guidance.XXXXXX")"
   tmp_files+=("$tmp")
   if [[ "$state" == missing ]]; then
-    cat "$f" > "$tmp"
     if [[ -s "$f" ]]; then
-      [[ "$(tail -c1 "$f" | wc -l | tr -d ' ')" == 1 ]] || printf '\n' >> "$tmp"
+      # Drop trailing blank lines, then separate with exactly one. Appending blindly
+      # stacks a blank line per strip-and-resplice cycle, and since the splicer never
+      # rewrites an up-to-date block, whatever lands here is what consumers commit.
+      # awk also terminates a final line that had no newline of its own.
+      awk '{ line[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR }
+           END { for (i = 1; i <= last; i++) print line[i] }' "$f" > "$tmp"
       printf '\n' >> "$tmp"
     fi
     write_block >> "$tmp"
@@ -246,6 +274,7 @@ splice_target() {  # replace or append the block in $1; $2 = block_state
                         { print }
     ' "$f" > "$tmp"
   fi
+  set_target_mode "$tmp" "$f"
   mv "$tmp" "$f"
   printf 'agent-tooling: guidance updated in %s (rev %s)\n' "$rel" "$tooling_rev"
 }
@@ -306,6 +335,7 @@ if [[ "$mode" == sync ]]; then
       printf '<!-- Claude Code inlines AGENTS.md through the import above; add Claude-specific\n'
       printf '     instructions below this line. Other hosts read AGENTS.md directly. -->\n'
     } > "$tmp"
+    set_target_mode "$tmp" "$repo_root/CLAUDE.md"
     mv "$tmp" "$repo_root/CLAUDE.md"
     printf 'agent-tooling: created the CLAUDE.md bridge (@AGENTS.md)\n'
   fi

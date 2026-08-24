@@ -103,6 +103,17 @@ grep -q 'no trailing newline' "$R/AGENTS.md" && ok "unterminated last line survi
 check_eq "exactly one block" "$(grep -c '^<!-- agent-tooling:guidance:begin ' "$R/AGENTS.md")" 1
 run_sync "$SYNC" --check "$R" >/dev/null 2>&1
 check_eq "check passes after append" "$?" 0
+# Exactly one blank line before the marker, however many the file ended with: a
+# strip-and-resplice cycle otherwise stacks one more each time, and the block is
+# never rewritten once current, so the padding would ship to consumers.
+check_eq "one blank line separates content from the block" \
+  "$(awk '/^<!-- agent-tooling:guidance:begin /{print blank; exit} /^[[:space:]]*$/{blank++; next} {blank=0}' "$R/AGENTS.md")" 1
+R="$TMP/padded"; mkrepo "$R"
+printf '# Padded\n\ncontent\n\n\n\n' > "$R/AGENTS.md"
+run_sync "$SYNC" "$R" >/dev/null 2>&1
+check_eq "trailing blank lines collapse to one" \
+  "$(awk '/^<!-- agent-tooling:guidance:begin /{print blank; exit} /^[[:space:]]*$/{blank++; next} {blank=0}' "$R/AGENTS.md")" 1
+check_eq "padded file keeps its content" "$(grep -c '^content$' "$R/AGENTS.md")" 1
 
 echo
 echo "## Symlinked names collapse to one physical splice"
@@ -166,6 +177,27 @@ grep -q 'domain note' "$R/AGENTS.md" && ok "consumer edit survives the splice" \
                                      || bad "consumer edit survives the splice"
 grep -q 'Second extra rule' "$R/AGENTS.md" && ok "block advanced under the edit" \
                                            || bad "block advanced under the edit"
+
+echo
+echo "## Splicing never tightens a file's permissions"
+# mktemp is 0600 and mv carries that mode onto the destination, so an unguarded
+# splice turns a committed, readable instructions file owner-only — invisible to
+# git, which records only the exec bit, but not to other uids on a CI runner or in
+# a container. Every write path is covered: replace, append, and both creations.
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+default_mode="$(printf '%o' "$(( 0666 & ~0$(umask) ))")"
+R="$TMP/modes"; mkrepo "$R"
+printf '# Perms\n' > "$R/AGENTS.md"
+chmod 644 "$R/AGENTS.md"
+run_sync "$SYNC" "$R" >/dev/null 2>&1
+check_eq "append preserves the existing mode" "$(mode_of "$R/AGENTS.md")" "644"
+check_eq "a created bridge uses the umask default" "$(mode_of "$R/CLAUDE.md")" "$default_mode"
+chmod 640 "$R/AGENTS.md"
+run_sync "$PLUGIN2/scripts/sync-guidance.sh" "$R" >/dev/null 2>&1
+check_eq "replace preserves a non-default mode" "$(mode_of "$R/AGENTS.md")" "640"
+R="$TMP/modes-fresh"; mkrepo "$R"
+run_sync "$SYNC" "$R" >/dev/null 2>&1
+check_eq "a created AGENTS.md uses the umask default" "$(mode_of "$R/AGENTS.md")" "$default_mode"
 
 echo
 echo "## A splice from a modified canonical says so in the stamp"
