@@ -146,21 +146,38 @@ write_verdict() {
     > "$repo/.agents/state/last-verdict.json"
 }
 
-# Run the hook inside repo and classify the decision. Uses the repo's fake
-# transcript when present, /dev/null otherwise.
-decide() {
-  local repo="$1" out d tp="/dev/null"
-  [[ -f "$repo/transcript.jsonl" ]] && tp="$repo/transcript.jsonl"
-  local payload; payload="$(jq -nc --arg p "$tp" '{transcript_path:$p, hook_event_name:"Stop"}')"
+# Run the hook inside repo for an exact Stop payload.
+run_payload_hook() {
+  local repo="$1" payload="$2"
   # Decision-logic cases run in HARD mode so a block condition is observable as
   # decision:block. Soft mode is covered in its own section below.
-  out="$(printf '%s' "$payload" | ( cd "$repo" && CLAUDE_PROJECT_DIR="$repo" VERDICT_GATE_HARD_BLOCK=1 bash "$HOOK" ) 2>/dev/null)"
+  printf '%s' "$payload" \
+    | ( cd "$repo" && CLAUDE_PROJECT_DIR="$repo" VERDICT_GATE_HARD_BLOCK=1 bash "$HOOK" ) \
+      2>/dev/null
+}
+
+decision_from_output() {
+  local out="$1" d
   if [[ -z "$out" ]]; then
     printf 'allow'
   else
     d="$(printf '%s' "$out" | jq -r '.decision // "allow"' 2>/dev/null || echo parse_error)"
     [[ "$d" == "block" ]] && printf 'block' || printf 'allow'
   fi
+}
+
+decide_payload() {
+  local repo="$1" payload="$2" out
+  out="$(run_payload_hook "$repo" "$payload")"
+  decision_from_output "$out"
+}
+
+# Uses the repo's fake transcript when present, /dev/null otherwise.
+decide() {
+  local repo="$1" tp="/dev/null" payload
+  [[ -f "$repo/transcript.jsonl" ]] && tp="$repo/transcript.jsonl"
+  payload="$(jq -nc --arg p "$tp" '{transcript_path:$p, hook_event_name:"Stop"}')"
+  decide_payload "$repo" "$payload"
 }
 
 check() {  # desc  repo  expect
@@ -212,6 +229,7 @@ for f in \
   .agents/state/last-verdict.prev.json \
   .agents/state/pr-reviewed.json \
   .agents/state/verdict-last-uuid \
+  .agents/state/verdict-stop-message.jsonl \
   .agents/state/verdict-audit.lock \
   .agents/state/verdict-decisions.log; do
   if git -C "$REPO_ROOT" check-ignore -q "$f"; then
@@ -344,6 +362,111 @@ check "verdict phrases only inside code → allow"                  "$R" "allow"
 R="$(setup)"  # no transcript at all (payload points at /dev/null)
 check "no transcript → allow (fail-open)"                         "$R" "allow"; rm -rf "$R"
 
+# Codex explicitly permits a null transcript_path and provides the stable
+# last_assistant_message field on Stop. Ignoring that field turns every such event
+# into an empty allow even when the message is an obvious verdict.
+R="$(setup)"
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:false,
+  last_assistant_message:"All tests pass."}')"
+out="$(run_payload_hook "$R" "$payload")"
+got="$(decision_from_output "$out")"
+expected_id="$(cksum_of "All tests pass.")"
+recorded_id="$(cat "$R/.agents/state/verdict-last-uuid" 2>/dev/null || echo MISSING)"
+fallback_transcript="$R/.agents/state/verdict-stop-message.jsonl"
+fallback_text="$(jq -r '.message.content[0].text // ""' "$fallback_transcript" 2>/dev/null || echo MISSING)"
+if [[ "$got" == "block" && "$recorded_id" == "$expected_id" \
+   && "$fallback_text" == "All tests pass." \
+   && "$out" == *"transcript_path: ${fallback_transcript}"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "null transcript + Stop message → block with content identity and auditable handoff"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (got=%s id=%s expected=%s fallback=%s handed-off=%s)\n' \
+    "null transcript fallback" "$got" "$recorded_id" "$expected_id" "$fallback_text" \
+    "$([[ "$out" == *"transcript_path: ${fallback_transcript}"* ]] && echo yes || echo no)"
+fi
+
+# A recursive Stop for the message just judged is stale, but only when Codex marks
+# the hook active. It must avoid the transcript flush wait because there is no
+# transcript to flush; otherwise every blocked Stop adds two seconds of dead time.
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:true,
+  last_assistant_message:"All tests pass."}')"
+started=$SECONDS
+got="$(decide_payload "$R" "$payload")"
+elapsed=$((SECONDS - started))
+if [[ "$got" == "allow" && "$elapsed" -lt 2 ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "same active Stop payload → immediate stale allow"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (got=%s elapsed=%ss)\n' \
+    "payload recursion guard" "$got" "$elapsed"
+fi
+
+# The same text without the recursion signal may be a new user turn and must be
+# judged again. Conversely, stop_hook_active never exempts changed text.
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:false,
+  last_assistant_message:"All tests pass."}')"
+got_same_fresh="$(decide_payload "$R" "$payload")"
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:true,
+  last_assistant_message:"All 7/7 tests pass."}')"
+got_changed_active="$(decide_payload "$R" "$payload")"
+if [[ "$got_same_fresh" == "block" && "$got_changed_active" == "block" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "payload guard skips only an identical active recursion"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (same-fresh=%s changed-active=%s)\n' \
+    "payload recursion scope" "$got_same_fresh" "$got_changed_active"
+fi; rm -rf "$R"
+
+R="$(setup)"
+payload="$(jq -nc --arg p "$R/missing.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", stop_hook_active:false,
+    last_assistant_message:"Root cause is the stale index."}')"
+got_missing="$(decide_payload "$R" "$payload")"
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:false,
+  last_assistant_message:"Should I run the focused suite?"}')"
+got_question="$(decide_payload "$R" "$payload")"
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:false,
+  last_assistant_message:null}')"
+got_empty="$(decide_payload "$R" "$payload")"
+if [[ "$got_missing" == "block" && "$got_question" == "allow" && "$got_empty" == "allow" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "payload fallback distinguishes verdict, question, and empty input"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (missing=%s question=%s empty=%s)\n' \
+    "payload fallback decisions" "$got_missing" "$got_question" "$got_empty"
+fi; rm -rf "$R"
+
+# A readable transcript remains authoritative because it contains the whole turn.
+# The latest payload fragment must not hide a verdict asserted earlier in that turn.
+R="$(setup)"; write_transcript "$R" "Root cause is the stale index."
+payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", stop_hook_active:false,
+    last_assistant_message:"Anything else?"}')"
+got="$(decide_payload "$R" "$payload")"
+if [[ "$got" == "block" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "whole-turn transcript takes precedence over payload fragment"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (got=%s)\n' "transcript precedence" "$got"
+fi; rm -rf "$R"
+
+# A nonempty transcript with no assistant record may simply be ahead of its flush.
+# Do not fall back to a benign latest fragment until the bounded transcript wait has
+# had a chance to recover the whole turn.
+R="$(setup)"
+jq -nc '{type:"user", message:{content:[{type:"text",text:"go"}]}}' > "$R/transcript.jsonl"
+( sleep 0.6
+  jq -nc '{type:"assistant", message:{content:[{type:"text",
+    text:"Root cause is the stale index; all tests pass."}]}}' >> "$R/transcript.jsonl" ) &
+late_writer=$!
+payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", stop_hook_active:false,
+    last_assistant_message:"Anything else?"}')"
+got="$(decide_payload "$R" "$payload")"
+wait "$late_writer" 2>/dev/null
+if [[ "$got" == "block" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "transcript flush wins before payload fallback"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (got=%s — payload fragment bypassed flush wait)\n' \
+    "payload fallback ordering" "$got"
+fi; rm -rf "$R"
+
 # ── The gate must never end a turn it could not SEE ──────────────────────────
 # A zero-byte/absent transcript is genuinely nothing to judge → allow at once, and the
 # rung must say `empty` so it stays distinguishable from being blind.
@@ -401,6 +524,24 @@ check_gone "IN_PROGRESS dossier consumed on allow"                "$R"; rm -rf "
 R="$(setup)"; write_transcript "$R" "The fix works."; write_verdict "$R" "FAIL" '["Test: no reproducer for the claimed fix"]'
 check "FAIL → block (finding-driven loop)"                        "$R" "block"
 check "FAIL again (unaddressed) → still block"                    "$R" "block"; rm -rf "$R"
+
+# A carried FAIL is handled before normal message extraction. Its retry instruction
+# still needs an auditable source when Codex supplies only the stable Stop message.
+R="$(setup)"; write_verdict "$R" "FAIL" '["Test: re-run the focused reproducer"]'
+payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:false,
+  last_assistant_message:"The focused fix is ready."}')"
+out="$(run_payload_hook "$R" "$payload")"
+fallback_transcript="$R/.agents/state/verdict-stop-message.jsonl"
+fallback_text="$(jq -r '.message.content[0].text // ""' "$fallback_transcript" 2>/dev/null || echo MISSING)"
+if [[ "$(decision_from_output "$out")" == "block" \
+   && "$fallback_text" == "The focused fix is ready." \
+   && "$out" == *"transcript_path: ${fallback_transcript}"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "FAIL retry with null transcript keeps an auditable handoff"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (fallback=%s handed-off=%s)\n' \
+    "FAIL retry payload handoff" "$fallback_text" \
+    "$([[ "$out" == *"transcript_path: ${fallback_transcript}"* ]] && echo yes || echo no)"
+fi; rm -rf "$R"
 
 echo
 echo "## Audit in flight → allow (the gate must not busy-wait on its own remedy)"

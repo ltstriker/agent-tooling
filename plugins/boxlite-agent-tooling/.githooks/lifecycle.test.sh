@@ -51,10 +51,10 @@ write_consumer_profile() {
     "$CONSUMER/.claude" "$CONSUMER/.github/copilot"
   jq -nc '{schemaVersion:1,profile:"consumer",repository:"boxlite-ai/example-consumer",tooling:{repository:"boxlite-ai/agent-tooling",ref:"main"},checks:[{name:"test",command:"true"}]}' \
     > "$CONSUMER/.agent-tooling/profile.json"
-  jq -nc '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{repo:"boxlite-ai/agent-tooling",ref:"main"}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
+  jq -nc '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{source:"github",repo:"boxlite-ai/agent-tooling",ref:"main"}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
     > "$CONSUMER/.claude/settings.json"
   cp "$CONSUMER/.claude/settings.json" "$CONSUMER/.github/copilot/settings.json"
-  jq -nc '{plugins:[{name:"boxlite-agent-tooling",source:{url:"https://github.com/boxlite-ai/agent-tooling.git",ref:"main",path:"./plugins/boxlite-agent-tooling"},policy:{installation:"INSTALLED_BY_DEFAULT"}}]}' \
+  jq -nc '{plugins:[{name:"boxlite-agent-tooling",source:{source:"git-subdir",url:"https://github.com/boxlite-ai/agent-tooling.git",ref:"main",path:"./plugins/boxlite-agent-tooling"},policy:{installation:"INSTALLED_BY_DEFAULT",authentication:"ON_INSTALL"},category:"Developer Tools"}]}' \
     > "$CONSUMER/.agents/plugins/marketplace.json"
 }
 

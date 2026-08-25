@@ -828,16 +828,19 @@ both_reason() {  # $1 = value for CODEX_SANDBOX ("" = unset)
 
 reason="$(both_reason "")"
 case "$reason" in
-  *"Task(subagent_type='commit-push-auditor'"*) ok_claude=1 ;; *) ok_claude=0 ;;
+  *"Task(subagent_type='boxlite-agent-tooling:commit-push-auditor'"*) ok_claude=1 ;; *) ok_claude=0 ;;
+esac
+case "$reason" in
+  *"Task(subagent_type='commit-push-auditor'"*) bare_claude=1 ;; *) bare_claude=0 ;;
 esac
 case "$reason" in
   *"collaboration.spawn_agent("*) ok_codex=1 ;; *) ok_codex=0 ;;
 esac
-if [[ "$ok_claude" == 1 && "$ok_codex" == 1 ]]; then
+if [[ "$ok_claude" == 1 && "$bare_claude" == 0 && "$ok_codex" == 1 ]]; then
   pass=$((pass + 1)); printf '  PASS  the deny reason names both Task() and spawn_agent()\n'
 else
-  fail=$((fail + 1)); printf '  FAIL  the deny reason names both Task() and spawn_agent()  (claude=%s codex=%s)\n' \
-    "$ok_claude" "$ok_codex"
+  fail=$((fail + 1)); printf '  FAIL  the deny reason names both Task() and spawn_agent()  (claude=%s bare=%s codex=%s)\n' \
+    "$ok_claude" "$bare_claude" "$ok_codex"
 fi
 
 # CODEX_SANDBOX is deliberately NOT swept into the behavioural check above. Set, it

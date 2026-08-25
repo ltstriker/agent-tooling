@@ -25,9 +25,9 @@
 #   - Every wired command resolves the plugin root as ${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}
 #     — Codex exports the first name, Claude Code the second. A bare single-host
 #     variable expands empty on the other host and the hook runs /nonexistent.
-#   - Agent specs resolve on every route: Claude Code looks the frontmatter `name` up
-#     by subagent_type, Codex is told to READ the spec file (subagent.sh doctrine), so
-#     a spec whose name differs from its filename strands one host or the other.
+#   - Agent specs resolve on every route: Claude Code prefixes the frontmatter `name`
+#     with the plugin name, while Codex gets a schema-safe task name plus the exact
+#     spec path (subagent.sh doctrine). A rename can strand either host silently.
 #   - .codex-plugin/plugin.json declares NO agents key — deliberately. Codex's
 #     collaboration.spawn_agent takes no spec parameter; the spec travels by path in
 #     the message. Adding the key to "fix the asymmetry" hands a strictly-validating
@@ -47,6 +47,8 @@ HOOKS="$PLUGIN/hooks/hooks.json"
 CLAUDE_MKT="$REPO_ROOT/.claude-plugin/marketplace.json"
 CODEX_MKT="$REPO_ROOT/.agents/plugins/marketplace.json"
 COPILOT_MKT="$REPO_ROOT/.github/plugin/marketplace.json"
+CLAUDE_SETTINGS="$REPO_ROOT/.claude/settings.json"
+COPILOT_SETTINGS="$REPO_ROOT/.github/copilot/settings.json"
 
 pass=0
 fail=0
@@ -109,9 +111,34 @@ check_versioned_marketplace "copilot" "$COPILOT_MKT"
 v="$(jq -r '.plugins[0].name' "$CODEX_MKT")"
 [ "$v" = "$(jq -r .name "$GENERIC")" ] && ok "codex: entry names the plugin" \
                                        || bad "codex: entry names the plugin (got: $v)"
+jq -e '
+  .plugins[0].source.source == "git-subdir" and
+  .plugins[0].source.url == "https://github.com/boxlite-ai/agent-tooling.git" and
+  .plugins[0].source.ref == "main" and
+  .plugins[0].source.path == "./plugins/boxlite-agent-tooling" and
+  .plugins[0].policy.installation == "INSTALLED_BY_DEFAULT" and
+  .plugins[0].policy.authentication == "ON_INSTALL" and
+  .plugins[0].category == "Developer Tools"
+' "$CODEX_MKT" >/dev/null 2>&1 \
+  && ok "codex: typed Git source and required install metadata" \
+  || bad "codex: typed Git source and required install metadata"
 v="$(resolve_dir "$REPO_ROOT/$(jq -r '.plugins[0].source.path' "$CODEX_MKT")")"
 [ "$v" = "$PLUGIN" ] && ok "codex: source resolves to the plugin" \
                      || bad "codex: source resolves to the plugin (got: $v)"
+
+echo
+echo "## Consumer activation settings use typed GitHub marketplace sources"
+for pair in "claude:$CLAUDE_SETTINGS" "copilot:$COPILOT_SETTINGS"; do
+  label="${pair%%:*}"; settings="${pair#*:}"
+  jq -e '
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.source == "github" and
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.repo == "boxlite-ai/agent-tooling" and
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.ref == "main" and
+    .enabledPlugins["boxlite-agent-tooling@boxlite-agent-tooling"] == true
+  ' "$settings" >/dev/null 2>&1 \
+    && ok "$label: typed GitHub activation source" \
+    || bad "$label: typed GitHub activation source"
+done
 
 echo
 echo "## Every host reaches the same skills tree"
@@ -164,6 +191,23 @@ done
 jq -e 'has("agents") | not' "$CODEX" >/dev/null 2>&1 \
   && ok "codex manifest declares no agents key (specs travel by path — see header)" \
   || bad "codex manifest declares no agents key (specs travel by path — see header)"
+
+plugin_name="$(jq -r .name "$CLAUDE")"
+routing="$(
+  # shellcheck source=/dev/null
+  source "$PLUGIN/.agents/lib/subagent.sh"
+  subagent_instruction --agent verdict-auditor --root "$PLUGIN" --task audit
+)"
+case "$routing" in
+  *"Task(subagent_type='$plugin_name:verdict-auditor'"*)
+    ok "claude route scopes the agent with the manifest name" ;;
+  *) bad "claude route scopes the agent with the manifest name" ;;
+esac
+case "$routing" in
+  *"task_name='verdict_auditor'"*"$PLUGIN/.claude/agents/verdict-auditor.md"*)
+    ok "codex route normalizes task_name but preserves the spec path" ;;
+  *) bad "codex route normalizes task_name but preserves the spec path" ;;
+esac
 
 echo
 echo "## hooks/hooks.json — one file, both hosts, both parsers"

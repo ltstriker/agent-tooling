@@ -103,11 +103,12 @@ jq -e '
 for settings_file in "$repo_root/.claude/settings.json" "$repo_root/.github/copilot/settings.json"; do
   [[ -r "$settings_file" ]] || { printf 'agent-tooling: missing activation settings: %s\n' "$settings_file" >&2; exit 1; }
   jq -e --arg ref "$tooling_ref" '
+    .extraKnownMarketplaces["boxlite-agent-tooling"].source.source == "github" and
     .extraKnownMarketplaces["boxlite-agent-tooling"].source.repo == "boxlite-ai/agent-tooling" and
     .extraKnownMarketplaces["boxlite-agent-tooling"].source.ref == $ref and
     .enabledPlugins["boxlite-agent-tooling@boxlite-agent-tooling"] == true
   ' "$settings_file" >/dev/null || {
-    printf 'agent-tooling: activation settings do not float on tooling.ref: %s\n' "$settings_file" >&2
+    printf 'agent-tooling: activation settings must use source.source "github" and float on tooling.ref: %s\n' "$settings_file" >&2
     exit 1
   }
 done
@@ -117,12 +118,15 @@ codex_marketplace="$repo_root/.agents/plugins/marketplace.json"
 jq -e --arg ref "$tooling_ref" '
   any(.plugins[];
     .name == "boxlite-agent-tooling" and
+    .source.source == "git-subdir" and
     .source.url == "https://github.com/boxlite-ai/agent-tooling.git" and
     .source.ref == $ref and
     .source.path == "./plugins/boxlite-agent-tooling" and
-    .policy.installation == "INSTALLED_BY_DEFAULT")
+    .policy.installation == "INSTALLED_BY_DEFAULT" and
+    .policy.authentication == "ON_INSTALL" and
+    .category == "Developer Tools")
 ' "$codex_marketplace" >/dev/null || {
-  printf 'agent-tooling: Codex marketplace does not float on tooling.ref: %s\n' "$codex_marketplace" >&2
+  printf 'agent-tooling: Codex marketplace must declare the git-subdir source, tooling.ref, install policy, authentication, and category: %s\n' "$codex_marketplace" >&2
   exit 1
 }
 

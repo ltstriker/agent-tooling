@@ -6,10 +6,11 @@
 #
 # Covers:
 #   1. Event emission: one per concluded check, every terminal bucket, dedup.
-#   2. The empty-field regression: a check with no `workflow` must not shift
+#   2. Confirmed merge-conflict emission, revision-scoped dedup, UNKNOWN handling.
+#   3. The empty-field regression: a check with no `workflow` must not shift
 #      `link` into the workflow column.
-#   3. Single-instance lock.
-#   4. pre-push arming: branch refs armed, deletions/tags skipped, opt-out.
+#   4. Single-instance lock.
+#   5. pre-push arming: branch refs armed, deletions/tags skipped, opt-out.
 #
 # Run with:  bash .agents/watch/pr-watch.test.sh
 # Exits non-zero on any failure.
@@ -70,7 +71,8 @@ git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 scratch="$TMP/tooling-src"
 plugin_rel="plugins/boxlite-agent-tooling"
 mkdir -p "$scratch/$plugin_rel/.agents"
-cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$scratch/$plugin_rel/"
+cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$REPO_ROOT/guidance" \
+  "$scratch/$plugin_rel/"
 cp -R "$REPO_ROOT/.agents/watch" "$scratch/$plugin_rel/.agents/watch"
 git -C "$scratch" init -q
 git -C "$scratch" -c user.email=t@t -c user.name=t add -A
@@ -82,6 +84,7 @@ PIN="$REPO/.git/agent-tooling/$PIN_SHA/$plugin_rel"
 mkdir -p "$REPO/.agent-tooling"
 printf '{"tooling":{"repository":"boxlite-ai/agent-tooling","ref":"main"}}\n' > "$REPO/.agent-tooling/profile.json"
 printf '%s\n' "$PIN_SHA" > "$REPO/.git/agent-tooling/current"
+"$PIN/scripts/sync-guidance.sh" "$REPO" >/dev/null
 git -C "$REPO" config extensions.worktreeConfig true
 git -C "$REPO" config --worktree core.hooksPath "$PIN/.githooks"
 # From here on, the hook under test IS the pinned copy — and so is the watcher it
@@ -99,6 +102,7 @@ mkdir -p "$FIXTURE_DIR"
 
 cat > "$STUB/gh" <<'STUB_EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FIXTURE_DIR/gh-calls.log"
 case "$1 $2" in
   "pr checks")  cat "$FIXTURE_DIR/checks.json" ;;
   "pr view")    cat "$FIXTURE_DIR/view.json" ;;
@@ -112,6 +116,7 @@ chmod +x "$STUB/gh"
 export PATH="$STUB:$PATH"
 
 write_fixtures() {
+  : > "$FIXTURE_DIR/gh-calls.log"
   cat > "$FIXTURE_DIR/checks.json" <<'EOF'
 [
   {"name":"CodeQL","state":"SUCCESS","bucket":"pass","workflow":"","link":"https://gh/runs/1"},
@@ -122,7 +127,7 @@ write_fixtures() {
 ]
 EOF
   cat > "$FIXTURE_DIR/view.json" <<'EOF'
-{"state":"OPEN",
+{"state":"OPEN","mergeable":"MERGEABLE","headRefOid":"head-1","baseRefOid":"base-1",
  "comments":[{"id":"C1","author":{"login":"boxlite-agent"},"body":"line one\nline two","url":"https://gh/c/1"}],
  "reviews":[{"id":"R1","author":{"login":"coderabbitai"},"state":"COMMENTED","body":"nit"}]}
 EOF
@@ -187,8 +192,51 @@ check "emits the review" \
 
 check "emits the inline review comment with its path" \
   "$(events_of review_comment "$OUT" | jq -r '.path')" "src/main.rs"
+check "the PR view requests mergeability and both compared revisions" \
+  "$(grep 'pr view' "$FIXTURE_DIR/gh-calls.log" \
+      | grep -Fq -- '--json state,comments,reviews,mergeable,headRefOid,baseRefOid' \
+      && echo yes || echo no)" "yes"
 
-# ── 2. the empty-field regression ────────────────────────────────────────────
+# ── 2. merge conflicts ───────────────────────────────────────────────────────
+
+echo
+echo "## Merge conflicts"
+check "a mergeable PR emits no conflict event" \
+  "$(events_of conflict "$OUT" | wc -l | tr -d ' ')" "0"
+
+jq '.mergeable = "UNKNOWN"' "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/view.tmp" \
+  && mv "$FIXTURE_DIR/view.tmp" "$FIXTURE_DIR/view.json"
+check "UNKNOWN mergeability is not misreported as a conflict" \
+  "$(events_of conflict "$(run_watch --pr 42 --once)" | wc -l | tr -d ' ')" "0"
+
+jq '.mergeable = "CONFLICTING"' "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/view.tmp" \
+  && mv "$FIXTURE_DIR/view.tmp" "$FIXTURE_DIR/view.json"
+CONFLICT="$(run_watch --pr 42 --once)"
+check "a confirmed merge conflict emits an event" \
+  "$(events_of conflict "$CONFLICT" | wc -l | tr -d ' ')" "1"
+check "the conflict event identifies both compared revisions" \
+  "$(events_of conflict "$CONFLICT" | jq -r '.head_sha + "/" + .base_sha')" "head-1/base-1"
+check "the same conflict is not repeated on every poll" \
+  "$(events_of conflict "$(run_watch --pr 42 --once)" | wc -l | tr -d ' ')" "0"
+
+jq '.headRefOid = "head-2"' "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/view.tmp" \
+  && mv "$FIXTURE_DIR/view.tmp" "$FIXTURE_DIR/view.json"
+check "a conflict against a new revision is reported again" \
+  "$(events_of conflict "$(run_watch --pr 42 --once)" | jq -r '.head_sha')" "head-2"
+
+jq '.baseRefOid = "base-2"' "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/view.tmp" \
+  && mv "$FIXTURE_DIR/view.tmp" "$FIXTURE_DIR/view.json"
+check "base movement independently makes the conflict new" \
+  "$(events_of conflict "$(run_watch --pr 42 --once)" | jq -r '.base_sha')" "base-2"
+
+jq 'del(.mergeable) | .headRefOid = "head-3"' \
+  "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/view.tmp" \
+  && mv "$FIXTURE_DIR/view.tmp" "$FIXTURE_DIR/view.json"
+check "missing mergeability is not misreported as a conflict" \
+  "$(events_of conflict "$(run_watch --pr 42 --once)" | wc -l | tr -d ' ')" "0"
+write_fixtures
+
+# ── 3. the empty-field regression ────────────────────────────────────────────
 #
 # `IFS=$'\t' read` collapses runs of tabs, so a check with an empty `workflow`
 # used to shift `link` one column left — CodeQL reported its URL as its workflow
@@ -204,7 +252,7 @@ check "link lands in url, not workflow" \
 check "populated workflow still lands correctly" \
   "$(events_of check "$OUT" | jq -r 'select(.name=="Lint (conclusion)") | .workflow')" "Lint and Format"
 
-# ── 3. body handling ─────────────────────────────────────────────────────────
+# ── 4. body handling ─────────────────────────────────────────────────────────
 
 echo
 echo "## Body handling"
@@ -228,7 +276,7 @@ check "backslashes survive verbatim (no escape-decoding corruption)" \
   "$(printf 'win C:\\temp and C:\\new plus a "quote" and\ttab')"
 write_fixtures
 
-# ── 4. dedup + lock ──────────────────────────────────────────────────────────
+# ── 5. dedup + lock ──────────────────────────────────────────────────────────
 
 echo
 echo "## Dedup and locking"
@@ -271,7 +319,7 @@ check "lock with no owner recorded is reclaimed" \
   "$(events_of watch_start "$OUT4c" | jq -r '.pr')" "42"
 rm -rf "$REPO/.git/pr-watch/pr-42.lock"
 
-# ── 5. terminal states ───────────────────────────────────────────────────────
+# ── 6. terminal states ───────────────────────────────────────────────────────
 
 echo
 echo "## Terminal states"
@@ -304,7 +352,7 @@ check "merged PR ends the watch without --once" \
 
 write_fixtures
 
-# ── 5b. watch until merged, not until quiet ──────────────────────────────────
+# ── 6b. watch until merged, not until quiet ──────────────────────────────────
 #
 # The whole point of the watch is to still be running at merge time. A PR with
 # green CI awaiting human review produces NO new events for hours; an earlier
@@ -318,10 +366,24 @@ echo "## Runs until merged, not until quiet"
 # awaiting-review state. Must keep polling rather than call it idle.
 reset_state
 run_watch --pr 42 --once >/dev/null            # prime .seen so nothing is new
+jq '.mergeable = "UNKNOWN"' "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/v.tmp" \
+  && mv "$FIXTURE_DIR/v.tmp" "$FIXTURE_DIR/view.json"
 QUIET="$(PR_WATCH_INTERVAL=1 PR_WATCH_IDLE_TIMEOUT=3 PR_WATCH_MAX_LIFETIME=6 with_deadline 40 run_watch --pr 42)"
-check "a quiet OPEN PR is not treated as idle" \
+check "a quiet OPEN PR with UNKNOWN mergeability still has contact" \
   "$(events_of watch_end "$QUIET" | jq -r '.reason')" \
   "max lifetime 6s reached before merge"
+
+# A valid JSON object missing the requested mergeability field is not a
+# successful observation. Otherwise a downgraded/changed API shape would keep
+# the watcher alive while silently disabling the conflict guarantee.
+reset_state
+jq 'del(.mergeable)' "$FIXTURE_DIR/view.json" > "$FIXTURE_DIR/view.tmp" \
+  && mv "$FIXTURE_DIR/view.tmp" "$FIXTURE_DIR/view.json"
+MISSING_MERGEABILITY="$(PR_WATCH_INTERVAL=1 PR_WATCH_IDLE_TIMEOUT=2 PR_WATCH_MAX_LIFETIME=6 with_deadline 40 run_watch --pr 42)"
+check "missing mergeability is treated as lost contact" \
+  "$(events_of watch_end "$MISSING_MERGEABILITY" | jq -r '.reason')" \
+  "no contact with PR for 2s"
+write_fixtures
 
 # Same silence, but now the polls themselves fail: contact is genuinely lost.
 reset_state
@@ -346,7 +408,7 @@ check "a merge after a quiet stretch is still reported" \
 
 write_fixtures
 
-# ── 6. the stream reader ─────────────────────────────────────────────────────
+# ── 7. the stream reader ─────────────────────────────────────────────────────
 
 echo
 echo "## Stream reader"
@@ -369,7 +431,7 @@ MISSING="$(PR_WATCH_STREAM_WAIT=2 bash "$STREAM" "$TMP/does-not-exist.jsonl" 1 2
 check "a log that never appears reports an error instead of hanging" \
   "$(printf '%s' "$MISSING" | jq -r '.kind')" "stream_error"
 
-# ── 7. pre-push arming ───────────────────────────────────────────────────────
+# ── 8. pre-push arming ───────────────────────────────────────────────────────
 #
 # Drive the hook the way git does: ref updates on stdin. is_agent is forced off
 # so the audit gate is skipped — this suite tests the arm, not the gate.
@@ -474,7 +536,7 @@ mv "$SCRATCH_WATCHER" "$TMP/moved-watcher.sh"
 check "absent watcher does not fail the push" "$?" "0"
 mv "$TMP/moved-watcher.sh" "$SCRATCH_WATCHER"
 
-# ── 8. argument parsing ──────────────────────────────────────────────────────
+# ── 9. argument parsing ──────────────────────────────────────────────────────
 #
 # `shift 2` on a flag with no value shifts nothing and leaves $1 in place, so the
 # same case branch matches forever — the process spins instead of erroring.

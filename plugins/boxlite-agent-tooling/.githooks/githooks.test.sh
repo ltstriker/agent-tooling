@@ -1086,7 +1086,8 @@ jq -n '{
       path: "./plugins/boxlite-agent-tooling",
       ref: "main"
     },
-    policy: {installation: "INSTALLED_BY_DEFAULT", authentication: "ON_INSTALL"}
+    policy: {installation: "INSTALLED_BY_DEFAULT", authentication: "ON_INSTALL"},
+    category: "Developer Tools"
   }]
 }' > "$INST/.agents/plugins/marketplace.json"
 printf '%s\n' \

@@ -162,6 +162,12 @@ else
   fail=$((fail + 1)); printf '  FAIL  context names the stream script and the policy\n'
 fi
 
+if [[ "$got" == *"kind 'conflict'"* && "$got" == *"confirmed merge conflict"* ]]; then
+  pass=$((pass + 1)); printf '  PASS  context tells consumers how to handle conflicts\n'
+else
+  fail=$((fail + 1)); printf '  FAIL  context tells consumers how to handle conflicts\n'
+fi
+
 # One attach route per capability, self-selected — the subagent.sh doctrine.
 # Guards the Codex-consumer regression: a context that names only Monitor()
 # reads as Claude-only wiring the moment another host registers this hook.

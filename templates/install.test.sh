@@ -85,10 +85,10 @@ make_consumer() {  # $1 = directory
   mkdir -p "$c/.agent-tooling" "$c/.agents/plugins" "$c/.claude" "$c/.github/copilot"
   jq -nc '{schemaVersion:1,profile:"consumer",repository:"boxlite-ai/example-consumer",tooling:{repository:"boxlite-ai/agent-tooling",ref:"main"},checks:[{name:"test",command:"true"}]}' \
     > "$c/.agent-tooling/profile.json"
-  jq -nc '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{repo:"boxlite-ai/agent-tooling",ref:"main"}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
+  jq -nc '{extraKnownMarketplaces:{"boxlite-agent-tooling":{source:{source:"github",repo:"boxlite-ai/agent-tooling",ref:"main"}}},enabledPlugins:{"boxlite-agent-tooling@boxlite-agent-tooling":true}}' \
     > "$c/.claude/settings.json"
   cp "$c/.claude/settings.json" "$c/.github/copilot/settings.json"
-  jq -nc '{plugins:[{name:"boxlite-agent-tooling",source:{url:"https://github.com/boxlite-ai/agent-tooling.git",ref:"main",path:"./plugins/boxlite-agent-tooling"},policy:{installation:"INSTALLED_BY_DEFAULT"}}]}' \
+  jq -nc '{plugins:[{name:"boxlite-agent-tooling",source:{source:"git-subdir",url:"https://github.com/boxlite-ai/agent-tooling.git",ref:"main",path:"./plugins/boxlite-agent-tooling"},policy:{installation:"INSTALLED_BY_DEFAULT",authentication:"ON_INSTALL"},category:"Developer Tools"}]}' \
     > "$c/.agents/plugins/marketplace.json"
   printf '/.agents/state/\n/.claude/.*\n' > "$c/.gitignore"
   printf 'base\n' > "$c/file"
@@ -122,6 +122,36 @@ grep -q '^<!-- agent-tooling:guidance:begin ' "$CONSUMER/AGENTS.md" 2>/dev/null 
   && ok "install splices the guidance block into AGENTS.md" \
   || bad "install splices the guidance block into AGENTS.md"
 check_eq "install creates the CLAUDE.md bridge" "$(head -n1 "$CONSUMER/CLAUDE.md" 2>/dev/null)" "@AGENTS.md"
+
+echo
+echo "## Codex marketplace sources are typed and fail closed"
+cp "$CONSUMER/.agents/plugins/marketplace.json" "$TMP/codex-marketplace"
+jq 'del(.plugins[0].source.source)' "$TMP/codex-marketplace" \
+  > "$CONSUMER/.agents/plugins/marketplace.json"
+"$PLUGIN_ROOT/scripts/validate-profile.sh" "$CONSUMER" > "$TMP/out" 2> "$TMP/err"
+check_eq "validator rejects an untyped Git source" "$?" 1
+grep -q 'git-subdir' "$TMP/err" \
+  && ok "validator names the required Codex source type" \
+  || bad "validator names the required Codex source type (stderr=$(cat "$TMP/err"))"
+cp "$TMP/codex-marketplace" "$CONSUMER/.agents/plugins/marketplace.json"
+
+echo
+echo "## Claude and Copilot marketplace sources are typed and fail closed"
+for settings_name in claude copilot; do
+  case "$settings_name" in
+    claude) settings_file="$CONSUMER/.claude/settings.json" ;;
+    copilot) settings_file="$CONSUMER/.github/copilot/settings.json" ;;
+  esac
+  cp "$settings_file" "$TMP/$settings_name-settings"
+  jq 'del(.extraKnownMarketplaces["boxlite-agent-tooling"].source.source)' \
+    "$TMP/$settings_name-settings" > "$settings_file"
+  "$PLUGIN_ROOT/scripts/validate-profile.sh" "$CONSUMER" > "$TMP/out" 2> "$TMP/err"
+  check_eq "validator rejects an untyped $settings_name GitHub source" "$?" 1
+  grep -qi 'github' "$TMP/err" \
+    && ok "validator names the required $settings_name source type" \
+    || bad "validator names the required $settings_name source type (stderr=$(cat "$TMP/err"))"
+  cp "$TMP/$settings_name-settings" "$settings_file"
+done
 
 echo
 echo "## Re-running against an unmoved branch is a cheap no-op"
