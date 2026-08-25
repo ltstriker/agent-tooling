@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Agent-agnostic CI + PR-comment watcher.
+# Agent-agnostic CI + PR-state watcher.
 #
 # Armed by .githooks/pre-push after a push, so it runs identically for Claude
 # Code, Codex, opencode, and a human at a terminal. Emits one JSON object per
 # line — to stdout and to an append-only log — as checks conclude and as
-# comments/reviews arrive.
+# merge conflicts and comments/reviews arrive.
 #
 # Consumers:
 #   Claude Code  .agents/hooks/post-remote-write-watch.sh arms a Monitor on the log
@@ -297,8 +297,8 @@ poll_checks() {
   return 0
 }
 
-# Issue comments + review submissions. Inline review threads live in neither of
-# these and are fetched separately below.
+# PR state, mergeability, issue comments, and review submissions. Inline review
+# threads live in neither of these and are fetched separately below.
 #
 # Reports the PR state by assigning the global `pr_state`, NOT by echoing it.
 # `emit` writes events to stdout, so a caller using `state=$(poll_conversation)`
@@ -307,8 +307,15 @@ poll_checks() {
 poll_conversation() {
   local view
   view="$(gh pr view "$pr_number" --repo "$slug" \
-            --json state,comments,reviews 2>/dev/null || true)"
-  printf '%s' "$view" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
+            --json state,comments,reviews,mergeable,headRefOid,baseRefOid 2>/dev/null || true)"
+  printf '%s' "$view" | jq -e '
+    type == "object"
+    and (.mergeable == "MERGEABLE"
+         or .mergeable == "CONFLICTING"
+         or .mergeable == "UNKNOWN")
+    and (.headRefOid | type == "string")
+    and (.baseRefOid | type == "string")
+  ' >/dev/null 2>&1 || return 1
 
   while IFS="$FS" read -r -d "$RS" id author body url; do
     [[ -z "$id" ]] && continue
@@ -327,6 +334,22 @@ poll_conversation() {
                 url "https://github.com/$slug/pull/$pr_number"
   done < <(printf '%s' "$view" \
             | rows '.reviews[]? | [(.id|tostring), (.author.login // "?"), (.state // ""), (.body // "")]')
+
+  # UNKNOWN is a normal transient while GitHub calculates mergeability. Alert
+  # only on its authoritative CONFLICTING result, and scope de-duplication to
+  # both compared revisions: movement on either side can create a new conflict.
+  local mergeability head_sha base_sha conflict_key
+  mergeability="$(printf '%s' "$view" | jq -r '.mergeable // "UNKNOWN"')"
+  if [[ "$mergeability" == "CONFLICTING" ]]; then
+    head_sha="$(printf '%s' "$view" | jq -r '.headRefOid // ""')"
+    base_sha="$(printf '%s' "$view" | jq -r '.baseRefOid // ""')"
+    conflict_key="conflict:${head_sha}:${base_sha}"
+    if ! seen "$conflict_key"; then
+      mark_seen "$conflict_key"
+      emit conflict head_sha "$head_sha" base_sha "$base_sha" \
+                    url "https://github.com/$slug/pull/$pr_number"
+    fi
+  fi
 
   pr_state="$(printf '%s' "$view" | jq -r '.state // "OPEN"')"
 }

@@ -18,9 +18,144 @@ profile manifest; the adopted revision is recorded locally in
 plugins/boxlite-agent-tooling/          Shared multi-host plugin
 plugins/boxlite-agent-tooling/guidance/ Canonical engineering-workflow guidance
 templates/install.sh                    Thin consumer bootstrap
-templates/codex-hooks.json              Scoped Codex prompt-rule wiring
+templates/codex-plugin-bootstrap.json   Full-plugin Codex SessionStart wiring
+templates/codex-plugin-bootstrap.sh     Trust-once Codex plugin bootstrap
+templates/claude-plugin-bootstrap.json  Full-plugin Claude project settings
+templates/claude-plugin-bootstrap.sh    Trust-once Claude plugin bootstrap
+templates/codex-hooks.json              Prompt-only Codex wiring
 templates/claude-settings.json          Scoped Claude Code prompt-rule wiring
 ```
+
+Codex's repository marketplace uses a typed Git-subdirectory source. The nested
+`source.source: "git-subdir"` discriminator is required alongside `url`, `ref`, and
+`path`; omitting it makes the plugin undiscoverable. Profile validation and the
+host-parity suite pin that complete shape.
+
+## Automatic Codex bootstrap
+
+A consumer that already carries the standard `.agent-tooling/install.sh`,
+`.agent-tooling/profile.json`, and `.agents/plugins/marketplace.json` commits two
+additional thin bootstrap files before anyone clones it:
+
+```sh
+mkdir -p "$consumer/.codex" "$consumer/.agent-tooling"
+cp templates/codex-plugin-bootstrap.json "$consumer/.codex/hooks.json"
+cp templates/codex-plugin-bootstrap.sh "$consumer/.agent-tooling/codex-plugin-bootstrap.sh"
+chmod +x "$consumer/.agent-tooling/codex-plugin-bootstrap.sh"
+```
+
+If `.codex/hooks.json` already contains unrelated project hooks, merge the template's
+`SessionStart` entry instead of overwriting the file. Do not combine it with the
+prompt-only `templates/codex-hooks.json`: the installed plugin already supplies that
+`UserPromptSubmit` rule.
+
+The clone-side flow is:
+
+```text
+git clone
+└─ open the repository in Codex
+   ├─ review and trust the project SessionStart command
+   └─ next startup or resume
+      └─ .agent-tooling/codex-plugin-bootstrap.sh
+         ├─ verify the adopted tooling locally
+         ├─ install it in lifecycle mode when missing or invalid
+         ├─ add the canonical boxlite-ai/agent-tooling Git marketplace
+         ├─ compare the installed plugin with the adopted manifest version
+         ├─ refresh and validate the adopted tip first when versions differ
+         ├─ install once, or upgrade the marketplace snapshot on version drift
+         └─ ask for a new Codex task
+            └─ review the installed plugin's command hooks with /hooks
+```
+
+The marketplace source is the canonical Git URL, not the consumer's local `.` path.
+Codex stores configured marketplaces in user scope by marketplace name; two clones or
+worktrees with the same name but different local paths conflict. The shared Git source
+gives every consumer one stable identity. The bootstrap validates the catalog before
+installing, refreshes only when the adopted plugin version changes, preserves an
+intentionally disabled plugin, stays silent on later valid starts, and fails closed
+with stderr when setup is incomplete.
+
+Trust is deliberately not transferable. Codex reviews the committed project bootstrap
+before it runs, then separately reviews the plugin-bundled hooks after installation.
+Plugin skills, tools, and hooks load only in a new task. There is no repository command
+that safely pre-approves those plugin hook definitions. The one-time approval is for
+the stable command definition, not a content hash of the script it launches; later
+changes to `codex-plugin-bootstrap.sh` therefore rely on the consumer repository's
+normal branch protection and code review.
+
+## Automatic Claude Code bootstrap
+
+Claude Code needs the same repository-owned bridge, with one extra lifecycle step:
+project settings can advertise and enable an external plugin, but current Claude Code
+does not install that plugin from `enabledPlugins` alone. A consumer commits the
+bootstrap script and merges the full settings template before anyone clones it:
+
+```sh
+mkdir -p "$consumer/.claude" "$consumer/.agent-tooling"
+cp templates/claude-plugin-bootstrap.sh \
+  "$consumer/.agent-tooling/claude-plugin-bootstrap.sh"
+chmod +x "$consumer/.agent-tooling/claude-plugin-bootstrap.sh"
+
+if [ -f "$consumer/.claude/settings.json" ]; then
+  jq -s '
+    .[0] as $base | .[1] as $bootstrap |
+    ($base * $bootstrap) |
+    .hooks.SessionStart = (
+      (($base.hooks.SessionStart // []) + ($bootstrap.hooks.SessionStart // [])) | unique
+    ) |
+    .hooks.UserPromptSubmit = (
+      (($base.hooks.UserPromptSubmit // []) + ($bootstrap.hooks.UserPromptSubmit // [])) | unique
+    )
+  ' \
+    "$consumer/.claude/settings.json" templates/claude-plugin-bootstrap.json \
+    > "$consumer/.claude/settings.json.new" &&
+    mv "$consumer/.claude/settings.json.new" "$consumer/.claude/settings.json"
+else
+  cp templates/claude-plugin-bootstrap.json "$consumer/.claude/settings.json"
+fi
+```
+
+The explicit array merge preserves existing `SessionStart` and `UserPromptSubmit`
+hooks as well as unrelated settings and hook events. The template floats on `main`;
+if the consumer's `tooling.ref` names another branch, change the template's marketplace
+`ref` to that same value before committing it.
+
+The clone-side call graph is:
+
+```text
+git clone
+└─ open the repository in Claude Code
+   ├─ review and trust the repository once
+   └─ trusted SessionStart (startup, resume, fork, or /clear)
+      └─ .agent-tooling/claude-plugin-bootstrap.sh
+         ├─ verify the adopted tooling locally
+         ├─ install it in lifecycle mode when missing or invalid
+         ├─ validate or add boxlite-ai/agent-tooling@tooling.ref
+         ├─ compare the project plugin with the adopted manifest version
+         ├─ refresh and validate the adopted tip first when versions differ
+         ├─ install once, or update the marketplace and plugin on version drift
+         ├─ record success for this Claude session
+         └─ ask for /reload-plugins or a new Claude session
+            ├─ UserPromptSubmit --check → require that success record
+            └─ Task(subagent_type="boxlite-agent-tooling:<auditor>")
+```
+
+The hook validates the public CLI state before every mutation because Claude permits
+a same-name marketplace to be replaced with a different source. It also distinguishes
+project installations by canonical worktree path, verifies an update reached the
+adopted version without changing an explicit local disable, and suppresses installer
+chatter that would otherwise enter model context.
+
+Claude does not let a `SessionStart` hook block the conversation. On failure the
+bootstrap therefore writes a per-session error and exits nonzero; the committed
+`UserPromptSubmit` hook exits 2 until that same session has a successful bootstrap
+record. The pair, rather than a fake `SessionStart` decision response, is the
+fail-closed boundary.
+
+There is no shell command that hot-loads the newly installed agents and hooks into
+the already-running parent process. `/reload-plugins` is therefore the final one-time
+step; later valid starts are silent. Repository trust remains a human decision and is
+not pre-approved by these files.
 
 ## Shared engineering guidance
 
@@ -64,8 +199,8 @@ consumer's own half of the file. A consumer CI backstop is two commands:
 ## Scoped prompt rules
 
 A full plugin installation brings the audit, PR-review, and verdict gates with it. A
-repository that wants only the reply-shape and workflow reminders can commit the prompt
-hook on its own. Both hosts run the same committed script:
+repository that explicitly wants only the reply-shape and workflow reminders can
+commit the prompt hook on its own instead. Both hosts run the same committed script:
 
 ```sh
 mkdir -p "$consumer/.agent-tooling"
@@ -73,7 +208,8 @@ cp plugins/boxlite-agent-tooling/.agents/hooks/rule-recency.sh \
    "$consumer/.agent-tooling/rule-recency.sh"
 ```
 
-Codex takes the whole file, because `.codex/hooks.json` holds nothing else:
+For this prompt-only option, Codex takes the whole file because `.codex/hooks.json`
+holds nothing else:
 
 ```sh
 mkdir -p "$consumer/.codex"
@@ -122,15 +258,17 @@ wrong:
   snake_case keys, which makes the wrong casing look plausible.
 - **No comment keys.** Both hosts validate strictly and reject an unknown key at any
   depth by loading no hooks at all; Codex does it without logging a parse error.
-- For Codex the project must be **trusted**. Codex grants trust on first run in a
-  directory, so the hook starts firing on the run after that one.
+- For Codex the project must be **trusted**, and each command-hook definition must be
+  reviewed and trusted with `/hooks`. Trust is tied to the exact definition, so a
+  changed command is skipped until it is reviewed again.
 
 `templates/prompt-rules.test.sh` pins all four for both hosts, because nothing
 downstream reports them. It also checks that `rule-recency.sh` still runs with nothing
 else installed, which is the assumption the committed copy rests on.
 
-Hooks themselves need no opt-in: `codex features list` reports `hooks` as `stable`,
-enabled by default.
+The hooks feature itself needs no flag opt-in: `codex features list` reports it as
+`stable` and enabled by default. Plugin hooks still require an installed, enabled
+plugin and the command trust described above.
 
 ## Validate
 
@@ -138,6 +276,8 @@ enabled by default.
 python3 /path/to/plugin-creator/scripts/validate_plugin.py \
   plugins/boxlite-agent-tooling
 claude plugin validate plugins/boxlite-agent-tooling
+bash templates/codex-plugin-bootstrap.test.sh
+bash templates/claude-plugin-bootstrap.test.sh
 bash plugins/boxlite-agent-tooling/host-parity.test.sh
 ```
 
@@ -178,10 +318,17 @@ write one full lowercase commit SHA to `.agent-tooling/hold` (commit it to freez
 every clone, keep it local to freeze one machine). While a hold exists nothing is
 resolved, the gates stay closed until the held revision is adopted, and a malformed
 hold fails the installation rather than letting it float on. Delete the file to
-resume floating.
+resume floating. Session bootstraps also honor the freeze: if an installed host
+plugin differs from the held manifest version, they fail without refreshing the
+marketplace or plugin until the hold is removed.
 
 Host plugin activations (`.claude/settings.json`, the Copilot settings, the Codex
-marketplace) float on the same `tooling.ref` — the profile validation enforces it —
-but each host re-resolves the ref on its own schedule, so the cross-host agreement is
-same-ref, not same-revision. `templates/install.test.sh` pins all of this against a
-local fixture remote.
+marketplace) float on the same `tooling.ref` — the profile validation enforces it.
+The Claude and Codex session bootstraps compare their installed plugin version with
+the adopted checkout and touch the network only on a mismatch. They first refresh and
+validate the tooling tip, which reconciles a host that updated before the repository's
+throttled poll; only a host that remains behind gets a plugin refresh. Every plugin
+release must therefore bump all parity-checked manifests. Copilot still resolves the
+ref on its host schedule, so the cross-host agreement is same-ref, not necessarily
+same-revision.
+`templates/install.test.sh` pins the adoption path against a local fixture remote.

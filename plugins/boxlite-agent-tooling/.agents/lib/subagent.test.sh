@@ -38,8 +38,15 @@ echo "## Both hosts are always offered"
 out="$(subagent_instruction --agent verdict-auditor --root "$PLUGIN_ROOT" --task 'audit my turn')"
 check    "names the Claude Code route"  "Claude Code"                 "$out"
 check    "names the Codex route"        "Codex"                       "$out"
-check    "uses Task() for Claude"       "Task(subagent_type='verdict-auditor'" "$out"
+check    "uses the plugin-scoped Task() agent for Claude" \
+  "Task(subagent_type='boxlite-agent-tooling:verdict-auditor'" "$out"
+check_no "never emits the unavailable bare Claude agent" \
+  "Task(subagent_type='verdict-auditor'" "$out"
 check    "uses spawn_agent for Codex"   "collaboration.spawn_agent("  "$out"
+check    "normalizes the Codex task name for its schema" \
+  "task_name='verdict_auditor'" "$out"
+check_no "never emits a hyphenated Codex task name" \
+  "task_name='verdict-auditor'" "$out"
 check    "carries the task text"        "audit my turn"               "$out"
 # A backgrounded audit lets the turn end before the artifact lands, and the gate fires
 # again on the way out — the re-block loop this wording exists to prevent.

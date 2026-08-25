@@ -114,8 +114,9 @@ ${pr_line}
 
 .githooks/pre-push has armed the watcher. It appends one JSON event per line to
   ${event_log}
-Kinds: check (one per check as it concludes), checks_done, comment, review,
-review_comment, watch_start, watch_end. The stream ends itself at watch_end.
+Kinds: check (one per check as it concludes), checks_done, conflict, comment,
+review, review_comment, watch_start, watch_end. The stream ends itself at
+watch_end.
 
 Attach ONE consumer to it now, using WHICHEVER of these your harness provides —
 do not attach a second one for this branch, and do not poll \`gh pr checks\` by
@@ -124,7 +125,7 @@ hand while it runs:
   Claude Code
     Monitor({
       command: 'bash ${tooling_root}/.agents/watch/pr-watch-stream.sh \"${event_log}\"',
-      description: 'CI checks + PR comments on ${branch}',
+      description: 'CI checks + PR activity on ${branch}',
       persistent: true,
     })
 
@@ -142,11 +143,15 @@ When an event arrives:
       gh run view <run-id> --log-failed
     then follow ${tooling_root}/.agents/watch/escalation-policy.md, which decides
     what you may fix unattended and what needs the human. Read it before editing.
+  * kind 'conflict'           -> alert the human to the confirmed merge conflict,
+    inspect both compared revisions, then follow the same escalation policy
+    before changing history or resolving files.
   * a new comment or review    -> summarize it for the user; apply the same
     policy before acting on it.
   * alert the human — PushNotification on Claude Code, otherwise the FIRST line
     of your next reply — for a failing required check ('Lint (conclusion)',
-    'Test (conclusion)') AND for every new comment,
+    'Test (conclusion)'), every confirmed merge conflict, AND for every new
+    comment,
     review, or inline review thread — bots included. Reviewers are why the
     watch exists; an unread bot finding is the failure mode it is meant to
     prevent. Routine passing checks stay silent.

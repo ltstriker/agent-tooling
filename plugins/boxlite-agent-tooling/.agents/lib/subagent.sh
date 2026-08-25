@@ -11,7 +11,7 @@
 # — only the agent can. So the hook's whole job here is to NAME the routes and let the
 # agent take the one it actually has. Both hosts ship a built-in for this:
 #
-#   Claude Code   Task(subagent_type=..., prompt=...)        spec resolved BY NAME
+#   Claude Code   Task(subagent_type=<plugin>:<agent>, ...)  scoped plugin name
 #   Codex         collaboration.spawn_agent(task_name, message)   no spec parameter
 #
 # Shelling out to `claude -p` or `codex exec` from inside a live agent spawns a whole
@@ -32,11 +32,12 @@
 #
 # Spec delivery differs by host, so it is referenced rather than inlined
 # ---------------------------------------------------------------------
-# Claude Code resolves `subagent_type` against .claude/agents/<name>.md itself. Codex
-# takes no spec parameter, so the procedure has to travel in `message`. The specs run
-# to ~100-150 lines and this text is injected on EVERY blocked attempt, so the Codex
-# route cites the spec path and has the subagent read it. One canonical spec file, a
-# short message, and no second copy in TOML to drift out of sync.
+# Claude Code registers plugin agents as <plugin>:<frontmatter-name>. Codex takes no
+# spec parameter, so the procedure has to travel in `message`, and its task_name must
+# use underscores rather than the spec filename's hyphens. The specs run to ~100-150
+# lines and this text is injected on EVERY blocked attempt, so the Codex route cites
+# the spec path and has the subagent read it. One canonical spec file, a short message,
+# and no second copy in TOML to drift out of sync.
 #
 # A missing spec file is a packaging bug, not a runtime branch: this still emits the
 # instruction, and subagent.test.sh asserts every referenced spec exists.
@@ -143,8 +144,10 @@ subagent_instruction() {
   fi
   [[ -n "$description" ]] || description="$agent"
 
-  local spec
+  local spec claude_agent codex_task_name
   spec="$(subagent_spec_path "$agent" "$root")"
+  claude_agent="boxlite-agent-tooling:$agent"
+  codex_task_name="${agent//-/_}"
 
   # SYNCHRONOUSLY is load-bearing and stated in both routes: a backgrounded audit's
   # completion event is what produced the #892 re-block loop, because the turn ended
@@ -152,14 +155,14 @@ subagent_instruction() {
   printf 'Spawn the %s subagent now, SYNCHRONOUSLY — its result must exist before you\ncontinue. Use WHICHEVER of these your harness provides:\n\n' "$agent"
 
   printf '  Claude Code\n'
-  printf "    Task(subagent_type='%s',\n" "$agent"
+  printf "    Task(subagent_type='%s',\n" "$claude_agent"
   printf "         description='%s',\n" "$description"
   printf "         prompt='%s')\n" "$task"
   printf '    run_in_background: false\n\n'
 
   printf '  Codex\n'
   printf '    collaboration.spawn_agent(\n'
-  printf "      task_name='%s',\n" "$agent"
+  printf "      task_name='%s',\n" "$codex_task_name"
   printf "      message='Read %s and follow that procedure\n" "$spec"
   printf "               exactly. Then: %s')\n\n" "$task"
 

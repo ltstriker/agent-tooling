@@ -134,6 +134,12 @@ file_mtime_epoch() {
 
 payload="$(cat)"
 transcript_path="$(printf '%s' "$payload" | jq -r '.transcript_path // ""' 2>/dev/null || echo '')"
+last_assistant_message="$(printf '%s' "$payload" | jq -r '
+  if (.last_assistant_message | type) == "string" then .last_assistant_message else "" end
+' 2>/dev/null || echo '')"
+stop_hook_active="$(printf '%s' "$payload" | jq -r '
+  if .stop_hook_active == true then "true" else "false" end
+' 2>/dev/null || echo 'false')"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 project_dir="${CLAUDE_PROJECT_DIR:-$repo_root}"
@@ -145,6 +151,10 @@ verdict_file="$project_dir/.agents/state/last-verdict.json"
 prev_verdict_file="$project_dir/.agents/state/last-verdict.prev.json"
 last_uuid_file="$project_dir/.agents/state/verdict-last-uuid"
 decision_log="$project_dir/.agents/state/verdict-decisions.log"
+# When Codex has no transcript, preserve its stable Stop message in the transcript
+# shape the independent auditor already consumes. This is gitignored runtime state,
+# not evidence invented by the gate: the text is copied byte-for-byte from the event.
+payload_transcript_file="$project_dir/.agents/state/verdict-stop-message.jsonl"
 # Held by run-verdict-audit.sh while it runs; body format defined by its
 # take_audit_lock(). Tells "the agent ignored the findings" from "the answer is coming".
 audit_lock_file="$project_dir/.agents/state/verdict-audit.lock"
@@ -219,17 +229,23 @@ compute_tree_hash() {
 # the turn text to judge).
 # Turn identity is a checksum of the joined text — content-derived, no
 # per-harness ids — used by the never-judge-twice race guard.
-# Empty text (no/unreadable transcript) means detection cannot run → the caller
-# falls back to allow (fail-open, never trap on absent state).
+# Empty transcript text is retried when the file has content: the hook can run before
+# the harness flushes the final assistant record. Only after that bounded wait does
+# the caller fall back to Codex Stop.last_assistant_message. Empty text after both
+# sources means detection cannot run → allow (fail-open, never trap on absent state).
 FINAL_ID=""
 FINAL_TEXT=""
+FINAL_SOURCE=""
+identify_final_message() {
+  FINAL_ID="cksum-$(printf '%s' "$FINAL_TEXT" | cksum | tr ' \t' '--')"
+}
 extract_final_message() {
-  FINAL_ID=""; FINAL_TEXT=""
-  [[ -n "$transcript_path" && -r "$transcript_path" ]] || return 0
-  if [[ -n "${VERDICT_EXTRACTOR_CMD:-}" ]]; then
-    FINAL_TEXT="$(bash -c "$VERDICT_EXTRACTOR_CMD \"\$1\"" _ "$transcript_path" 2>/dev/null || true)"
-  else
-    FINAL_TEXT="$(jq -rs '
+  FINAL_ID=""; FINAL_TEXT=""; FINAL_SOURCE=""
+  if [[ -n "$transcript_path" && -r "$transcript_path" ]]; then
+    if [[ -n "${VERDICT_EXTRACTOR_CMD:-}" ]]; then
+      FINAL_TEXT="$(bash -c "$VERDICT_EXTRACTOR_CMD \"\$1\"" _ "$transcript_path" 2>/dev/null || true)"
+    else
+      FINAL_TEXT="$(jq -rs '
       def is_assistant: [.. | objects | select((.role? == "assistant") or (.type? == "assistant"))] | length > 0;
       def is_real_user:
         # A REAL user record carries a text-typed block at the TOP LEVEL of the
@@ -252,9 +268,17 @@ extract_final_message() {
              else ([.. | objects | .text? // empty | strings] | join("\n")) end)
         ) | select(length > 0)]
       | join("\n\n")' "$transcript_path" 2>/dev/null || true)"
+    fi
   fi
   [[ -n "$FINAL_TEXT" ]] || return 0
-  FINAL_ID="cksum-$(printf '%s' "$FINAL_TEXT" | cksum | tr ' \t' '--')"
+  FINAL_SOURCE="transcript"
+  identify_final_message
+}
+use_payload_message() {
+  [[ -n "$last_assistant_message" ]] || return 0
+  FINAL_TEXT="$last_assistant_message"
+  FINAL_SOURCE="payload"
+  identify_final_message
 }
 
 # Fenced blocks go entirely: verdict phrasing quoted inside one is documentation, not a
@@ -451,9 +475,32 @@ verdict_patterns+='|(部署|服务|线上)(正常|健康|稳定)'
 #     it is at BLOCK time rather than at definition time.
 #
 # Variables available: ${transcript_path} ${branch} ${head} ${verdict_file}
+write_payload_transcript() {
+  local tmp
+  mkdir -p "$(dirname "$payload_transcript_file")" 2>/dev/null || return 1
+  tmp="$(mktemp "${payload_transcript_file}.XXXXXX")" || return 1
+  if ! jq -nc --arg text "$last_assistant_message" \
+      '{type:"assistant", source:"codex-stop-payload",
+        message:{content:[{type:"text", text:$text}]}}' > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$payload_transcript_file"
+}
+
 verdict_instruction() {
-  local prior="" tooling_root
+  local prior="" tooling_root audit_transcript_path="$transcript_path"
   tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  if [[ "$FINAL_SOURCE" == "payload" \
+     || ( -n "$last_assistant_message" \
+          && ( -z "$transcript_path" || ! -r "$transcript_path" || ! -s "$transcript_path" ) ) ]]; then
+    if write_payload_transcript; then
+      audit_transcript_path="$payload_transcript_file"
+    else
+      printf 'preflight-verdict-check: could not persist the Stop payload for audit: %s\n' \
+        "$payload_transcript_file" >&2
+    fi
+  fi
   [[ -r "$prev_verdict_file" ]] && prior="
 
 A PRIOR audit of this same work FAILED; its findings are in ${prev_verdict_file}.
@@ -476,7 +523,7 @@ claims, so anything the fix newly asserts is still caught."
   # told to run. This hook never executes it — the reader might.
   local headless_command
   printf -v headless_command 'bash %q %q' \
-    "$tooling_root/.agents/hooks/run-verdict-audit.sh" "$transcript_path"
+    "$tooling_root/.agents/hooks/run-verdict-audit.sh" "$audit_transcript_path"
 
   local lib="$tooling_root/.agents/lib/subagent.sh"
   if [[ -r "$lib" ]]; then
@@ -487,7 +534,7 @@ claims, so anything the fix newly asserts is still caught."
       --root "$tooling_root" \
       --description 'verdict proof check' \
       --artifact "$verdict_file" \
-      --task "$(subagent_prompt verdict-task "$tooling_root" "transcript_path=${transcript_path}")" \
+      --task "$(subagent_prompt verdict-task "$tooling_root" "transcript_path=${audit_transcript_path}")" \
       --headless "$headless_command"
   else
     printf 'preflight-verdict-check: missing %s — emitting the headless route only\n' "$lib" >&2
@@ -574,13 +621,15 @@ if [[ -r "$verdict_file" ]]; then
         log_decision dossier PASS-allow
         # The parked FAIL goes too: the cycle it belonged to just ended clean, and a
         # surviving prev would point the next audit at findings already resolved.
-        rm -f "$verdict_file" "$prev_verdict_file"   # consume; the next verdict re-audits
+        rm -f "$verdict_file" "$prev_verdict_file" "$payload_transcript_file"
+        # Consume the synthetic Stop transcript too; the next verdict re-audits from
+        # its own event instead of inheriting the previous message.
         allow_with_note "[verdict-gate] dossier PASS → consumed, turn ends"
         ;;
       IN_PROGRESS)
         remaining="$(jq -r '.findings[]? | "  - " + .' "$verdict_file" 2>/dev/null || echo '')"
         log_decision dossier IN_PROGRESS-allow
-        rm -f "$verdict_file" "$prev_verdict_file"
+        rm -f "$verdict_file" "$prev_verdict_file" "$payload_transcript_file"
         allow_with_note "Verdict: IN_PROGRESS — proof deferred, work not yet complete:
 ${remaining}"
         ;;
@@ -654,39 +703,56 @@ extract_final_message
 #     to slip past the gate, so give it the SAME bounded wait the identity guard below
 #     uses before failing open. Observed live: a turn whose text record landed 0.1s
 #     after this hook read the file logged `extract empty-allow` and was never triaged.
-if [[ -z "$FINAL_TEXT" && -s "$transcript_path" ]]; then
+transcript_had_content=false
+[[ -n "$transcript_path" && -s "$transcript_path" ]] && transcript_had_content=true
+if [[ -z "$FINAL_TEXT" && "$transcript_had_content" == true ]]; then
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
     extract_final_message
     [[ -n "$FINAL_TEXT" ]] && break
   done
-  # Still blind after the wait: fail open (never trap on absent state), but under a rung
-  # that says so. Logging this as `empty` would leave `tail`ing the log unable to tell a
-  # quiet session from a gate that never looked, which is how this went unnoticed.
-  if [[ -z "$FINAL_TEXT" ]]; then
+fi
+
+# Codex permits a null transcript_path and supplies this stable Stop field for that
+# case. Apply it only after the transcript flush window so the last fragment cannot
+# hide an earlier verdict from the same turn.
+[[ -z "$FINAL_TEXT" ]] && use_payload_message
+
+if [[ -z "$FINAL_TEXT" ]]; then
+  if [[ "$transcript_had_content" == true ]]; then
+    # Still blind after the wait: fail open (never trap on absent state), but under a
+    # rung that says so. Logging this as `empty` would make a gate that never looked
+    # indistinguishable from a quiet session.
     log_decision extract blind-allow
     allow_with_note "[verdict-gate] transcript has content but no assistant text after 2s → allowing UNJUDGED"
+  else
+    log_decision extract empty-allow
+    allow
   fi
-fi
-if [[ -z "$FINAL_TEXT" ]]; then
-  log_decision extract empty-allow
-  allow
 fi
 
 # Flush-race guard: if the newest transcript message is the one already judged, the
 # harness fired Stop before appending this turn's final text. Wait briefly for the
 # fresh message; if none arrives there is nothing new to judge → allow. A message
-# is never judged twice.
+# is never judged twice. A payload-only message has nothing to flush: only Codex's
+# active-hook signal plus an identical content identity proves that call is recursive.
 recorded_id="$(cat "$last_uuid_file" 2>/dev/null || echo '')"
 if [[ -n "$FINAL_ID" && -n "$recorded_id" && "$FINAL_ID" == "$recorded_id" ]]; then
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.2
-    extract_final_message
-    [[ "$FINAL_ID" != "$recorded_id" ]] && break
-  done
-  if [[ -z "$FINAL_TEXT" || "$FINAL_ID" == "$recorded_id" ]]; then
+  if [[ "$FINAL_SOURCE" == "payload" && "$stop_hook_active" == "true" ]]; then
     log_decision race stale-allow
-    allow_with_note "[verdict-gate] transcript unchanged since last judgment → allow"
+    allow_with_note "[verdict-gate] Stop payload unchanged during active hook → allow"
+  fi
+  if [[ "$FINAL_SOURCE" == "transcript" ]]; then
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 0.2
+      extract_final_message
+      [[ "$FINAL_ID" != "$recorded_id" ]] && break
+    done
+    [[ -z "$FINAL_TEXT" ]] && use_payload_message
+    if [[ -z "$FINAL_TEXT" || "$FINAL_ID" == "$recorded_id" ]]; then
+      log_decision race stale-allow
+      allow_with_note "[verdict-gate] transcript unchanged since last judgment → allow"
+    fi
   fi
 fi
 
