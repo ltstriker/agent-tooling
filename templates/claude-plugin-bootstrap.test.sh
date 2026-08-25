@@ -6,6 +6,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SETTINGS_FILE="$REPO_ROOT/templates/claude-plugin-bootstrap.json"
+MERGE_FILTER="$REPO_ROOT/templates/merge-claude-plugin-settings.jq"
+PRECANONICAL_SETTINGS="$REPO_ROOT/templates/fixtures/claude-plugin-bootstrap-precanonical.json"
 BOOTSTRAP="$REPO_ROOT/templates/claude-plugin-bootstrap.sh"
 FAKE_CLAUDE="$REPO_ROOT/templates/fixtures/fake-claude-plugin-cli.sh"
 FAKE_INSTALLER="$REPO_ROOT/templates/fixtures/fake-agent-tooling-install.sh"
@@ -46,6 +48,31 @@ jq -e '
 ' "$SETTINGS_FILE" >/dev/null 2>&1 \
   && ok "settings declare a typed GitHub marketplace and enable the plugin" \
   || bad "settings declare a typed GitHub marketplace and enable the plugin"
+actual_top_level="$(jq -c '.' "$SETTINGS_FILE" 2>/dev/null)"
+canonical_top_level="$(jq -c '{hooks, enabledPlugins, extraKnownMarketplaces}' "$SETTINGS_FILE" 2>/dev/null)"
+check_eq "settings use Claude Code canonical top-level key order" \
+  "$actual_top_level" "$canonical_top_level"
+actual_session_hook="$(jq -c '.hooks.SessionStart[0].hooks[0]' "$SETTINGS_FILE" 2>/dev/null)"
+canonical_session_hook="$(jq -c '
+  .hooks.SessionStart[0].hooks[0] |
+  {type, command, args, timeout, statusMessage}
+' "$SETTINGS_FILE" 2>/dev/null)"
+check_eq "SessionStart hook uses Claude Code canonical key order" \
+  "$actual_session_hook" "$canonical_session_hook"
+if jq -s -f "$MERGE_FILTER" "$PRECANONICAL_SETTINGS" "$SETTINGS_FILE" \
+  > "$TMP/merged-settings.json" 2>/dev/null; then
+  merge_status=0
+else
+  merge_status="$?"
+fi
+check_eq "documented merge accepts settings from the previous template" "$merge_status" 0
+merged_session_hook="$(jq -c '.hooks.SessionStart[0].hooks[0]' "$TMP/merged-settings.json" 2>/dev/null)"
+check_eq "documented merge replaces the previous hook with canonical key order" \
+  "$merged_session_hook" "$canonical_session_hook"
+check_eq "documented merge keeps one managed SessionStart hook" \
+  "$(jq -r '.hooks.SessionStart | length' "$TMP/merged-settings.json" 2>/dev/null)" 1
+check_eq "documented merge keeps one managed prompt gate" \
+  "$(jq -r '.hooks.UserPromptSubmit | length' "$TMP/merged-settings.json" 2>/dev/null)" 1
 check_eq "hook runs only when Claude creates a session context" \
   "$(jq -r '.hooks.SessionStart[0].matcher // "MISSING"' "$SETTINGS_FILE" 2>/dev/null)" \
   "^(startup|resume|fork|clear)$"

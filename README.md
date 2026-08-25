@@ -22,6 +22,7 @@ templates/codex-plugin-bootstrap.json   Full-plugin Codex SessionStart wiring
 templates/codex-plugin-bootstrap.sh     Trust-once Codex plugin bootstrap
 templates/claude-plugin-bootstrap.json  Full-plugin Claude project settings
 templates/claude-plugin-bootstrap.sh    Trust-once Claude plugin bootstrap
+templates/merge-claude-plugin-settings.jq  Canonical Claude settings merge
 templates/codex-hooks.json              Prompt-only Codex wiring
 templates/claude-settings.json          Scoped Claude Code prompt-rule wiring
 ```
@@ -97,16 +98,7 @@ cp templates/claude-plugin-bootstrap.sh \
 chmod +x "$consumer/.agent-tooling/claude-plugin-bootstrap.sh"
 
 if [ -f "$consumer/.claude/settings.json" ]; then
-  jq -s '
-    .[0] as $base | .[1] as $bootstrap |
-    ($base * $bootstrap) |
-    .hooks.SessionStart = (
-      (($base.hooks.SessionStart // []) + ($bootstrap.hooks.SessionStart // [])) | unique
-    ) |
-    .hooks.UserPromptSubmit = (
-      (($base.hooks.UserPromptSubmit // []) + ($bootstrap.hooks.UserPromptSubmit // [])) | unique
-    )
-  ' \
+  jq -s -f templates/merge-claude-plugin-settings.jq \
     "$consumer/.claude/settings.json" templates/claude-plugin-bootstrap.json \
     > "$consumer/.claude/settings.json.new" &&
     mv "$consumer/.claude/settings.json.new" "$consumer/.claude/settings.json"
@@ -116,8 +108,11 @@ fi
 ```
 
 The explicit array merge preserves existing `SessionStart` and `UserPromptSubmit`
-hooks as well as unrelated settings and hook events. The template floats on `main`;
-if the consumer's `tooling.ref` names another branch, change the template's marketplace
+hooks as well as unrelated settings and hook events. It also emits the host's canonical
+top-level and command-field order, preferring the current template when an older copy
+of the same hook is already present. This keeps the first plugin installation from
+rewriting and dirtying the committed settings file. The template floats on `main`; if
+the consumer's `tooling.ref` names another branch, change the template's marketplace
 `ref` to that same value before committing it.
 
 The clone-side call graph is:

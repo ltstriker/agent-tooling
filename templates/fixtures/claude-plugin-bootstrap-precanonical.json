@@ -1,4 +1,16 @@
 {
+  "extraKnownMarketplaces": {
+    "boxlite-agent-tooling": {
+      "source": {
+        "source": "github",
+        "repo": "boxlite-ai/agent-tooling",
+        "ref": "main"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "boxlite-agent-tooling@boxlite-agent-tooling": true
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -11,8 +23,8 @@
               "bash",
               "${CLAUDE_PROJECT_DIR}/.agent-tooling/claude-plugin-bootstrap.sh"
             ],
-            "timeout": 180,
-            "statusMessage": "Checking BoxLite agent tooling"
+            "statusMessage": "Checking BoxLite agent tooling",
+            "timeout": 180
           }
         ]
       }
@@ -35,17 +47,5 @@
         ]
       }
     ]
-  },
-  "enabledPlugins": {
-    "boxlite-agent-tooling@boxlite-agent-tooling": true
-  },
-  "extraKnownMarketplaces": {
-    "boxlite-agent-tooling": {
-      "source": {
-        "source": "github",
-        "repo": "boxlite-ai/agent-tooling",
-        "ref": "main"
-      }
-    }
   }
 }
