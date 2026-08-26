@@ -198,6 +198,23 @@ check_eq "moved checkout expects plugin release 0.1.5" "$(adopted_codex_version)
 check_eq "host remains on plugin release 0.1.4 before refresh" \
   "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
 
+before_manifest_upgrade_commands="$(command_count '^plugin marketplace upgrade ')"
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 \
+FAKE_CODEX_FALSE_SUCCESS_MARKETPLACE_MANIFEST=1 \
+run_hook > "$TMP/out" 2> "$TMP/err"
+check_eq "upgrade without a matching configured manifest is rejected" "$?" 1
+check_eq "stale-manifest path runs the exact marketplace upgrade command" \
+  "$(command_count '^plugin marketplace upgrade boxlite-agent-tooling --json$')" \
+  "$((before_manifest_upgrade_commands + 1))"
+if grep -q 'configured Codex marketplace stayed at 0.1.4 after upgrade; expected 0.1.5' "$TMP/err"; then
+  ok "stale-manifest failure names both versions"
+else
+  bad "stale-manifest failure names both versions (stderr=$(cat "$TMP/err"))"
+fi
+# Restore only the simulated host record so the next case starts from the same
+# pre-upgrade boundary; the false-success fixture deliberately left the manifest old.
+printf '%s\n' "0.1.4" > "$FAKE_STATE/plugin-version"
+
 before_upgrade_commands="$(command_count '^plugin marketplace upgrade ')"
 FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 \
 FAKE_CODEX_FALSE_SUCCESS_MARKETPLACE_UPGRADE=1 \
@@ -388,6 +405,58 @@ else
 fi
 check_eq "failed plugin add is attempted exactly once" \
   "$(command_count '^plugin add ')" "$((before_plugins + 1))"
+
+echo
+echo "## Catalog version boundaries fail closed"
+CONFIGURED_PLUGIN_MANIFEST="$CONSUMER/plugins/boxlite-agent-tooling/.codex-plugin/plugin.json"
+cp "$CONFIGURED_PLUGIN_MANIFEST" "$TMP/configured-plugin-manifest"
+jq '.version = null' "$TMP/configured-plugin-manifest" > "$CONFIGURED_PLUGIN_MANIFEST"
+before_catalog_reads="$(command_count '^plugin list ')"
+run_hook > "$TMP/out" 2> "$TMP/err"
+check_eq "configured marketplace manifest without a version is rejected" "$?" 1
+if grep -q 'configured Codex marketplace has no valid plugin version' "$TMP/err"; then
+  ok "manifest failure names the invalid configured version"
+else
+  bad "manifest failure names the invalid configured version (stderr=$(cat "$TMP/err"))"
+fi
+check_eq "invalid configured manifest stops before catalog inspection" \
+  "$(command_count '^plugin list ')" "$before_catalog_reads"
+cp "$TMP/configured-plugin-manifest" "$CONFIGURED_PLUGIN_MANIFEST"
+
+rm -f "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
+before_plugins="$(command_count '^plugin add ')"
+FAKE_CODEX_AVAILABLE_VERSION_JSON='{}' run_hook > "$TMP/out" 2> "$TMP/err"
+check_eq "malformed available version is rejected" "$?" 1
+check_eq "malformed available version stops before plugin installation" \
+  "$(command_count '^plugin add ')" "$before_plugins"
+
+FAKE_CODEX_AVAILABLE_VERSION_OMITTED=1 run_hook > "$TMP/out" 2> "$TMP/err"
+check_eq "missing available version field is rejected" "$?" 1
+check_eq "missing available version field stops before plugin installation" \
+  "$(command_count '^plugin add ')" "$before_plugins"
+rm -f "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
+
+touch "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
+printf '%s\n' "0.1.4" > "$FAKE_STATE/plugin-version"
+FAKE_CODEX_INSTALLED_VERSION_NULL=1 run_hook > "$TMP/out" 2> "$TMP/err"
+check_eq "installed plugin with a null version is rejected" "$?" 1
+if grep -q 'does not advertise the expected plugin' "$TMP/err"; then
+  ok "installed null failure names the invalid catalog entry"
+else
+  bad "installed null failure names the invalid catalog entry (stderr=$(cat "$TMP/err"))"
+fi
+
+rm -f "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
+before_plugins="$(command_count '^plugin add ')"
+FAKE_CODEX_PLUGIN_ADD_VERSION=0.1.3 run_hook > "$TMP/out" 2> "$TMP/err"
+check_eq "plugin add with the wrong installed version is rejected" "$?" 1
+check_eq "wrong-version plugin add is attempted exactly once" \
+  "$(command_count '^plugin add ')" "$((before_plugins + 1))"
+if grep -q 'did not install boxlite-agent-tooling at expected version 0.1.4' "$TMP/err"; then
+  ok "post-add failure names the adopted expected version"
+else
+  bad "post-add failure names the adopted expected version (stderr=$(cat "$TMP/err"))"
+fi
 
 echo
 printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"
