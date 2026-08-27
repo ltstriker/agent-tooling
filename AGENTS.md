@@ -33,7 +33,7 @@
   skills tree, one agent-spec set, one hooks file inside the schema both hosts parse.
   Run it after touching any manifest, marketplace, symlink, or hooks.json.
 
-<!-- agent-tooling:guidance:begin rev=59b469996d22-dirty sha256=8afd17bc8f27 -->
+<!-- agent-tooling:guidance:begin rev=3de47b436b45 sha256=8afd17bc8f27 -->
 
 > Managed by **boxlite-ai/agent-tooling** — do not edit between the markers. Change `plugins/boxlite-agent-tooling/guidance/workflow.md` there, then rerun `./.agent-tooling/install.sh` here.
 
