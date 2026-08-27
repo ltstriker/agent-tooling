@@ -55,6 +55,10 @@ subagent_spec_path() {  # $1 = agent name, $2 = tooling root
   printf '%s/.claude/agents/%s.md\n' "$2" "$1"
 }
 
+subagent_json_string() {  # arbitrary text -> one JSON string literal
+  jq -Rn --arg value "$1" '$value'
+}
+
 # Load a prompt from .agents/prompts/<name>.md and fill in its {{placeholders}}.
 #
 #   subagent_prompt verdict-audit-task "$root" transcript_path="$p" branch="$b"
@@ -121,20 +125,39 @@ subagent_prompt() {  # $1 = prompt name, $2 = tooling root, then key=value pairs
 # Print the block a gate puts in its deny reason.
 #
 #   subagent_instruction --agent commit-push-auditor --root "$tooling_root" \
-#                        --task "$task" [--description D] [--artifact F] [--headless CMD]
+#                        --task "$task" [--description D] [--artifact F]
+#                        [--codex-task-name N] [--codex-retry-existing]
+#                        [--headless CMD]
 #
 # Exit 2 on a usage error, so a miswired caller fails loudly in tests rather than
 # silently emitting an instruction that names nothing.
 subagent_instruction() {
   local agent="" root="" task="" description="" artifact="" headless=""
+  local codex_task_name="" codex_task_name_explicit=false codex_retry_existing=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --agent)       agent="${2:-}";       shift 2 ;;
-      --root)        root="${2:-}";        shift 2 ;;
-      --task)        task="${2:-}";        shift 2 ;;
-      --description) description="${2:-}"; shift 2 ;;
-      --artifact)    artifact="${2:-}";    shift 2 ;;
-      --headless)    headless="${2:-}";    shift 2 ;;
+      --agent)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --agent requires a value\n' >&2; return 2; }
+        agent="$2"; shift 2 ;;
+      --root)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --root requires a value\n' >&2; return 2; }
+        root="$2"; shift 2 ;;
+      --task)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --task requires a value\n' >&2; return 2; }
+        task="$2"; shift 2 ;;
+      --description)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --description requires a value\n' >&2; return 2; }
+        description="$2"; shift 2 ;;
+      --artifact)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --artifact requires a value\n' >&2; return 2; }
+        artifact="$2"; shift 2 ;;
+      --codex-task-name)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --codex-task-name requires a value\n' >&2; return 2; }
+        codex_task_name="$2"; codex_task_name_explicit=true; shift 2 ;;
+      --codex-retry-existing) codex_retry_existing=true; shift ;;
+      --headless)
+        [[ $# -ge 2 ]] || { printf 'subagent_instruction: --headless requires a value\n' >&2; return 2; }
+        headless="$2"; shift 2 ;;
       *) printf 'subagent_instruction: unknown option: %s\n' "$1" >&2; return 2 ;;
     esac
   done
@@ -143,11 +166,28 @@ subagent_instruction() {
     return 2
   fi
   [[ -n "$description" ]] || description="$agent"
+  if [[ -n "$codex_task_name" && ! "$codex_task_name" =~ ^[a-z0-9_]+$ ]]; then
+    printf 'subagent_instruction: --codex-task-name must use lowercase letters, digits, or underscores\n' >&2
+    return 2
+  fi
+  if [[ "$codex_retry_existing" == true && "$codex_task_name_explicit" != true ]]; then
+    printf 'subagent_instruction: --codex-retry-existing requires --codex-task-name\n' >&2
+    return 2
+  fi
 
-  local spec claude_agent codex_task_name
+  local spec claude_agent task_json description_json claude_agent_json task_name_json
+  local codex_message retry_message codex_message_json retry_message_json
   spec="$(subagent_spec_path "$agent" "$root")"
   claude_agent="boxlite-agent-tooling:$agent"
-  codex_task_name="${agent//-/_}"
+  [[ -n "$codex_task_name" ]] || codex_task_name="${agent//-/_}"
+  task_json="$(subagent_json_string "$task")" || return 2
+  description_json="$(subagent_json_string "$description")" || return 2
+  claude_agent_json="$(subagent_json_string "$claude_agent")" || return 2
+  task_name_json="$(subagent_json_string "$codex_task_name")" || return 2
+  codex_message="Read $spec and follow that procedure exactly. Then: $task"
+  retry_message="Read $spec and follow that procedure exactly. Then: $task"
+  codex_message_json="$(subagent_json_string "$codex_message")" || return 2
+  retry_message_json="$(subagent_json_string "$retry_message")" || return 2
 
   # SYNCHRONOUSLY is load-bearing and stated in both routes: a backgrounded audit's
   # completion event is what produced the #892 re-block loop, because the turn ended
@@ -155,16 +195,27 @@ subagent_instruction() {
   printf 'Spawn the %s subagent now, SYNCHRONOUSLY — its result must exist before you\ncontinue. Use WHICHEVER of these your harness provides:\n\n' "$agent"
 
   printf '  Claude Code\n'
-  printf "    Task(subagent_type='%s',\n" "$claude_agent"
-  printf "         description='%s',\n" "$description"
-  printf "         prompt='%s')\n" "$task"
+  printf '    Task(subagent_type=%s,\n' "$claude_agent_json"
+  printf '         description=%s,\n' "$description_json"
+  printf '         prompt=%s)\n' "$task_json"
   printf '    run_in_background: false\n\n'
 
   printf '  Codex\n'
   printf '    collaboration.spawn_agent(\n'
-  printf "      task_name='%s',\n" "$codex_task_name"
-  printf "      message='Read %s and follow that procedure\n" "$spec"
-  printf "               exactly. Then: %s')\n\n" "$task"
+  printf '      task_name=%s,\n' "$task_name_json"
+  printf '      message=%s)\n\n' "$codex_message_json"
+
+  if [[ "$codex_retry_existing" == true ]]; then
+    printf '    If task_name=%s already exists, inspect that exact retained handle.\n' \
+      "$task_name_json"
+    printf '    If it is already running, wait for it synchronously. If it is idle,\n'
+    printf '    completed, or failed, retry it synchronously with:\n'
+    printf '    collaboration.followup_task(\n'
+    printf '      target=%s,\n' "$task_name_json"
+    printf '      message=%s)\n' "$retry_message_json"
+    printf '    Do not create a sibling task name for this generation; if the retained\n'
+    printf '    handle cannot be established, remain blocked.\n\n'
+  fi
 
   if [[ -n "$headless" ]]; then
     printf '  No agent runtime (git hook, CI, plain shell)\n'

@@ -1,6 +1,6 @@
 ---
 name: verdict-auditor
-description: Independent auditor that checks whether the agent's stated verdict — claims like "the fix works", "tests pass", "root cause is X", "deploy is healthy", "found N issues" / "no issues", "<thing> is removed/unused", "done" — is backed by concrete, re-runnable proof rather than prose. MUST be invoked when .agents/hooks/preflight-verdict-check.sh blocks the agent from ending its turn. Reads the agent's FINAL TURN — every assistant message since the last real user message (the claims) — and the working-tree diff (the work) cold, judges proof against CLAUDE.md's Test/Verify rules, and writes a structured dossier to .agents/state/last-verdict.json. The Stop hook lets a verdict-shaped turn end only on a fresh PASS (or IN_PROGRESS) dossier matching the current branch + HEAD + working-tree hash; a mismatched or stale dossier is discarded and the turn re-detected, and a FAIL keeps blocking until a re-audit passes.
+description: Independent auditor that checks whether the agent's stated verdict — claims like "the fix works", "tests pass", "root cause is X", "deploy is healthy", "found N issues" / "no issues", "<thing> is removed/unused", "done" — is backed by concrete, re-runnable proof rather than prose. MUST be invoked when .agents/hooks/preflight-verdict-check.sh blocks the agent from ending its turn. Reads the agent's FINAL TURN — every assistant message since the last real user message (the claims) — and the working-tree diff (the work) cold, judges proof against CLAUDE.md's Test/Verify rules, and writes a structured dossier to the verdict_file supplied by the parent. The Stop hook lets a verdict-shaped turn end only on a fresh PASS (or IN_PROGRESS) dossier matching the current session, audit generation, branch, HEAD, and working-tree hash; a mismatched or stale dossier is discarded and the turn re-detected, and a FAIL keeps blocking until a re-audit passes.
 tools: Read, Bash, Write
 # UNVERIFIED as of 2026-08-03: two audits run after this pin landed both reported
 # executing on Opus 5, so agent definitions are likely read at session start and a
@@ -19,8 +19,10 @@ work the agent just did actually backs the claims it just made — with proof th
 be **re-run**, not narrative. You judge the verdict cold; you do not trust the agent's
 own account of its proof.
 
-The parent agent must give you the path to the session transcript (`transcript_path`,
-a JSONL file). If it didn't, ask for it before proceeding.
+The parent agent must give you the session transcript (`transcript_path`, a JSONL file),
+the exact dossier destination (`verdict_file`), the prior-dossier destination
+(`previous_verdict_file`), and the turn's `audit_generation`. If any is missing, ask for
+it before proceeding. These paths may be session-scoped; never substitute a global path.
 
 ## Procedure
 
@@ -55,7 +57,7 @@ a JSONL file). If it didn't, ask for it before proceeding.
      tool calls and their results —
      `jq -s '.[]|select(.type=="assistant" or .type=="user")|.message.content[]|select(.type=="tool_use" or .type=="tool_result")|{type,name,is_error,content:(.content//.input)}' "$transcript_path"`
    - cited files, logs, or `file:line` the message points to — resolve them.
-   - a PRIOR failed audit, when `.agents/state/last-verdict.prev.json` exists: the
+   - a PRIOR failed audit, when `previous_verdict_file` exists: the
      gate parks a FAILed dossier there when the agent's fix moves the tree. It holds
      the findings that round is supposed to have addressed, and proof entries that
      may still stand.
@@ -108,12 +110,13 @@ a JSONL file). If it didn't, ask for it before proceeding.
      something), set the whole dossier `"verdict":"IN_PROGRESS"` and list what remains
      in `findings`.
 
-6. **Write** `.agents/state/last-verdict.json` with EXACTLY this shape (no extra fields):
+6. **Write** `verdict_file` with EXACTLY this shape (no extra fields):
    ```json
    {
      "branch": "<from step 2>",
      "head": "<from step 2>",
      "tree_hash": "<from step 2>",
+     "generation": "<audit_generation exactly>",
      "verdict": "PASS" | "FAIL" | "IN_PROGRESS",
      "proof": [
        {

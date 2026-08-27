@@ -1,7 +1,7 @@
 ---
 name: verdict-runner
 used-by: .agents/hooks/run-verdict-audit.sh
-placeholders: verdict_file, transcript_path
+placeholders: verdict_file, previous_verdict_file, audit_generation, transcript_path
 description: >
   Fed on stdin to the headless verdict auditor — the runner used when no agent
   runtime is present to spawn a subagent. Same standard of proof as verdict-task.md,
@@ -16,6 +16,9 @@ evidence: the working-tree diff, the commands and their output in the transcript
 cited files and logs. A claim backed only by guessing or indirect inference is NOT
 proven. A turn that asserts nothing verifiable is a PASS.
 
-Follow your procedure and write the dossier to {{verdict_file}}.
+Follow your procedure and write the dossier to {{verdict_file}}. Include
+`"generation":"{{audit_generation}}"` exactly; the runner rejects any other generation.
 
 transcript_path: {{transcript_path}}
+previous_verdict_file: {{previous_verdict_file}}
+audit_generation: {{audit_generation}}

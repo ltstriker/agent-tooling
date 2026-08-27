@@ -21,7 +21,7 @@ else
   recorded_version=""
 fi
 tooling_sha="${FAKE_AGENT_TOOLING_SHA:-${recorded_sha:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}"
-tooling_version="${FAKE_AGENT_TOOLING_VERSION:-${recorded_version:-0.1.4}}"
+tooling_version="${FAKE_AGENT_TOOLING_VERSION:-${recorded_version:-0.1.5}}"
 plugin_dir="$common_git_dir/agent-tooling/$tooling_sha/plugins/boxlite-agent-tooling"
 verify_dir="$plugin_dir/scripts"
 mkdir -p "$verify_dir"

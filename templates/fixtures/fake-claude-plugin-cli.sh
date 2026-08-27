@@ -38,7 +38,7 @@ elif [[ "$1 $2 $3" == "plugin marketplace add" ]]; then
     exit 1
   }
   touch "$state/marketplace"
-  printf '%s\n' "${FAKE_CLAUDE_MARKETPLACE_VERSION:-0.1.4}" > "$state/marketplace-version"
+  printf '%s\n' "${FAKE_CLAUDE_MARKETPLACE_VERSION:-0.1.5}" > "$state/marketplace-version"
   printf 'marketplace added\n' >> "$state/marketplace-mutations"
   printf 'Successfully added marketplace\n'
 elif [[ "$*" == "plugin marketplace update boxlite-agent-tooling" ]]; then
@@ -52,7 +52,7 @@ elif [[ "$*" == "plugin marketplace update boxlite-agent-tooling" ]]; then
     printf 'fixture marketplace update failure\n' >&2
     exit 1
   }
-  printf '%s\n' "${FAKE_CLAUDE_MARKETPLACE_VERSION:-0.1.4}" > "$state/marketplace-version"
+  printf '%s\n' "${FAKE_CLAUDE_MARKETPLACE_VERSION:-0.1.5}" > "$state/marketplace-version"
   printf 'Successfully updated marketplace\n'
 elif [[ "$*" == "plugin list --json" ]]; then
   [[ "${FAKE_CLAUDE_INVALID_PLUGIN_LIST:-0}" != 1 ]] || {
@@ -62,7 +62,7 @@ elif [[ "$*" == "plugin list --json" ]]; then
   if [[ -e "$state/plugin-installed" ]]; then
     enabled=false
     [[ ! -e "$state/plugin-enabled" ]] || enabled=true
-    version="$(head -n1 "$state/plugin-version" 2>/dev/null || printf '0.1.4')"
+    version="$(head -n1 "$state/plugin-version" 2>/dev/null || printf '0.1.5')"
     project_path="${FAKE_CLAUDE_REPORTED_PROJECT_PATH:-${FAKE_CLAUDE_PROJECT_PATH:?}}"
     [[ ! -e "$state/plugin-installed-here" ]] || project_path="${FAKE_CLAUDE_PROJECT_PATH:?}"
     jq -nc \

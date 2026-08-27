@@ -161,9 +161,9 @@ check_eq "canonical marketplace is mutated once" \
 check_eq "plugin is installed once" \
   "$(command_count '^plugin add boxlite-agent-tooling@boxlite-agent-tooling --json$')" 1
 check_eq "tooling installer runs once" "$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')" 1
-check_eq "adopted checkout expects plugin release 0.1.4" "$(adopted_codex_version)" "0.1.4"
-check_eq "installed plugin reports release 0.1.4" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+check_eq "adopted checkout expects plugin release 0.1.5" "$(adopted_codex_version)" "0.1.5"
+check_eq "installed plugin reports release 0.1.5" \
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 if grep -q '^sync=1$' "$FAKE_STATE/installer-calls"; then
   ok "SessionStart marks the tooling install as lifecycle-triggered"
 else
@@ -193,30 +193,30 @@ check_eq "disabled plugin is not re-enabled by reinstall" \
 echo
 echo "## A moved adopted release upgrades once and preserves disabled state"
 NEXT_TOOLING_SHA="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-adopt_tooling_release "$NEXT_TOOLING_SHA" "0.1.5"
-check_eq "moved checkout expects plugin release 0.1.5" "$(adopted_codex_version)" "0.1.5"
-check_eq "host remains on plugin release 0.1.4 before refresh" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+adopt_tooling_release "$NEXT_TOOLING_SHA" "0.1.6"
+check_eq "moved checkout expects plugin release 0.1.6" "$(adopted_codex_version)" "0.1.6"
+check_eq "host remains on plugin release 0.1.5 before refresh" \
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 
 before_manifest_upgrade_commands="$(command_count '^plugin marketplace upgrade ')"
-FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 \
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.6 \
 FAKE_CODEX_FALSE_SUCCESS_MARKETPLACE_MANIFEST=1 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "upgrade without a matching configured manifest is rejected" "$?" 1
 check_eq "stale-manifest path runs the exact marketplace upgrade command" \
   "$(command_count '^plugin marketplace upgrade boxlite-agent-tooling --json$')" \
   "$((before_manifest_upgrade_commands + 1))"
-if grep -q 'configured Codex marketplace stayed at 0.1.4 after upgrade; expected 0.1.5' "$TMP/err"; then
+if grep -q 'configured Codex marketplace stayed at 0.1.5 after upgrade; expected 0.1.6' "$TMP/err"; then
   ok "stale-manifest failure names both versions"
 else
   bad "stale-manifest failure names both versions (stderr=$(cat "$TMP/err"))"
 fi
 # Restore only the simulated host record so the next case starts from the same
 # pre-upgrade boundary; the false-success fixture deliberately left the manifest old.
-printf '%s\n' "0.1.4" > "$FAKE_STATE/plugin-version"
+printf '%s\n' "0.1.5" > "$FAKE_STATE/plugin-version"
 
 before_upgrade_commands="$(command_count '^plugin marketplace upgrade ')"
-FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 \
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.6 \
 FAKE_CODEX_FALSE_SUCCESS_MARKETPLACE_UPGRADE=1 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "false-success marketplace upgrade is rejected" "$?" 1
@@ -224,10 +224,10 @@ check_eq "false-success path runs the exact marketplace upgrade command" \
   "$(command_count '^plugin marketplace upgrade boxlite-agent-tooling --json$')" \
   "$((before_upgrade_commands + 1))"
 check_eq "false-success upgrade cannot advance installed plugin metadata" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 
 before_catalog_reads="$(command_count '^plugin list ')"
-FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 run_hook > "$TMP/out" 2> "$TMP/err"
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.6 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "release-transition startup succeeds after a real upgrade" "$?" 0
 check_eq "release transition runs the exact marketplace upgrade command once more" \
   "$(command_count '^plugin marketplace upgrade boxlite-agent-tooling --json$')" \
@@ -235,7 +235,7 @@ check_eq "release transition runs the exact marketplace upgrade command once mor
 check_ge "release transition re-reads the plugin catalog after upgrading" \
   "$(( $(command_count '^plugin list ') - before_catalog_reads ))" 2
 check_eq "installed plugin reports the adopted release after upgrade" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 [[ ! -e "$FAKE_STATE/plugin-enabled" ]] \
   && ok "upgrade preserves the intentionally disabled state" \
   || bad "upgrade preserves the intentionally disabled state"
@@ -247,7 +247,7 @@ fi
 
 upgrades_after_transition="$(command_count '^plugin marketplace upgrade ')"
 installer_calls_after_transition="$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')"
-FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 run_hook > "$TMP/out" 2> "$TMP/err"
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.6 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "same-release startup succeeds" "$?" 0
 check_eq "same-release startup emits no model-visible output" \
   "$(wc -c < "$TMP/out" | tr -d ' ')" 0
@@ -259,10 +259,10 @@ check_eq "same-release startup keeps tooling verification local" \
 echo
 echo "## A host-ahead plugin first advances the adopted tooling revision"
 ORIGINAL_TOOLING_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-adopt_tooling_release "$ORIGINAL_TOOLING_SHA" "0.1.4"
-check_eq "test setup restores an adopted 0.1.4 checkout" "$(adopted_codex_version)" "0.1.4"
-check_eq "host remains ahead at plugin release 0.1.5" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+adopt_tooling_release "$ORIGINAL_TOOLING_SHA" "0.1.5"
+check_eq "test setup restores an adopted 0.1.5 checkout" "$(adopted_codex_version)" "0.1.5"
+check_eq "host remains ahead at plugin release 0.1.6" \
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 printf '%s\n' "$ORIGINAL_TOOLING_SHA" > "$CONSUMER/.agent-tooling/hold"
 rm -f "$FAKE_STATE/marketplace"
 before_held_marketplace_adds="$(command_count '^plugin marketplace add ')"
@@ -276,7 +276,7 @@ check_eq "hold prevents adding a missing marketplace" \
 touch "$FAKE_STATE/marketplace"
 
 rm -f "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
-printf '%s\n' "0.1.4" > "$FAKE_STATE/marketplace-version"
+printf '%s\n' "0.1.5" > "$FAKE_STATE/marketplace-version"
 before_held_plugin_adds="$(command_count '^plugin add ')"
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "hold rejects a missing plugin before installation" "$?" 1
@@ -287,14 +287,14 @@ check_eq "hold prevents installing a missing plugin" \
   || bad "held missing-plugin path leaves host state untouched"
 touch "$FAKE_STATE/plugin-installed"
 rm -f "$FAKE_STATE/plugin-enabled"
-printf '%s\n' "0.1.5" > "$FAKE_STATE/plugin-version"
-printf '%s\n' "0.1.5" > "$FAKE_STATE/marketplace-version"
+printf '%s\n' "0.1.6" > "$FAKE_STATE/plugin-version"
+printf '%s\n' "0.1.6" > "$FAKE_STATE/marketplace-version"
 
 before_held_installs="$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')"
 before_held_upgrades="$(command_count '^plugin marketplace upgrade ')"
 FAKE_AGENT_TOOLING_SHA="$NEXT_TOOLING_SHA" \
-FAKE_AGENT_TOOLING_VERSION=0.1.5 \
-FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 \
+FAKE_AGENT_TOOLING_VERSION=0.1.6 \
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.6 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "held host-ahead startup fails closed" "$?" 1
 grep -q 'hold' "$TMP/err" \
@@ -304,27 +304,27 @@ check_eq "held mismatch does not refresh adopted tooling" \
   "$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')" "$before_held_installs"
 check_eq "held mismatch does not touch the marketplace" \
   "$(command_count '^plugin marketplace upgrade ')" "$before_held_upgrades"
-check_eq "held mismatch leaves the adopted release frozen" "$(adopted_codex_version)" "0.1.4"
+check_eq "held mismatch leaves the adopted release frozen" "$(adopted_codex_version)" "0.1.5"
 check_eq "held mismatch leaves the host plugin untouched" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 rm -f "$CONSUMER/.agent-tooling/hold"
 
 before_host_ahead_installs="$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')"
 before_host_ahead_upgrades="$(command_count '^plugin marketplace upgrade ')"
 FAKE_AGENT_TOOLING_SHA="$NEXT_TOOLING_SHA" \
-FAKE_AGENT_TOOLING_VERSION=0.1.5 \
-FAKE_CODEX_MARKETPLACE_VERSION=0.1.5 \
+FAKE_AGENT_TOOLING_VERSION=0.1.6 \
+FAKE_CODEX_MARKETPLACE_VERSION=0.1.6 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "host-ahead startup advances tooling and succeeds" "$?" 0
 check_eq "host-ahead startup adopts the matching tooling release" \
-  "$(adopted_codex_version)" "0.1.5"
+  "$(adopted_codex_version)" "0.1.6"
 check_eq "host-ahead startup invokes the validated installer once" \
   "$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')" \
   "$((before_host_ahead_installs + 1))"
 check_eq "host-ahead startup does not try to downgrade the marketplace" \
   "$(command_count '^plugin marketplace upgrade ')" "$before_host_ahead_upgrades"
 check_eq "host-ahead startup preserves the newer installed plugin" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 [[ ! -e "$FAKE_STATE/plugin-enabled" ]] \
   && ok "host-ahead reconciliation preserves disabled state" \
   || bad "host-ahead reconciliation preserves disabled state"
@@ -437,7 +437,7 @@ check_eq "missing available version field stops before plugin installation" \
 rm -f "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
 
 touch "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-enabled"
-printf '%s\n' "0.1.4" > "$FAKE_STATE/plugin-version"
+printf '%s\n' "0.1.5" > "$FAKE_STATE/plugin-version"
 FAKE_CODEX_INSTALLED_VERSION_NULL=1 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "installed plugin with a null version is rejected" "$?" 1
 if grep -q 'does not advertise the expected plugin' "$TMP/err"; then
@@ -452,7 +452,7 @@ FAKE_CODEX_PLUGIN_ADD_VERSION=0.1.3 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "plugin add with the wrong installed version is rejected" "$?" 1
 check_eq "wrong-version plugin add is attempted exactly once" \
   "$(command_count '^plugin add ')" "$((before_plugins + 1))"
-if grep -q 'did not install boxlite-agent-tooling at expected version 0.1.4' "$TMP/err"; then
+if grep -q 'did not install boxlite-agent-tooling at expected version 0.1.5' "$TMP/err"; then
   ok "post-add failure names the adopted expected version"
 else
   bad "post-add failure names the adopted expected version (stderr=$(cat "$TMP/err"))"

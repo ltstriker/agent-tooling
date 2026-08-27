@@ -14,6 +14,7 @@ profile_file="$repo_root/.agent-tooling/profile.json"
 [[ -r "$profile_file" ]] || { printf 'agent-tooling: missing profile manifest: %s\n' "$profile_file" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'agent-tooling: jq is required\n' >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { printf 'agent-tooling: git is required\n' >&2; exit 1; }
+command -v perl >/dev/null 2>&1 || { printf 'agent-tooling: perl is required\n' >&2; exit 1; }
 
 profile="$(jq -er '.profile | select(type == "string" and length > 0)' "$profile_file")" || {
   printf 'agent-tooling: profile must be a non-empty string in %s\n' "$profile_file" >&2
@@ -67,14 +68,16 @@ case "$origin" in
   *) printf 'agent-tooling: origin does not match declared repository %s: %s\n' "$declared_repo" "$origin" >&2; exit 1 ;;
 esac
 
+# Verdict state is session-scoped with opaque suffixes, and new runtime files may be
+# added as the gates evolve. Fixed filename checks cannot cover that namespace. Requiring
+# the directory itself to be ignored keeps every current and future state file out of
+# tree hashes and commits.
+git -C "$repo_root" check-ignore -q .agents/state/ || {
+  printf 'agent-tooling: runtime state directory must be gitignored: .agents/state/\n' >&2
+  exit 1
+}
+
 for state_path in \
-  .agents/state/last-audit.json \
-  .agents/state/last-verdict.json \
-  .agents/state/last-verdict.prev.json \
-  .agents/state/pr-reviewed.json \
-  .agents/state/verdict-last-uuid \
-  .agents/state/verdict-audit.lock \
-  .agents/state/verdict-decisions.log \
   .claude/.last-audit.json \
   .claude/.last-audit-handoff.json \
   .claude/.last-verdict.json \

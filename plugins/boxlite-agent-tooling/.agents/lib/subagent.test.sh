@@ -39,19 +39,45 @@ out="$(subagent_instruction --agent verdict-auditor --root "$PLUGIN_ROOT" --task
 check    "names the Claude Code route"  "Claude Code"                 "$out"
 check    "names the Codex route"        "Codex"                       "$out"
 check    "uses the plugin-scoped Task() agent for Claude" \
-  "Task(subagent_type='boxlite-agent-tooling:verdict-auditor'" "$out"
+  'Task(subagent_type="boxlite-agent-tooling:verdict-auditor"' "$out"
 check_no "never emits the unavailable bare Claude agent" \
-  "Task(subagent_type='verdict-auditor'" "$out"
+  'Task(subagent_type="verdict-auditor"' "$out"
 check    "uses spawn_agent for Codex"   "collaboration.spawn_agent("  "$out"
 check    "normalizes the Codex task name for its schema" \
-  "task_name='verdict_auditor'" "$out"
+  'task_name="verdict_auditor"' "$out"
 check_no "never emits a hyphenated Codex task name" \
-  "task_name='verdict-auditor'" "$out"
+  'task_name="verdict-auditor"' "$out"
 check    "carries the task text"        "audit my turn"               "$out"
 # A backgrounded audit lets the turn end before the artifact lands, and the gate fires
 # again on the way out — the re-block loop this wording exists to prevent.
 check    "demands a synchronous run"    "SYNCHRONOUSLY"               "$out"
 check    "spells out run_in_background" "run_in_background: false"    "$out"
+
+# Interrupted Codex agents remain available under their task name. A verdict audit that
+# is superseded by user input therefore needs a fresh generation-qualified name on the
+# next round; otherwise spawn_agent collides with the canceled agent instead of auditing.
+scoped="$(subagent_instruction --agent verdict-auditor --root "$PLUGIN_ROOT" \
+          --task 'audit this generation' --codex-task-name verdict_auditor_301_302_4 \
+          --codex-retry-existing)"
+check "accepts a generation-qualified Codex task handle" \
+  'task_name="verdict_auditor_301_302_4"' "$scoped"
+check_no "the explicit handle replaces the fixed Codex task name" \
+  'task_name="verdict_auditor"' "$scoped"
+check "same-generation retry reuses the exact Codex handle" \
+  "collaboration.followup_task(" "$scoped"
+check "same-generation retry targets the retained handle" \
+  'target="verdict_auditor_301_302_4"' "$scoped"
+check "a running retained auditor is waited on" \
+  "already running" "$scoped"
+retry_prompt_count="$(printf '%s' "$scoped" | grep -oF 'Then: audit this generation' \
+  | wc -l | tr -d ' ')"
+[[ "$retry_prompt_count" == 2 ]] \
+  && ok "retry keeps the original audit prompt" \
+  || bad "retry keeps the original audit prompt (count=$retry_prompt_count)"
+check "retry forbids a concurrent sibling writer" \
+  "Do not create a sibling task name" "$scoped"
+check_no "generic cold-agent routes do not implicitly reuse context" \
+  "collaboration.followup_task(" "$out"
 
 echo
 echo "## The Codex route points the subagent at the real spec"
@@ -77,9 +103,22 @@ full="$(subagent_instruction --agent commit-push-auditor --root "$PLUGIN_ROOT" \
 check "headless route appears"        "git hook, CI"                     "$full"
 check "headless command appears"      "run-commit-push-audit.sh"         "$full"
 check "artifact clause appears"       ".agents/state/last-audit.json"    "$full"
-check "description reaches Task()"    "description='CLAUDE.md audit'"    "$full"
+check "description reaches Task()"    'description="CLAUDE.md audit"'    "$full"
 # The anti-cheating line is the reason the artifact clause exists at all.
 check "forbids self-written verdicts" "Do not write or hand-edit"        "$full"
+
+# Native call examples must remain syntactically copyable for every valid repository
+# path and task string. Literal single-quote wrappers break on the first apostrophe.
+quoted_root="$TMP/repo's tooling"
+quoted_task="audit the user's turn"
+quoted="$(subagent_instruction --agent verdict-auditor --root "$quoted_root" \
+  --task "$quoted_task" --codex-task-name verdict_auditor_1 --codex-retry-existing)"
+check "apostrophe task is carried in a JSON string" \
+  'prompt="audit the user'"'"'s turn"' "$quoted"
+check "apostrophe spec path is carried without breaking the Codex call" \
+  "repo's tooling/.claude/agents/verdict-auditor.md" "$quoted"
+check_no "native call examples never use fragile single-quoted arguments" \
+  "prompt='" "$quoted"
 
 echo
 echo "## Usage errors fail loudly rather than emitting a half-instruction"
@@ -92,6 +131,27 @@ for args in "--agent a --root b" "--agent a --task t" "--root b --task t"; do
 done
 out_err="$(subagent_instruction --agent a --root b --task t --bogus x 2>/dev/null)"; rc=$?
 [ "$rc" = "2" ] && ok "rejects an unknown option" || bad "rejects an unknown option (rc=$rc)"
+
+# Every value-taking option must reject a missing value. An unchecked `shift 2` with
+# one argument leaves Bash's argv unchanged and loops forever, so bound the red side.
+for dangling_option in \
+  --agent --root --task --description --artifact --codex-task-name --headless; do
+  out_err="$(perl -e 'alarm 1; exec @ARGV' bash -c '
+    source "$1"
+    subagent_instruction "$2"
+  ' _ "$LIB_DIR/subagent.sh" "$dangling_option" 2>/dev/null)"; rc=$?
+  if [[ "$rc" == 2 && -z "$out_err" ]]; then
+    ok "rejects missing value for $dangling_option"
+  else
+    bad "rejects missing value for $dangling_option (rc=$rc)"
+  fi
+done
+
+out_err="$(subagent_instruction --agent a --root b --task t \
+  --codex-retry-existing 2>/dev/null)"; rc=$?
+[[ "$rc" == 2 && -z "$out_err" ]] \
+  && ok "retry-existing requires an explicit Codex handle" \
+  || bad "retry-existing requires an explicit Codex handle (rc=$rc)"
 
 echo
 echo "## Frontmatter never reaches the model as procedure"

@@ -1,7 +1,7 @@
 ---
 name: verdict-task
 used-by: .agents/hooks/preflight-verdict-check.sh
-placeholders: transcript_path
+placeholders: transcript_path, verdict_file, previous_verdict_file, audit_generation
 description: >
   Handed to the verdict-auditor subagent when a turn asserts a conclusion the reader
   would have to take on trust. The auditor's full procedure lives in
@@ -22,3 +22,10 @@ A turn that asserts nothing verifiable is a PASS. Questions, narration of work i
 progress, and plain conversation are not claims.
 
 transcript_path: {{transcript_path}}
+verdict_file: {{verdict_file}}
+previous_verdict_file: {{previous_verdict_file}}
+audit_generation: {{audit_generation}}
+
+Write only to `verdict_file`, and include `"generation":"{{audit_generation}}"` exactly in
+the dossier. This generation identifies the turn you were asked to judge; output for a
+revoked generation must never authorize a later turn.

@@ -107,6 +107,40 @@ installed_plugin() { printf '%s/%s/plugins/boxlite-agent-tooling' "$CACHE" "$1";
 run_install() { (cd "$CONSUMER" && ./.agent-tooling/install.sh); }
 run_verify() { "$(installed_plugin "$(record)")/scripts/verify-installation.sh" "$CONSUMER"; }
 
+echo "## Runtime state ignores cover the session-scoped namespace"
+GRANULAR_CONSUMER="$TMP/granular-consumer"
+make_consumer "$GRANULAR_CONSUMER"
+cat > "$GRANULAR_CONSUMER/.gitignore" <<'GRANULAR_IGNORE'
+/.agents/state/last-audit.json
+/.agents/state/last-verdict.json
+/.agents/state/last-verdict.prev.json
+/.agents/state/pr-reviewed.json
+/.agents/state/verdict-last-uuid
+/.agents/state/verdict-audit.lock
+/.agents/state/verdict-decisions.log
+/.claude/.*
+GRANULAR_IGNORE
+"$PLUGIN_ROOT/scripts/validate-profile.sh" "$GRANULAR_CONSUMER" \
+  > "$TMP/granular.out" 2> "$TMP/granular.err"
+check_eq "granular legacy ignores cannot admit session-suffixed runtime state" "$?" 1
+grep -q '\.agents/state/' "$TMP/granular.err" \
+  && ok "failure requires the whole runtime-state namespace" \
+  || bad "runtime-state failure is actionable (stderr=$(cat "$TMP/granular.err"))"
+
+# Session request and dossier snapshots use Perl for bounded O_NONBLOCK/O_NOFOLLOW
+# opens. Make that runtime contract fail during profile validation, not as an endless
+# sequence of stale requests once a Stop hook is already active.
+NO_PERL_BIN="$TMP/no-perl-bin"; mkdir -p "$NO_PERL_BIN"
+for required_command in bash git jq; do
+  ln -s "$(command -v "$required_command")" "$NO_PERL_BIN/$required_command"
+done
+PATH="$NO_PERL_BIN" "$PLUGIN_ROOT/scripts/validate-profile.sh" "$CONSUMER" \
+  > "$TMP/no-perl.out" 2> "$TMP/no-perl.err"
+check_eq "validator rejects a missing safe-state reader dependency" "$?" 1
+grep -q 'perl is required' "$TMP/no-perl.err" \
+  && ok "missing Perl failure is actionable" \
+  || bad "missing Perl failure is actionable (stderr=$(cat "$TMP/no-perl.err"))"
+
 echo "## First installation resolves the branch and adopts its tip"
 run_install > "$TMP/out" 2> "$TMP/err"
 check_eq "bootstrap succeeds" "$?" 0
@@ -177,6 +211,22 @@ grep -q 'could not resolve' "$TMP/err" && ok "explains it kept the record" \
 check_eq "record survives the failed resolution" "$(record)" "$TIP_TWO"
 run_verify >/dev/null 2>&1
 check_eq "gates verify with the remote unreachable" "$?" 0
+
+# An existing record must not bypass runtime dependency validation on the offline fast
+# path. The state hooks require Perl, so install and local verification both fail loudly
+# if a machine loses it after adoption.
+( cd "$CONSUMER" && PATH="$NO_PERL_BIN" ./.agent-tooling/install.sh ) \
+  > "$TMP/offline-no-perl.out" 2> "$TMP/offline-no-perl.err"
+check_eq "offline installed bootstrap rejects missing Perl" "$?" 1
+grep -q 'perl is required' "$TMP/offline-no-perl.err" \
+  && ok "offline bootstrap names the missing Perl dependency" \
+  || bad "offline bootstrap missing-Perl error is actionable (stderr=$(cat "$TMP/offline-no-perl.err"))"
+PATH="$NO_PERL_BIN" "$(installed_plugin "$(record)")/scripts/verify-installation.sh" "$CONSUMER" \
+  > "$TMP/verify-no-perl.out" 2> "$TMP/verify-no-perl.err"
+check_eq "local verification rejects missing Perl" "$?" 1
+grep -q 'perl is required' "$TMP/verify-no-perl.err" \
+  && ok "local verification names the missing Perl dependency" \
+  || bad "local verification missing-Perl error is actionable (stderr=$(cat "$TMP/verify-no-perl.err"))"
 
 echo
 echo "## Only the very first installation needs the network"
