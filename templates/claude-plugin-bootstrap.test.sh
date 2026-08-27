@@ -210,9 +210,9 @@ check_eq "project plugin is installed once and accepts the non-TTY prompt" \
   "$(command_count '^plugin install boxlite-agent-tooling@boxlite-agent-tooling --scope project --yes$')" 1
 check_eq "tooling installer runs once" \
   "$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')" 1
-check_eq "adopted checkout expects plugin release 0.1.4" "$(adopted_claude_version)" "0.1.4"
-check_eq "installed plugin reports release 0.1.4" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+check_eq "adopted checkout expects plugin release 0.1.5" "$(adopted_claude_version)" "0.1.5"
+check_eq "installed plugin reports release 0.1.5" \
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 grep -q '^sync=1$' "$FAKE_STATE/installer-calls" \
   && ok "SessionStart marks the tooling install as lifecycle-triggered" \
   || bad "SessionStart marks the tooling install as lifecycle-triggered"
@@ -275,27 +275,27 @@ check_eq "disabled installation is not re-enabled by install" \
 echo
 echo "## A moved adopted release upgrades once and preserves disabled state"
 NEXT_TOOLING_SHA="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-adopt_tooling_release "$NEXT_TOOLING_SHA" "0.1.5"
-check_eq "moved checkout expects plugin release 0.1.5" "$(adopted_claude_version)" "0.1.5"
-check_eq "host remains on plugin release 0.1.4 before refresh" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+adopt_tooling_release "$NEXT_TOOLING_SHA" "0.1.6"
+check_eq "moved checkout expects plugin release 0.1.6" "$(adopted_claude_version)" "0.1.6"
+check_eq "host remains on plugin release 0.1.5 before refresh" \
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 
 before_marketplace_updates="$(command_count '^plugin marketplace update ')"
 before_plugin_updates="$(command_count '^plugin update ')"
-FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.5 \
+FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.6 \
 FAKE_CLAUDE_FAIL_MARKETPLACE_UPDATE=1 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "marketplace update failure is rejected" "$?" 1
 check_eq "failed marketplace refresh keeps the installed plugin version" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 check_eq "failed marketplace refresh keeps the last-known-good catalog version" \
-  "$(head -n1 "$FAKE_STATE/marketplace-version")" "0.1.4"
+  "$(head -n1 "$FAKE_STATE/marketplace-version")" "0.1.5"
 check_eq "marketplace refresh protects the last-known-good clone on failure" \
   "$(tail -n1 "$FAKE_STATE/marketplace-update-keep")" "1"
 
 before_marketplace_updates="$(command_count '^plugin marketplace update ')"
 before_plugin_updates="$(command_count '^plugin update ')"
-FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.5 \
+FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.6 \
 FAKE_CLAUDE_FALSE_SUCCESS_PLUGIN_UPDATE=1 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "false-success plugin update is rejected" "$?" 1
@@ -306,10 +306,10 @@ check_eq "false-success path runs the exact project plugin update command" \
   "$(command_count '^plugin update boxlite-agent-tooling@boxlite-agent-tooling --scope project --yes$')" \
   "$((before_plugin_updates + 1))"
 check_eq "false-success update cannot advance installed plugin metadata" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.4"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
 
 before_plugin_reads="$(command_count '^plugin list --json$')"
-FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.5 run_hook > "$TMP/out" 2> "$TMP/err"
+FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.6 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "release-transition SessionStart succeeds after a real update" "$?" 0
 check_eq "release transition runs the exact marketplace update command once more" \
   "$(command_count '^plugin marketplace update boxlite-agent-tooling$')" \
@@ -320,7 +320,7 @@ check_eq "release transition runs the exact project plugin update command once m
 check_ge "release transition re-reads installed plugins after updating" \
   "$(( $(command_count '^plugin list --json$') - before_plugin_reads ))" 2
 check_eq "installed plugin reports the adopted release after update" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 [[ ! -e "$FAKE_STATE/plugin-enabled" ]] \
   && ok "update preserves the intentionally disabled state" \
   || bad "update preserves the intentionally disabled state"
@@ -334,7 +334,7 @@ jq -e '
 marketplace_updates_after_transition="$(command_count '^plugin marketplace update ')"
 plugin_updates_after_transition="$(command_count '^plugin update ')"
 installer_calls_after_transition="$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')"
-FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.5 run_hook > "$TMP/out" 2> "$TMP/err"
+FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.6 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "same-release SessionStart succeeds" "$?" 0
 check_eq "same-release SessionStart emits no model-visible output" \
   "$(wc -c < "$TMP/out" | tr -d ' ')" 0
@@ -348,10 +348,10 @@ check_eq "same-release SessionStart keeps tooling verification local" \
 echo
 echo "## A host-ahead plugin first advances the adopted tooling revision"
 ORIGINAL_TOOLING_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-adopt_tooling_release "$ORIGINAL_TOOLING_SHA" "0.1.4"
-check_eq "test setup restores an adopted 0.1.4 checkout" "$(adopted_claude_version)" "0.1.4"
-check_eq "host remains ahead at plugin release 0.1.5" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+adopt_tooling_release "$ORIGINAL_TOOLING_SHA" "0.1.5"
+check_eq "test setup restores an adopted 0.1.5 checkout" "$(adopted_claude_version)" "0.1.5"
+check_eq "host remains ahead at plugin release 0.1.6" \
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 printf '%s\n' "$ORIGINAL_TOOLING_SHA" > "$CONSUMER/.agent-tooling/hold"
 rm -f "$FAKE_STATE/marketplace"
 before_held_marketplace_adds="$(command_count '^plugin marketplace add ')"
@@ -366,7 +366,7 @@ touch "$FAKE_STATE/marketplace"
 
 rm -f "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-installed-here" \
   "$FAKE_STATE/plugin-enabled"
-printf '%s\n' "0.1.5" > "$FAKE_STATE/marketplace-version"
+printf '%s\n' "0.1.6" > "$FAKE_STATE/marketplace-version"
 before_held_plugin_installs="$(command_count '^plugin install ')"
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "hold rejects a missing project plugin before installation" "$?" 1
@@ -377,14 +377,14 @@ check_eq "hold prevents installing a missing project plugin" \
   || bad "held missing-plugin path leaves host state untouched"
 touch "$FAKE_STATE/plugin-installed" "$FAKE_STATE/plugin-installed-here"
 rm -f "$FAKE_STATE/plugin-enabled"
-printf '%s\n' "0.1.5" > "$FAKE_STATE/plugin-version"
+printf '%s\n' "0.1.6" > "$FAKE_STATE/plugin-version"
 
 before_held_installs="$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')"
 before_held_marketplace_updates="$(command_count '^plugin marketplace update ')"
 before_held_plugin_updates="$(command_count '^plugin update ')"
 FAKE_AGENT_TOOLING_SHA="$NEXT_TOOLING_SHA" \
-FAKE_AGENT_TOOLING_VERSION=0.1.5 \
-FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.5 \
+FAKE_AGENT_TOOLING_VERSION=0.1.6 \
+FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.6 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "held host-ahead SessionStart fails closed" "$?" 1
 grep -q 'hold' "$TMP/err" \
@@ -396,21 +396,21 @@ check_eq "held mismatch does not update the marketplace" \
   "$(command_count '^plugin marketplace update ')" "$before_held_marketplace_updates"
 check_eq "held mismatch does not update the plugin" \
   "$(command_count '^plugin update ')" "$before_held_plugin_updates"
-check_eq "held mismatch leaves the adopted release frozen" "$(adopted_claude_version)" "0.1.4"
+check_eq "held mismatch leaves the adopted release frozen" "$(adopted_claude_version)" "0.1.5"
 check_eq "held mismatch leaves the host plugin untouched" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 rm -f "$CONSUMER/.agent-tooling/hold"
 
 before_host_ahead_installs="$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')"
 before_host_ahead_marketplace_updates="$(command_count '^plugin marketplace update ')"
 before_host_ahead_plugin_updates="$(command_count '^plugin update ')"
 FAKE_AGENT_TOOLING_SHA="$NEXT_TOOLING_SHA" \
-FAKE_AGENT_TOOLING_VERSION=0.1.5 \
-FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.5 \
+FAKE_AGENT_TOOLING_VERSION=0.1.6 \
+FAKE_CLAUDE_MARKETPLACE_VERSION=0.1.6 \
 run_hook > "$TMP/out" 2> "$TMP/err"
 check_eq "host-ahead SessionStart advances tooling and succeeds" "$?" 0
 check_eq "host-ahead SessionStart adopts the matching tooling release" \
-  "$(adopted_claude_version)" "0.1.5"
+  "$(adopted_claude_version)" "0.1.6"
 check_eq "host-ahead SessionStart invokes the validated installer once" \
   "$(wc -l < "$FAKE_STATE/installer-calls" | tr -d ' ')" \
   "$((before_host_ahead_installs + 1))"
@@ -419,7 +419,7 @@ check_eq "host-ahead SessionStart skips marketplace update" \
 check_eq "host-ahead SessionStart skips plugin update" \
   "$(command_count '^plugin update ')" "$before_host_ahead_plugin_updates"
 check_eq "host-ahead SessionStart preserves the newer installed plugin" \
-  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.5"
+  "$(head -n1 "$FAKE_STATE/plugin-version")" "0.1.6"
 [[ ! -e "$FAKE_STATE/plugin-enabled" ]] \
   && ok "host-ahead reconciliation preserves disabled state" \
   || bad "host-ahead reconciliation preserves disabled state"

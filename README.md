@@ -267,13 +267,18 @@ plugin and the command trust described above.
 
 ## Validate
 
+Codex officially supports a `hooks` entry in `.codex-plugin/plugin.json` for
+[plugin-bundled hooks](https://learn.chatgpt.com/docs/hooks#plugin-bundled-hooks).
+The generic `plugin-creator/scripts/validate_plugin.py` bundled with some Codex
+releases still rejects that documented field, so it is not a release gate for this
+cross-host plugin. `host-parity.test.sh` validates the three manifests, the shared
+hooks schema, every declared path, and every wired command instead.
+
 ```sh
-python3 /path/to/plugin-creator/scripts/validate_plugin.py \
-  plugins/boxlite-agent-tooling
+bash plugins/boxlite-agent-tooling/host-parity.test.sh
 claude plugin validate plugins/boxlite-agent-tooling
 bash templates/codex-plugin-bootstrap.test.sh
 bash templates/claude-plugin-bootstrap.test.sh
-bash plugins/boxlite-agent-tooling/host-parity.test.sh
 ```
 
 The parity suite is the cross-host check the two host validators cannot make: it

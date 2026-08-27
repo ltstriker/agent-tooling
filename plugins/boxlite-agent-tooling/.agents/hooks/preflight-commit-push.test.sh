@@ -828,10 +828,10 @@ both_reason() {  # $1 = value for CODEX_SANDBOX ("" = unset)
 
 reason="$(both_reason "")"
 case "$reason" in
-  *"Task(subagent_type='boxlite-agent-tooling:commit-push-auditor'"*) ok_claude=1 ;; *) ok_claude=0 ;;
+  *'Task(subagent_type="boxlite-agent-tooling:commit-push-auditor"'*) ok_claude=1 ;; *) ok_claude=0 ;;
 esac
 case "$reason" in
-  *"Task(subagent_type='commit-push-auditor'"*) bare_claude=1 ;; *) bare_claude=0 ;;
+  *'Task(subagent_type="commit-push-auditor"'*) bare_claude=1 ;; *) bare_claude=0 ;;
 esac
 case "$reason" in
   *"collaboration.spawn_agent("*) ok_codex=1 ;; *) ok_codex=0 ;;

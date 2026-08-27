@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# UserPromptSubmit hook: revoke a headless verdict audit owned by this same session.
+#
+# Native Task/collaboration auditors are harness-owned and are canceled by the parent
+# agent per preflight-verdict-check.sh's instruction. This hook handles only the shell
+# fallback in run-verdict-audit.sh. It never signals a PID selected from workspace state:
+# revoking the session's request makes the runner cancel its own process group and discard
+# any dossier produced for the abandoned turn.
+#
+# Current Codex dispatches UserPromptSubmit at its external UserInput edge and records a
+# Stop continuation internally without re-dispatching it. Claude documents this event as
+# running before a submitted prompt is processed; live delivery while a synchronous Task
+# is still running remains a host behavior to verify end-to-end. Silent no-op is deliberate
+# for malformed or unscoped events. The hook must never become an arbitrary-PID signal
+# primitive or prevent the newer prompt from entering the task.
+set -uo pipefail
+
+for required_command in jq perl; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    printf 'cancel-verdict-audit.sh: required dependency not found: %s\n' \
+      "$required_command" >&2
+    exit 2
+  fi
+done
+
+raw_payload="$(cat)"
+payload="$(printf '%s' "$raw_payload" | jq -ecs '
+  if length == 1 and (.[0] | type) == "object" then .[0] else empty end
+' 2>/dev/null || true)"
+if [[ -z "$payload" ]]; then
+  printf 'cancel-verdict-audit.sh: expected exactly one JSON hook object.\n' >&2
+  exit 1
+fi
+is_user_prompt_submit="$(printf '%s' "$payload" | jq -r '
+  (.hook_event_name | type) == "string" and .hook_event_name == "UserPromptSubmit"
+' 2>/dev/null || echo 'false')"
+[[ "$is_user_prompt_submit" == "true" ]] || exit 0
+session_field_state="$(printf '%s' "$payload" | jq -r '
+  if has("session_id") | not then "absent"
+  elif (.session_id | type) == "string" and (.session_id | length) > 0 then "valid"
+  else "invalid"
+  end
+' 2>/dev/null || echo 'invalid')"
+[[ "$session_field_state" == absent ]] && exit 0
+if [[ "$session_field_state" != valid ]]; then
+  printf 'cancel-verdict-audit.sh: session_id must be a non-empty string when present.\n' >&2
+  exit 1
+fi
+
+project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+if ! repo_root="$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+  printf 'cancel-verdict-audit.sh: project directory is not a Git repository: %s\n' \
+    "$project_dir" >&2
+  exit 1
+fi
+project_dir="$(cd "$repo_root" && pwd -P)"
+tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+audit_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+if [[ ! -r "$audit_state_lib" ]]; then
+  printf 'cancel-verdict-audit.sh: missing %s — cannot scope audit state.\n' \
+    "$audit_state_lib" >&2
+  exit 1
+fi
+# shellcheck source=../lib/verdict-audit-state.sh
+source "$audit_state_lib"
+# Never transport the session string through command substitution: it strips trailing
+# newlines. The shared helper streams the raw JSON value directly into git hash-object.
+if ! session_scope="$(verdict_audit_scope_from_hook_payload \
+    "$payload" "$project_dir" 2>/dev/null)"; then
+  printf 'cancel-verdict-audit.sh: could not derive the session audit scope.\n' >&2
+  exit 1
+fi
+state_dir="$project_dir/.agents/state"
+[[ -d "$state_dir" ]] || exit 0
+audit_request_file="$(verdict_audit_state_path "$state_dir/verdict-request" "$session_scope")"
+audit_publish_mutex_file="${audit_request_file}.publish.mutex"
+audit_decision_mutex_file="${audit_request_file}.decision.mutex"
+audit_cancellation_prefix="$(verdict_audit_state_path \
+  "$state_dir/verdict-canceled" "$session_scope")"
+verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.json" "$session_scope")"
+previous_verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.prev.json" "$session_scope")"
+last_uuid_file="$(verdict_audit_state_path "$state_dir/verdict-last-uuid" "$session_scope")"
+payload_transcript_file="$(verdict_audit_state_path "$state_dir/verdict-stop-message.jsonl" "$session_scope")"
+prompt_epoch_file="$(verdict_audit_state_path "$state_dir/verdict-prompt-epoch" "$session_scope")"
+
+# Persist the steer before touching any mutex. A Stop invocation snapshots this token on
+# entry and refuses every later authority mutation when it changes, so cancellation stays
+# effective even if the decision-holder crashes or this hook must return after contention.
+prompt_epoch="$$-$(date +%s)-${RANDOM:-0}"
+prompt_epoch_written=true
+if ! printf '%s\n' "$prompt_epoch" \
+    | verdict_audit_write_atomic "$prompt_epoch_file" 2>/dev/null; then
+  # A directory, FIFO, or symlink at the epoch pathname must not turn cancellation into
+  # a point-in-time delete. Select that exact entry under a quarantine name, retry the
+  # regular-file publication, and leave a non-empty quarantined directory untouched.
+  # This is recoverable state repair, never recursive deletion.
+  prompt_epoch_quarantine="${prompt_epoch_file}.unsafe-$$-${RANDOM:-0}"
+  if verdict_audit_rename_exact \
+      "$prompt_epoch_file" "$prompt_epoch_quarantine" 2>/dev/null \
+     && printf '%s\n' "$prompt_epoch" \
+          | verdict_audit_write_atomic "$prompt_epoch_file" 2>/dev/null; then
+    rm -f "$prompt_epoch_quarantine" 2>/dev/null || true
+    rmdir "$prompt_epoch_quarantine" 2>/dev/null || true
+  else
+    prompt_epoch_written=false
+    if [[ -e "$prompt_epoch_quarantine" || -L "$prompt_epoch_quarantine" ]]; then
+      verdict_audit_restore_no_clobber \
+        "$prompt_epoch_quarantine" "$prompt_epoch_file" 2>/dev/null || true
+    fi
+  fi
+fi
+
+# Revoke visible authority before any fallible mutex operation. An unsafe gitignored
+# mutex path must not leave a superseded request/PASS consumable; the serialized cleanup
+# below closes the hidden-quarantine and late-publication races when the mutex is usable.
+rm -f "$audit_request_file" "$previous_verdict_file" "$last_uuid_file" \
+  "$payload_transcript_file" "$verdict_file"
+
+# The short decision mutex orders UserPromptSubmit against a Stop gate that has hidden a
+# dossier under a quarantine pathname. Once held, revoke first so the live runner wakes;
+# then wait on its publication lease and clean again so neither a headless promotion nor
+# a native late write can resurrect the abandoned generation. The entire operation lives
+# in one Perl process so the decision lock remains held through both cleanup passes.
+perl -MFcntl=:DEFAULT,:flock -e '
+  my ($decision_path, $publish_path, $request, $previous, $last_uuid,
+      $payload_transcript, $cancel_prefix, $verdict) = @ARGV;
+
+  sub unlink_prefixed {
+    my ($prefix) = @_;
+    my $slash = rindex($prefix, "/");
+    return if $slash < 0;
+    my $directory = substr($prefix, 0, $slash);
+    my $basename = substr($prefix, $slash + 1);
+    if (opendir(my $dir, $directory)) {
+      while (defined(my $entry = readdir($dir))) {
+        next unless index($entry, $basename) == 0;
+        unlink($directory . "/" . $entry);
+      }
+      closedir($dir);
+    }
+  }
+
+  sub unlink_state {
+    unlink($request, $previous, $last_uuid, $payload_transcript, $verdict);
+    unlink_prefixed($cancel_prefix . ".");
+    unlink_prefixed($verdict . ".audit-");
+  }
+
+  sub open_mutex {
+    my ($path) = @_;
+    return if lstat($path) && -l _;
+    my $flags = O_RDWR | O_CREAT | O_APPEND | O_NONBLOCK;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $fh, $path, $flags, 0600) or return;
+    my @opened = stat($fh);
+    my @named = lstat($path);
+    return unless @opened && @named && -f $fh && $opened[3] == 1
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    return $fh;
+  }
+
+  $SIG{ALRM} = sub { unlink_state(); exit 0 };
+  alarm 3;
+  my $decision = open_mutex($decision_path) or exit 2;
+  flock($decision, LOCK_EX) or exit 2;
+  my @decision_opened = stat($decision);
+  my @decision_named = lstat($decision_path);
+  exit 2 unless @decision_opened && @decision_named && $decision_opened[3] == 1
+    && $decision_opened[0] == $decision_named[0]
+    && $decision_opened[1] == $decision_named[1];
+
+  unlink_state();
+  # Once revocation is visible, timeout cleanup is safe while this decision mutex remains
+  # held: no Stop gate can publish a hidden quarantine after the final cleanup pass.
+  $SIG{ALRM} = sub { unlink_state(); exit 0 };
+  my $publish = open_mutex($publish_path);
+  if ($publish) {
+    flock($publish, LOCK_EX) or do { unlink_state(); exit 2 };
+    my @publish_opened = stat($publish);
+    my @publish_named = lstat($publish_path);
+    if (!@publish_opened || !@publish_named || !-f $publish
+        || $publish_opened[3] != 1
+        || $publish_opened[0] != $publish_named[0]
+        || $publish_opened[1] != $publish_named[1]) {
+      unlink_state();
+      exit 2;
+    }
+  }
+  unlink_state();
+  alarm 0;
+' "$audit_decision_mutex_file" "$audit_publish_mutex_file" \
+  "$audit_request_file" "$previous_verdict_file" "$last_uuid_file" \
+  "$payload_transcript_file" "$audit_cancellation_prefix" "$verdict_file" \
+  >/dev/null 2>&1 || {
+    printf 'cancel-verdict-audit.sh: could not serialize audit cancellation.\n' >&2
+    exit 1
+  }
+if [[ "$prompt_epoch_written" != true ]]; then
+  printf 'cancel-verdict-audit.sh: could not record the session prompt epoch.\n' >&2
+  # UserPromptSubmit exit 2 is the cross-host fail-closed outcome. If cancellation
+  # cannot be made durable, the newer prompt must not enter while an older Stop can
+  # still recreate authority after this cleanup pass.
+  exit 2
+fi
+exit 0

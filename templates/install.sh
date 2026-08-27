@@ -23,6 +23,7 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 profile_file="$repo_root/.agent-tooling/profile.json"
 [[ -r "$profile_file" ]] || { printf 'agent-tooling: missing %s\n' "$profile_file" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'agent-tooling: jq is required\n' >&2; exit 1; }
+command -v perl >/dev/null 2>&1 || { printf 'agent-tooling: perl is required\n' >&2; exit 1; }
 
 tooling_repo="$(jq -er '.tooling.repository | select(type == "string" and length > 0)' "$profile_file")" || {
   printf 'agent-tooling: tooling.repository is required\n' >&2

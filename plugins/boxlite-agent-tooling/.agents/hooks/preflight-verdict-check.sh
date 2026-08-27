@@ -6,8 +6,8 @@
 # TURN — every assistant text since the last real user message, read deterministically
 # from the transcript: if it draws a conclusion the reader must take on TRUST — one
 # whose evidence is not shown in the turn itself — the turn must end with a fresh
-# dossier (.agents/state/last-verdict.json, written by the
-# verdict-auditor subagent). Chat, questions, and in-progress narration end freely.
+# session-scoped dossier under .agents/state/ (written by the verdict-auditor
+# subagent). Chat, questions, and in-progress narration end freely.
 # Turn-level, not last-fragment: findings asserted mid-turn cannot hide behind a
 # closing "let me check X" (that miss shipped once, caught by a sibling session's
 # decision log).
@@ -119,21 +119,38 @@
 # Tests: bash .agents/hooks/preflight-verdict-check.test.sh
 set -uo pipefail
 
-file_mtime_epoch() {
-  local path="$1" mtime
-  if mtime="$(stat -c '%Y' "$path" 2>/dev/null)" && [[ "$mtime" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$mtime"
-    return
+for required_command in jq perl; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    printf 'preflight-verdict-check: required dependency not found: %s\n' \
+      "$required_command" >&2
+    exit 2
   fi
-  if mtime="$(stat -f '%m' "$path" 2>/dev/null)" && [[ "$mtime" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$mtime"
-    return
-  fi
-  printf '0'
-}
+done
 
-payload="$(cat)"
+raw_payload="$(cat)"
+payload="$(printf '%s' "$raw_payload" | jq -ecs '
+  if length == 1 and (.[0] | type) == "object" then .[0] else empty end
+' 2>/dev/null || true)"
+if [[ -z "$payload" ]]; then
+  printf 'preflight-verdict-check: expected exactly one JSON hook object.\n' >&2
+  exit 1
+fi
 transcript_path="$(printf '%s' "$payload" | jq -r '.transcript_path // ""' 2>/dev/null || echo '')"
+session_id="$(printf '%s' "$payload" | jq -r '
+  if (.session_id | type) == "string" then .session_id else "" end
+' 2>/dev/null || echo '')"
+session_field_state="$(printf '%s' "$payload" | jq -r '
+  if has("session_id") | not then "absent"
+  elif (.session_id | type) == "string" and (.session_id | length) > 0 then "valid"
+  else "invalid"
+  end
+' 2>/dev/null || echo 'invalid')"
+if [[ "$session_field_state" == invalid ]]; then
+  printf 'preflight-verdict-check: session_id must be a non-empty string when present.\n' >&2
+  exit 1
+fi
+has_session_id=false
+[[ "$session_field_state" == valid ]] && has_session_id=true
 last_assistant_message="$(printf '%s' "$payload" | jq -r '
   if (.last_assistant_message | type) == "string" then .last_assistant_message else "" end
 ' 2>/dev/null || echo '')"
@@ -141,41 +158,172 @@ stop_hook_active="$(printf '%s' "$payload" | jq -r '
   if .stop_hook_active == true then "true" else "false" end
 ' 2>/dev/null || echo 'false')"
 
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-project_dir="${CLAUDE_PROJECT_DIR:-$repo_root}"
+project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+if ! repo_root="$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+  printf 'preflight-verdict-check: project directory is not a Git repository: %s\n' \
+    "$project_dir" >&2
+  exit 1
+fi
+repo_root="$(cd "$repo_root" && pwd -P)"
+project_dir="$repo_root"
+tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+audit_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+if [[ ! -r "$audit_state_lib" ]]; then
+  printf 'preflight-verdict-check: missing %s — cannot scope verdict state.\n' \
+    "$audit_state_lib" >&2
+  exit 1
+fi
+# shellcheck source=../lib/verdict-audit-state.sh
+source "$audit_state_lib"
+if [[ "$has_session_id" == "true" ]]; then
+  if ! session_scope="$(verdict_audit_scope_from_hook_payload \
+      "$payload" "$project_dir" 2>/dev/null)"; then
+    printf 'preflight-verdict-check: could not derive the session audit scope.\n' >&2
+    exit 1
+  fi
+else
+  session_scope="-"
+fi
 branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || echo '?')"
 head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo '?')"
-verdict_file="$project_dir/.agents/state/last-verdict.json"
+state_dir="$project_dir/.agents/state"
+stable_verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.json" "$session_scope")"
+verdict_file="$stable_verdict_file"
+auditor_verdict_file="$stable_verdict_file"
+verdict_request_file="$(verdict_audit_state_path "$state_dir/verdict-request" "$session_scope")"
+audit_decision_mutex_file="${verdict_request_file}.decision.mutex"
+decision_lease_pid=0
+decision_lease_status_file=""
 # A FAILed dossier is parked here when the agent's fix moves the tree and invalidates
 # the binding, so the next audit re-checks known findings instead of starting cold.
-prev_verdict_file="$project_dir/.agents/state/last-verdict.prev.json"
-last_uuid_file="$project_dir/.agents/state/verdict-last-uuid"
-decision_log="$project_dir/.agents/state/verdict-decisions.log"
+prev_verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.prev.json" "$session_scope")"
+last_uuid_file="$(verdict_audit_state_path "$state_dir/verdict-last-uuid" "$session_scope")"
+decision_log="$(verdict_audit_state_path "$state_dir/verdict-decisions.log" "$session_scope")"
 # When Codex has no transcript, preserve its stable Stop message in the transcript
 # shape the independent auditor already consumes. This is gitignored runtime state,
 # not evidence invented by the gate: the text is copied byte-for-byte from the event.
-payload_transcript_file="$project_dir/.agents/state/verdict-stop-message.jsonl"
-# Held by run-verdict-audit.sh while it runs; body format defined by its
-# take_audit_lock(). Tells "the agent ignored the findings" from "the answer is coming".
-audit_lock_file="$project_dir/.agents/state/verdict-audit.lock"
+payload_transcript_file="$(verdict_audit_state_path "$state_dir/verdict-stop-message.jsonl" "$session_scope")"
+prompt_epoch_file="$(verdict_audit_state_path "$state_dir/verdict-prompt-epoch" "$session_scope")"
+# Published by run-verdict-audit.sh while it holds the adjacent kernel lease. The first
+# two fields are runner PID + deadline; later fields bind session, owner, and generation.
+# Together they tell "the agent ignored the findings" from "the answer is coming".
+audit_lock_file="$(verdict_audit_state_path "$state_dir/verdict-audit.lock" "$session_scope")"
+audit_mutex_file="${audit_lock_file}.mutex"
 # Ceiling on a lock's self-declared deadline. NOT max_age_seconds — dossier staleness
-# and "how long may an audit run" are different questions.
-audit_lock_max_seconds=3600
+# and "how long may an audit run" are different questions. Shared with the runner so a
+# configured timeout cannot publish a lease this gate immediately rejects.
+# shellcheck disable=SC2154 # Assigned by verdict-audit-state.sh above.
+audit_lock_max_seconds="$verdict_audit_lock_max_seconds"
 max_age_seconds=600
 classifier_timeout_seconds=20
+
+# UserPromptSubmit atomically advances this session epoch before it waits for any gate
+# mutex. This Stop invocation may trust authority only while the entry snapshot remains
+# current. A missing marker is the initial epoch; malformed state fails closed.
+read_prompt_epoch() {
+  [[ "$session_scope" != "-" ]] || { printf '-'; return 0; }
+  if [[ ! -e "$prompt_epoch_file" && ! -L "$prompt_epoch_file" ]]; then
+    printf '-'
+    return 0
+  fi
+  local epoch
+  epoch="$(verdict_audit_read_single_record "$prompt_epoch_file" 2>/dev/null)" || return 1
+  [[ "$epoch" =~ ^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$ ]] || return 1
+  printf '%s' "$epoch"
+}
+entry_prompt_epoch="$(read_prompt_epoch 2>/dev/null)" || entry_prompt_epoch=""
+prompt_epoch_is_current() {
+  [[ "$session_scope" == "-" ]] && return 0
+  [[ -n "$entry_prompt_epoch" ]] || return 1
+  local current_epoch
+  current_epoch="$(read_prompt_epoch 2>/dev/null)" || return 1
+  [[ "$current_epoch" == "$entry_prompt_epoch" ]]
+}
 
 # One line per Stop decision (gitignored): timestamp, message identity, deciding
 # rung, outcome — so "why did/didn't the gate fire?" is answerable with tail
 # instead of fixture reconstruction. Best-effort: logging must never fail the
 # hook. Rotated in place to stay bounded.
 log_decision() {  # rung outcome
-  { mkdir -p "$(dirname "$decision_log")"
-    printf '%s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${FINAL_ID:--}" "$1" "$2" >> "$decision_log"
-    if [[ "$(wc -l < "$decision_log")" -gt 1000 ]]; then
-      tail -n 500 "$decision_log" > "$decision_log.tmp" && mv "$decision_log.tmp" "$decision_log"
-    fi
-  } 2>/dev/null || true
+  local line
+  mkdir -p "$(dirname "$decision_log")" 2>/dev/null || return 0
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) ${FINAL_ID:--} $1 $2"
+  verdict_audit_append_log_line "$decision_log" "$line" 2>/dev/null || true
 }
+
+# UserPromptSubmit and dossier consumption share this short-lived session mutex. The
+# prompt hook takes it before revocation; the Stop gate takes it before hiding a dossier
+# under a quarantine name. That gives the two events one linear order and prevents an old
+# generation from being restored or parked after cancellation already returned.
+stop_decision_lease() {
+  if [[ "$decision_lease_pid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$decision_lease_pid" 2>/dev/null || true
+    wait "$decision_lease_pid" 2>/dev/null || true
+  fi
+  decision_lease_pid=0
+  [[ -z "$decision_lease_status_file" ]] || rm -f "$decision_lease_status_file"
+  decision_lease_status_file=""
+}
+
+start_decision_lease() {
+  [[ "$session_scope" != "-" ]] || return 0
+  local status="" i=0 parent="$$"
+  decision_lease_status_file="${audit_decision_mutex_file}.status-$$-${RANDOM:-0}"
+  rm -f "$decision_lease_status_file"
+  perl -MFcntl=:DEFAULT,:flock -e '
+    my ($mutex_path, $status_path, $parent) = @ARGV;
+    sub report {
+      my ($value) = @_;
+      sysopen(my $status, $status_path, O_WRONLY | O_CREAT | O_EXCL, 0600)
+        or exit 2;
+      print {$status} $value;
+      close($status);
+    }
+    $SIG{ALRM} = sub { report("error") if !-e $status_path; exit 2 };
+    alarm 2;
+    exit 2 if lstat($mutex_path) && -l _;
+    my $flags = O_RDWR | O_CREAT | O_APPEND | O_NONBLOCK;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $mutex, $mutex_path, $flags, 0600) or do { report("error"); exit 2 };
+    my @opened = stat($mutex);
+    my @named = lstat($mutex_path);
+    if (!@opened || !@named || !-f $mutex || $opened[3] != 1
+        || $opened[0] != $named[0] || $opened[1] != $named[1]) {
+      report("error");
+      exit 2;
+    }
+    flock($mutex, LOCK_EX) or do { report("error"); exit 2 };
+    @opened = stat($mutex);
+    @named = lstat($mutex_path);
+    if (!@opened || !@named || !-f $mutex || $opened[3] != 1
+        || $opened[0] != $named[0] || $opened[1] != $named[1]) {
+      report("error");
+      exit 2;
+    }
+    alarm 0;
+    report("ok");
+    select(undef, undef, undef, 0.05) while getppid() == $parent;
+  ' "$audit_decision_mutex_file" "$decision_lease_status_file" "$parent" &
+  decision_lease_pid=$!
+  while (( i < 250 )); do
+    if status="$(verdict_audit_read_single_record \
+        "$decision_lease_status_file" 2>/dev/null)"; then
+      break
+    fi
+    kill -0 "$decision_lease_pid" 2>/dev/null || break
+    sleep 0.01
+    (( i += 1 ))
+  done
+  rm -f "$decision_lease_status_file"
+  decision_lease_status_file=""
+  if [[ "$status" == ok ]]; then
+    return 0
+  fi
+  stop_decision_lease
+  return 1
+}
+
+trap stop_decision_lease EXIT
 
 allow()           { exit 0; }                                              # let the turn end, silently
 # User-visible, model-invisible allow: a Stop hook systemMessage is shown to the
@@ -187,6 +335,10 @@ allow_with_note() { jq -nc --arg m "$1" '{continue:true, systemMessage:$m}'; exi
 # (VERDICT_GATE_HARD_BLOCK=0) demotes them to a user-visible nudge the MODEL never
 # sees — rollback/telemetry only, see design notes.
 block() {
+  # A prompt can arrive while a classifier or instruction renderer is still running.
+  # Revalidate at the final output boundary so a superseded Stop can never publish a
+  # late block even when every earlier branch check observed the old epoch.
+  prompt_epoch_is_current || allow
   # Default HARD, matching the two doc sites above. Defaulting to soft meant only
   # Claude Code was gated: it is the sole caller that sets this, via settings.json
   # env, so the Codex registration in .codex/hooks.json and any direct invocation
@@ -279,6 +431,27 @@ use_payload_message() {
   FINAL_TEXT="$last_assistant_message"
   FINAL_SOURCE="payload"
   identify_final_message
+}
+
+# Resolve the current audited message before looking at any dossier. Session ownership
+# alone is insufficient: a real steer stays in the same session, so the request must
+# also bind the exact assistant turn text that the auditor was asked to judge.
+transcript_had_content=false
+resolve_final_message() {
+  extract_final_message
+  transcript_had_content=false
+  [[ -n "$transcript_path" && -s "$transcript_path" ]] && transcript_had_content=true
+  if [[ -z "$FINAL_TEXT" && "$transcript_had_content" == true ]]; then
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 0.2
+      extract_final_message
+      [[ -n "$FINAL_TEXT" ]] && break
+    done
+  fi
+  # Codex permits a null transcript_path and supplies this stable Stop field. Apply it
+  # only after the transcript flush window so one trailing fragment cannot hide an
+  # earlier verdict from the same turn.
+  [[ -z "$FINAL_TEXT" ]] && use_payload_message
 }
 
 # Fenced blocks go entirely: verdict phrasing quoted inside one is documentation, not a
@@ -475,22 +648,259 @@ verdict_patterns+='|(部署|服务|线上)(正常|健康|稳定)'
 #     it is at BLOCK time rather than at definition time.
 #
 # Variables available: ${transcript_path} ${branch} ${head} ${verdict_file}
-write_payload_transcript() {
-  local tmp
-  mkdir -p "$(dirname "$payload_transcript_file")" 2>/dev/null || return 1
-  tmp="$(mktemp "${payload_transcript_file}.XXXXXX")" || return 1
-  if ! jq -nc --arg text "$last_assistant_message" \
-      '{type:"assistant", source:"codex-stop-payload",
-        message:{content:[{type:"text", text:$text}]}}' > "$tmp"; then
-    rm -f "$tmp"
+#                      ${prev_verdict_file} ${audit_generation}
+audit_generation="legacy"
+request_is_current=false
+verdict_request_body=""
+
+load_verdict_request() {
+  if [[ "$session_scope" == "-" ]]; then
+    audit_generation="legacy"
+    request_is_current=true
+    return 0
+  fi
+  local body generation deadline message_id extra now allow_canceled="${1:-false}"
+  [[ -r "$verdict_request_file" ]] || return 1
+  body="$(verdict_audit_read_single_record "$verdict_request_file" 2>/dev/null)" || return 1
+  read -r generation deadline message_id extra <<< "$body"
+  now="$(date +%s)"
+  verdict_audit_epoch_is_bounded "$deadline" || return 1
+  [[ "$generation" =~ ^[1-9][0-9]*-[0-9]+-[0-9]+$ \
+     && "$message_id" =~ ^cksum-[0-9]+-[0-9]+$ \
+     && -z "$extra" \
+     && "$message_id" == "$FINAL_ID" ]] || return 1
+  (( now <= deadline && deadline <= now + audit_lock_max_seconds )) || return 1
+  audit_generation="$generation"
+  audit_cancellation_file="$(verdict_audit_cancellation_path \
+    "$state_dir" "$session_scope" "$audit_generation")"
+  if [[ "$allow_canceled" != true ]] \
+     && verdict_audit_cancellation_exists "$audit_cancellation_file"; then
     return 1
   fi
-  mv -f "$tmp" "$payload_transcript_file"
+  if [[ "$session_scope" != "-" ]]; then
+    auditor_verdict_file="${stable_verdict_file}.audit-${audit_generation}"
+    if [[ -e "$auditor_verdict_file" || -L "$auditor_verdict_file" ]]; then
+      verdict_file="$auditor_verdict_file"
+    else
+      verdict_file="$stable_verdict_file"
+    fi
+  fi
+  verdict_request_body="$body"
+  request_is_current=true
+  return 0
+}
+
+consume_current_verdict_request() {
+  [[ "$session_scope" != "-" ]] || return 0
+  [[ -n "$verdict_request_body" ]] || return 1
+  prompt_epoch_is_current || return 1
+  verdict_audit_remove_record_if_matches \
+    "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || return 1
+  prompt_epoch_is_current
+}
+
+current_verdict_request_matches() {
+  [[ "$session_scope" != "-" ]] || return 0
+  [[ -n "$verdict_request_body" ]] || return 1
+  local current_body
+  current_body="$(verdict_audit_read_single_record \
+    "$verdict_request_file" 2>/dev/null)" || return 1
+  [[ "$current_body" == "$verdict_request_body" ]]
+}
+
+current_verdict_authority_matches() {
+  prompt_epoch_is_current || return 1
+  current_verdict_request_matches || return 1
+  [[ "$session_scope" == "-" ]] && return 0
+  [[ -n "${audit_cancellation_file:-}" ]] || return 1
+  ! verdict_audit_cancellation_exists "$audit_cancellation_file"
+}
+
+discard_path_for_current_epoch() {  # stable-path
+  local stable_path="$1"
+  prompt_epoch_is_current || return 1
+  [[ -e "$stable_path" || -L "$stable_path" ]] || return 0
+  local quarantine="${stable_path}.discard-$$-${RANDOM:-0}" selected_identity
+  selected_identity="$(verdict_audit_path_identity "$stable_path" 2>/dev/null)" \
+    || return 1
+  prompt_epoch_is_current || return 1
+  verdict_audit_rename_exact "$stable_path" "$quarantine" 2>/dev/null || return 1
+  if ! verdict_audit_selected_identity_matches \
+      "$quarantine" "$selected_identity" 2>/dev/null; then
+    verdict_audit_restore_no_clobber \
+      "$quarantine" "$stable_path" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$quarantine"
+  rmdir "$quarantine" 2>/dev/null || true
+}
+
+# Replace a small session record without ever overwriting a pathname that a newer prompt
+# or Stop may have published. A staged hardlink retains inode identity through the final
+# epoch check, so rollback can retract only this invocation's write.
+publish_record_for_current_epoch() {  # record-path body-without-LF
+  local record_path="$1" record_body="$2"
+  local staged="${record_path}.stage-$$-${RANDOM:-0}"
+  local prior="${record_path}.prior-$$-${RANDOM:-0}" had_prior=false prior_identity=""
+  prompt_epoch_is_current || return 1
+  if ! printf '%s\n' "$record_body" \
+      | verdict_audit_write_exclusive_regular "$staged" 2>/dev/null; then
+    return 1
+  fi
+  if ! prompt_epoch_is_current; then
+    rm -f "$staged"
+    return 1
+  fi
+  if [[ -e "$record_path" || -L "$record_path" ]]; then
+    prior_identity="$(verdict_audit_path_identity "$record_path" 2>/dev/null)" || {
+      rm -f "$staged"
+      return 1
+    }
+    prompt_epoch_is_current || {
+      rm -f "$staged"
+      return 1
+    }
+    verdict_audit_rename_exact "$record_path" "$prior" 2>/dev/null || {
+      rm -f "$staged"
+      return 1
+    }
+    had_prior=true
+    if ! verdict_audit_selected_identity_matches \
+        "$prior" "$prior_identity" 2>/dev/null; then
+      verdict_audit_restore_no_clobber "$prior" "$record_path" 2>/dev/null || true
+      rm -f "$staged"
+      return 1
+    fi
+    if ! prompt_epoch_is_current; then
+      rm -f "$prior" 2>/dev/null || true
+      rmdir "$prior" 2>/dev/null || true
+      rm -f "$staged"
+      return 1
+    fi
+  fi
+  if ! verdict_audit_link_no_clobber "$staged" "$record_path" 2>/dev/null; then
+    if [[ "$had_prior" == true ]]; then
+      verdict_audit_restore_no_clobber "$prior" "$record_path" 2>/dev/null || true
+    fi
+    rm -f "$staged"
+    return 1
+  fi
+  if ! prompt_epoch_is_current; then
+    verdict_audit_unlink_if_same_inode "$record_path" "$staged" 2>/dev/null || true
+    if [[ "$had_prior" == true ]]; then
+      rm -f "$prior" 2>/dev/null || true
+      rmdir "$prior" 2>/dev/null || true
+    fi
+    rm -f "$staged"
+    return 1
+  fi
+  rm -f "$staged"
+  if [[ "$had_prior" == true ]]; then
+    rm -f "$prior" 2>/dev/null || true
+    rmdir "$prior" 2>/dev/null || true
+  fi
+  return 0
+}
+
+discard_matching_json_generation() {  # json-path expected-generation
+  local json_path="$1" expected="$2" quarantine snapshot json generation
+  [[ -e "$json_path" || -L "$json_path" ]] || return 0
+  quarantine="${json_path}.discard-$$-${RANDOM:-0}"
+  verdict_audit_rename_exact "$json_path" "$quarantine" 2>/dev/null || return 1
+  snapshot="$(verdict_audit_read_json_snapshot "$quarantine" 2>/dev/null)" \
+    || snapshot=""
+  json=""
+  [[ "$snapshot" == *$'\n'* ]] && json="${snapshot#*$'\n'}"
+  generation="$(printf '%s' "$json" | jq -rs '
+    if length == 1 and (.[0] | type == "object")
+       and (.[0].generation | type == "string")
+    then .[0].generation else "" end
+  ' 2>/dev/null || echo '')"
+  if [[ "$generation" == "$expected" ]]; then
+    rm -f "$quarantine"
+    return 0
+  fi
+  verdict_audit_restore_no_clobber "$quarantine" "$json_path" 2>/dev/null || return 2
+  return 1
+}
+
+ensure_verdict_request() {
+  prompt_epoch_is_current || return 1
+  if load_verdict_request; then
+    if prompt_epoch_is_current; then
+      return 0
+    fi
+    request_is_current=false
+    return 1
+  fi
+  [[ "$session_scope" != "-" && -n "$FINAL_ID" ]] || return 0
+  local deadline new_request_body existing_request_body invalid_identity
+  audit_generation="$$-$(date +%s)-${RANDOM:-0}"
+  auditor_verdict_file="${stable_verdict_file}.audit-${audit_generation}"
+  verdict_file="$stable_verdict_file"
+  deadline="$(( $(date +%s) + audit_lock_max_seconds ))"
+  mkdir -p "$(dirname "$verdict_request_file")" 2>/dev/null || return 1
+  prompt_epoch_is_current || return 1
+  discard_path_for_current_epoch "$verdict_file" >/dev/null 2>&1 || true
+  prompt_epoch_is_current || return 1
+  if [[ -e "$verdict_request_file" || -L "$verdict_request_file" ]]; then
+    if existing_request_body="$(verdict_audit_read_single_record \
+        "$verdict_request_file" 2>/dev/null)"; then
+      verdict_audit_remove_record_if_matches \
+        "$verdict_request_file" "$existing_request_body" >/dev/null 2>&1 || return 1
+    else
+      # Invalid/FIFO/directory state cannot permanently suppress audit recovery. Rename
+      # one exact pathname out of the publication slot, then remove only that selected
+      # entry when it is a file/symlink or an empty directory.
+      local invalid_request="${verdict_request_file}.invalid-$$-${RANDOM:-0}"
+      invalid_identity="$(verdict_audit_path_identity \
+        "$verdict_request_file" 2>/dev/null)" || return 1
+      prompt_epoch_is_current || return 1
+      verdict_audit_rename_exact \
+        "$verdict_request_file" "$invalid_request" 2>/dev/null || return 1
+      if ! verdict_audit_selected_identity_matches \
+          "$invalid_request" "$invalid_identity" 2>/dev/null; then
+        verdict_audit_restore_no_clobber \
+          "$invalid_request" "$verdict_request_file" 2>/dev/null || true
+        return 1
+      fi
+      rm -f "$invalid_request" 2>/dev/null || true
+      rmdir "$invalid_request" 2>/dev/null || true
+    fi
+  fi
+  prompt_epoch_is_current || return 1
+  new_request_body="$audit_generation $deadline $FINAL_ID"
+  if ! printf '%s\n' "$new_request_body" \
+      | verdict_audit_write_exclusive_regular "$verdict_request_file" 2>/dev/null; then
+    return 1
+  fi
+  verdict_request_body="$new_request_body"
+  if ! prompt_epoch_is_current; then
+    verdict_audit_remove_record_if_matches \
+      "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || true
+    request_is_current=false
+    return 1
+  fi
+  request_is_current=true
+}
+
+write_payload_transcript() {
+  local payload_body
+  prompt_epoch_is_current || return 1
+  mkdir -p "$(dirname "$payload_transcript_file")" 2>/dev/null || return 1
+  payload_body="$(jq -nc --arg text "$last_assistant_message" \
+    '{type:"assistant", source:"codex-stop-payload",
+      message:{content:[{type:"text", text:$text}]}}')" || return 1
+  publish_record_for_current_epoch "$payload_transcript_file" "$payload_body"
 }
 
 verdict_instruction() {
-  local prior="" tooling_root audit_transcript_path="$transcript_path"
-  tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  local prior="" audit_transcript_path="$transcript_path" codex_auditor_task
+  if ! ensure_verdict_request; then
+    printf 'Verdict audit request could not be recorded at %s. Fix that state-write error before auditing.\n' \
+      "$verdict_request_file"
+    return 0
+  fi
   if [[ "$FINAL_SOURCE" == "payload" \
      || ( -n "$last_assistant_message" \
           && ( -z "$transcript_path" || ! -r "$transcript_path" || ! -s "$transcript_path" ) ) ]]; then
@@ -522,8 +932,10 @@ claims, so anything the fix newly asserts is still caught."
   # path containing a quote would otherwise re-tokenize the command an agent is being
   # told to run. This hook never executes it — the reader might.
   local headless_command
-  printf -v headless_command 'bash %q %q' \
-    "$tooling_root/.agents/hooks/run-verdict-audit.sh" "$audit_transcript_path"
+  printf -v headless_command 'bash %q %q %q %q %q' \
+    "$tooling_root/.agents/hooks/run-verdict-audit.sh" "$audit_transcript_path" \
+    "$session_id" "$audit_generation" "$session_scope"
+  codex_auditor_task="verdict_auditor_${audit_generation//-/_}"
 
   local lib="$tooling_root/.agents/lib/subagent.sh"
   if [[ -r "$lib" ]]; then
@@ -533,8 +945,14 @@ claims, so anything the fix newly asserts is still caught."
       --agent verdict-auditor \
       --root "$tooling_root" \
       --description 'verdict proof check' \
-      --artifact "$verdict_file" \
-      --task "$(subagent_prompt verdict-task "$tooling_root" "transcript_path=${audit_transcript_path}")" \
+      --codex-task-name "$codex_auditor_task" \
+      --codex-retry-existing \
+      --artifact "$auditor_verdict_file" \
+      --task "$(subagent_prompt verdict-task "$tooling_root" \
+                  "transcript_path=${audit_transcript_path}" \
+                  "verdict_file=${auditor_verdict_file}" \
+                  "previous_verdict_file=${prev_verdict_file}" \
+                  "audit_generation=${audit_generation}")" \
       --headless "$headless_command"
   else
     printf 'preflight-verdict-check: missing %s — emitting the headless route only\n' "$lib" >&2
@@ -544,16 +962,32 @@ end):
 
   ${headless_command}
 
-The AUDITOR — not you — writes ${verdict_file}; do not write it yourself.
+The AUDITOR — not you — writes ${auditor_verdict_file}; do not write it yourself.
 EOF
   fi
 
   cat <<EOF
 
+While waiting, retain the native auditor's handle. If a REAL user message is steered in
+before it returns, cancel it immediately, revoke generation
+${audit_generation}, discard any dossier from that abandoned audit, and handle the new
+message. In Codex use
+collaboration.interrupt_agent(target='${codex_auditor_task}'); in Claude Code cancel the
+active Task. Do not wait for an audit whose question the user just superseded.
+
 If you are pausing or asking the user something, have the auditor record IN_PROGRESS
 with what remains; if a claim genuinely cannot be proven here, it can mark that proof
 'blocked' with the residual risk. Then end your turn again.${prior}
 EOF
+}
+
+block_with_verdict_instruction() {  # reason-without-instruction
+  local reason="$1" instruction
+  prompt_epoch_is_current || allow
+  instruction="$(verdict_instruction)"
+  prompt_epoch_is_current || allow
+  block "${reason}
+${instruction}"
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -566,90 +1000,252 @@ EOF
 # addressed stays a finding", those become a FAIL — re-entering the meaningless-loop class
 # item 2 of this header exists to eliminate.
 expire_stale_prev() {
-  [[ -r "$prev_verdict_file" ]] || return 0
-  local parked_age=$(( $(date +%s) - $(file_mtime_epoch "$prev_verdict_file") ))
-  (( parked_age > max_age_seconds )) && rm -f "$prev_verdict_file"
+  prompt_epoch_is_current || return 0
+  [[ -e "$prev_verdict_file" || -L "$prev_verdict_file" ]] || return 0
+  local parked_quarantine="${prev_verdict_file}.expire-$$-${RANDOM:-0}"
+  local parked_identity=""
+  local parked_snapshot="" parked_mtime="" parked_age=0
+  parked_identity="$(verdict_audit_path_identity "$prev_verdict_file" 2>/dev/null)" \
+    || return 0
+  prompt_epoch_is_current || return 0
+  verdict_audit_rename_exact \
+    "$prev_verdict_file" "$parked_quarantine" 2>/dev/null || return 0
+  if ! verdict_audit_selected_identity_matches \
+      "$parked_quarantine" "$parked_identity" 2>/dev/null; then
+    verdict_audit_restore_no_clobber \
+      "$parked_quarantine" "$prev_verdict_file" 2>/dev/null || true
+    return 0
+  fi
+  if ! prompt_epoch_is_current; then
+    rm -f "$parked_quarantine" 2>/dev/null || true
+    rmdir "$parked_quarantine" 2>/dev/null || true
+    return 0
+  fi
+  if parked_snapshot="$(verdict_audit_read_json_snapshot \
+      "$parked_quarantine" 2>/dev/null)" \
+     && [[ "$parked_snapshot" == *$'\n'* ]]; then
+    parked_mtime="${parked_snapshot%%$'\n'*}"
+  fi
+  if [[ "$parked_mtime" =~ ^[0-9]+$ ]]; then
+    parked_age=$(( $(date +%s) - parked_mtime ))
+  else
+    parked_age=$(( max_age_seconds + 1 ))
+  fi
+  if (( parked_age >= 0 && parked_age <= max_age_seconds )) \
+     && prompt_epoch_is_current; then
+    # A concurrent gate may already have parked a newer FAIL at the stable name. In
+    # that case the newer inode wins and only this selected older inode is discarded.
+    if verdict_audit_link_no_clobber \
+        "$parked_quarantine" "$prev_verdict_file" 2>/dev/null; then
+      if prompt_epoch_is_current; then
+        rm -f "$parked_quarantine"
+        return 0
+      fi
+      verdict_audit_unlink_if_same_inode \
+        "$prev_verdict_file" "$parked_quarantine" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$parked_quarantine"
+  rmdir "$parked_quarantine" 2>/dev/null || true
   return 0
 }
 expire_stale_prev
 
-# ── Present dossier → validate the binding, then the verdict decides ─────────
-if [[ -r "$verdict_file" ]]; then
-  v_branch="$(jq -r '.branch // ""'    "$verdict_file" 2>/dev/null || echo '')"
-  v_head="$(jq -r '.head // ""'        "$verdict_file" 2>/dev/null || echo '')"
-  v_tree="$(jq -r '.tree_hash // ""'   "$verdict_file" 2>/dev/null || echo '')"
-  v_verdict="$(jq -r '.verdict // ""'  "$verdict_file" 2>/dev/null || echo '')"
-
-  # Keep failed platform probes from contaminating the successful command's output.
-  v_mtime="$(file_mtime_epoch "$verdict_file")"
-  now_epoch="$(date +%s)"
-  age=$(( now_epoch - v_mtime ))
-
-  cur_tree="$(compute_tree_hash)"
-
-  if [[ "$v_branch" != "$branch" ]] || \
-     [[ "$v_head" != "$head" ]] || \
-     [[ "$v_tree" != "$cur_tree" ]] || \
-     (( age > max_age_seconds )); then
-    # Bookkeeping mismatch (branch/HEAD/tree moved, or dossier aged out) → discard
-    # and fall through to detection. The current turn's OWN text decides
-    # below whether a FRESH audit is demanded; the mismatch itself never blocks.
-    log_decision dossier discard-stale
-    # A FAILed dossier is the one worth keeping across the discard: the binding almost
-    # always moved because the agent was FIXING those findings, and the observed cycle
-    # (FAIL-block -> fix -> discard-stale -> re-detect -> block) then paid a full COLD
-    # re-audit every round. Parking it lets round N+1 re-check known findings against
-    # the delta. PASS/IN_PROGRESS that merely aged out carry nothing to re-check.
-    # ...but ONLY while it is still fresh. The discard fires for four reasons, and just
-    # one of them means a round is in flight: the tree moved because the agent was
-    # fixing these findings. An AGE-OUT means the opposite — nobody acted on them and
-    # the round is over, so parking it hands the next audit findings about unrelated
-    # work. Observed live: a FAIL from 04:46 was still being parked at 05:37 and
-    # offered to an auditor judging a different task entirely.
-    if [[ "$v_verdict" == "FAIL" ]] && (( age <= max_age_seconds )); then
-      # `touch` after the move on purpose: mv preserves the ORIGINAL write time, but the
-      # read side needs to know how long this has sat unclaimed, not how old the verdict
-      # was. Parking is the event that starts that clock.
-      mv -f "$verdict_file" "$prev_verdict_file" 2>/dev/null && touch "$prev_verdict_file" \
-        || rm -f "$verdict_file"
-    else
-      rm -f "$verdict_file"
-    fi
+# Resolve the exact turn before accepting any runtime artifact. A user steer may retain
+# the harness turn id, while the content-derived FINAL_ID necessarily changes.
+resolve_final_message
+if [[ -z "$FINAL_TEXT" ]]; then
+  if [[ "$transcript_had_content" == true ]]; then
+    log_decision extract blind-allow
+    allow_with_note "[verdict-gate] transcript has content but no assistant text after 2s → allowing UNJUDGED"
   else
-    case "$v_verdict" in
-      PASS)
-        log_decision dossier PASS-allow
-        # The parked FAIL goes too: the cycle it belonged to just ended clean, and a
-        # surviving prev would point the next audit at findings already resolved.
-        rm -f "$verdict_file" "$prev_verdict_file" "$payload_transcript_file"
-        # Consume the synthetic Stop transcript too; the next verdict re-audits from
-        # its own event instead of inheriting the previous message.
-        allow_with_note "[verdict-gate] dossier PASS → consumed, turn ends"
-        ;;
-      IN_PROGRESS)
-        remaining="$(jq -r '.findings[]? | "  - " + .' "$verdict_file" 2>/dev/null || echo '')"
-        log_decision dossier IN_PROGRESS-allow
-        rm -f "$verdict_file" "$prev_verdict_file" "$payload_transcript_file"
-        allow_with_note "Verdict: IN_PROGRESS — proof deferred, work not yet complete:
+    log_decision extract empty-allow
+    allow
+  fi
+fi
+
+# A session dossier has authority only while its request still names this exact turn and
+# that generation has not been canceled. UserPromptSubmit revokes the request directly;
+# INT/TERM has no prompt hook, so the runner publishes a generation-named tombstone. The
+# Stop gate consumes that marker by retiring the exact request and dossier before issuing
+# a fresh generation. Removing authority before the marker makes any later writer harmless.
+request_is_current=false
+if load_verdict_request true; then
+  if [[ "$session_scope" != "-" ]]; then
+    if verdict_audit_cancellation_exists "$audit_cancellation_file"; then
+      log_decision cancellation discard-generation
+      if consume_current_verdict_request >/dev/null 2>&1; then
+        discard_matching_json_generation \
+          "$verdict_file" "$audit_generation" >/dev/null 2>&1 || true
+        discard_path_for_current_epoch "$last_uuid_file" >/dev/null 2>&1 || true
+        discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
+        verdict_audit_clear_cancellation_records \
+          "$audit_cancellation_file" >/dev/null 2>&1 || true
+      fi
+      request_is_current=false
+    fi
+  fi
+elif [[ "$session_scope" != "-" ]]; then
+  # Re-check before replacement in ensure_verdict_request(). A concurrent newer Stop
+  # may have installed valid authority after this failed snapshot.
+  :
+fi
+
+# ── Present dossier → validate the binding, then the verdict decides ─────────
+# Rename first: every later consume/park/restore operation owns this exact inode. A
+# canceled native auditor may publish a newer dossier at the stable path while the gate
+# is deciding; that newer pathname is never opened, moved, or deleted by this decision.
+dossier_observed_identity=""
+if [[ "$request_is_current" == true \
+   && ( -e "$verdict_file" || -L "$verdict_file" ) ]]; then
+  dossier_observed_identity="$(verdict_audit_path_identity \
+    "$verdict_file" 2>/dev/null)" || dossier_observed_identity=""
+fi
+if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
+   && start_decision_lease \
+   && current_verdict_authority_matches; then
+  dossier_quarantine="${verdict_file}.inspect-$$-${RANDOM:-0}"
+  if verdict_audit_rename_exact "$verdict_file" "$dossier_quarantine" 2>/dev/null; then
+    if ! verdict_audit_selected_identity_matches \
+        "$dossier_quarantine" "$dossier_observed_identity" 2>/dev/null; then
+      verdict_audit_restore_no_clobber \
+        "$dossier_quarantine" "$verdict_file" 2>/dev/null || true
+    else
+    dossier_file_snapshot=""
+    verdict_json=""
+    v_mtime=0
+    if dossier_file_snapshot="$(verdict_audit_read_json_snapshot \
+        "$dossier_quarantine" 2>/dev/null)" \
+       && [[ "$dossier_file_snapshot" == *$'\n'* ]]; then
+      v_mtime="${dossier_file_snapshot%%$'\n'*}"
+      verdict_json="${dossier_file_snapshot#*$'\n'}"
+    fi
+    verdict_document="$(printf '%s' "$verdict_json" \
+      | verdict_audit_normalize_dossier 2>/dev/null || true)"
+    verdict_snapshot="$verdict_document"
+    verdict_json="$verdict_document"
+    # Parse the immutable in-memory JSON snapshot. JSON preserves an empty detached-HEAD
+    # branch; Bash IFS whitespace transport does not.
+    v_branch="$(printf '%s' "$verdict_snapshot" | jq -r '.branch // ""' 2>/dev/null || true)"
+    v_head="$(printf '%s' "$verdict_snapshot" | jq -r '.head // ""' 2>/dev/null || true)"
+    v_tree="$(printf '%s' "$verdict_snapshot" | jq -r '.tree_hash // ""' 2>/dev/null || true)"
+    v_verdict="$(printf '%s' "$verdict_snapshot" | jq -r '.verdict // ""' 2>/dev/null || true)"
+    v_generation="$(printf '%s' "$verdict_snapshot" | jq -r '.generation // ""' 2>/dev/null || true)"
+    now_epoch="$(date +%s)"
+    [[ "$v_mtime" =~ ^[0-9]+$ ]] || v_mtime=0
+    age=$(( now_epoch - v_mtime ))
+    cur_tree="$(compute_tree_hash)"
+
+    generation_matches=false
+    if [[ "$session_scope" == "-" ]]; then
+      [[ -z "$v_generation" || "$v_generation" == "legacy" ]] && generation_matches=true
+    elif [[ "$v_generation" == "$audit_generation" ]]; then
+      generation_matches=true
+    fi
+
+    if [[ "$generation_matches" != true ]]; then
+      log_decision dossier discard-generation
+      rm -f "$dossier_quarantine"
+      rmdir "$dossier_quarantine" 2>/dev/null || true
+    elif [[ "$v_branch" != "$branch" ]] || \
+       [[ "$v_head" != "$head" ]] || \
+       [[ "$v_tree" != "$cur_tree" ]] || \
+       (( age < 0 || age > max_age_seconds )); then
+      log_decision dossier discard-stale
+      if ! consume_current_verdict_request; then
+        rm -f "$dossier_quarantine"
+        rmdir "$dossier_quarantine" 2>/dev/null || true
+        [[ "$session_scope" == "-" ]] || request_is_current=false
+      elif [[ "$v_verdict" == "FAIL" ]] \
+         && prompt_epoch_is_current \
+         && (( age >= 0 && age <= max_age_seconds )); then
+        # Exact rename cannot reinterpret a directory destination. Retain the dossier's
+        # original freshness timestamp: refreshing it here would let an old result gain a
+        # second authority window. On failure preserve the quarantine and fail closed.
+        if verdict_audit_link_no_clobber \
+            "$dossier_quarantine" "$prev_verdict_file" 2>/dev/null; then
+          if prompt_epoch_is_current; then
+            rm -f "$dossier_quarantine"
+          else
+            verdict_audit_unlink_if_same_inode \
+              "$prev_verdict_file" "$dossier_quarantine" 2>/dev/null || true
+            rm -f "$dossier_quarantine"
+          fi
+        else
+          rm -f "$dossier_quarantine"
+        fi
+        [[ "$session_scope" == "-" ]] || request_is_current=false
+      else
+        rm -f "$dossier_quarantine"
+        rmdir "$dossier_quarantine" 2>/dev/null || true
+        [[ "$session_scope" == "-" ]] || request_is_current=false
+      fi
+    else
+      case "$v_verdict" in
+        PASS)
+          if consume_current_verdict_request; then
+            log_decision dossier PASS-allow
+            rm -f "$dossier_quarantine"
+            discard_path_for_current_epoch "$prev_verdict_file" >/dev/null 2>&1 || true
+            discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
+            rmdir "$dossier_quarantine" 2>/dev/null || true
+            allow_with_note "[verdict-gate] dossier PASS → consumed, turn ends"
+          fi
+          log_decision dossier discard-revoked
+          rm -f "$dossier_quarantine"
+          rmdir "$dossier_quarantine" 2>/dev/null || true
+          [[ "$session_scope" == "-" ]] || request_is_current=false
+          ;;
+        IN_PROGRESS)
+          remaining="$(printf '%s' "$verdict_json" \
+            | jq -r '.findings[]? | "  - " + .' 2>/dev/null || echo '')"
+          if consume_current_verdict_request; then
+            log_decision dossier IN_PROGRESS-allow
+            rm -f "$dossier_quarantine"
+            discard_path_for_current_epoch "$prev_verdict_file" >/dev/null 2>&1 || true
+            discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
+            rmdir "$dossier_quarantine" 2>/dev/null || true
+            allow_with_note "Verdict: IN_PROGRESS — proof deferred, work not yet complete:
 ${remaining}"
-        ;;
-      *)
-        log_decision dossier FAIL-block
-        # FAIL (or unexpected): the finding-driven block. The dossier is KEPT so
-        # ending again without addressing the findings re-blocks — this is the one
-        # loop the gate is ALLOWED to have. A fix that changes the tree invalidates
-        # the binding above and routes through a fresh detection instead.
-        findings="$(jq -r '.findings[]? | "  - " + .' "$verdict_file" 2>/dev/null || echo '')"
-        block "Verdict proof check FAILED on branch '${branch}':
+          fi
+          log_decision dossier discard-revoked
+          rm -f "$dossier_quarantine"
+          rmdir "$dossier_quarantine" 2>/dev/null || true
+          [[ "$session_scope" == "-" ]] || request_is_current=false
+          ;;
+        *)
+          if current_verdict_authority_matches; then
+            log_decision dossier FAIL-block
+            findings="$(printf '%s' "$verdict_json" \
+              | jq -r '.findings[]? | "  - " + .' 2>/dev/null || echo '')"
+            if ! prompt_epoch_is_current; then
+              :
+            elif ! verdict_audit_restore_no_clobber \
+                "$dossier_quarantine" "$verdict_file" 2>/dev/null; then
+              printf 'preflight-verdict-check: retained FAIL could not be restored from %s\n' \
+                "$dossier_quarantine" >&2
+            elif prompt_epoch_is_current; then
+              block_with_verdict_instruction "Verdict proof check FAILED on branch '${branch}':
 
 ${findings}
 
-Address each finding, then re-audit. This block persists until a re-audit passes.
-$(verdict_instruction)"
-        ;;
-    esac
+Address each finding, then re-audit. This block persists until a re-audit passes."
+            else
+              discard_matching_json_generation \
+                "$verdict_file" "$audit_generation" >/dev/null 2>&1 || true
+            fi
+          fi
+          log_decision dossier discard-revoked
+          rm -f "$dossier_quarantine"
+          rmdir "$dossier_quarantine" 2>/dev/null || true
+          request_is_current=false
+          ;;
+      esac
+    fi
+    fi
   fi
 fi
+stop_decision_lease
 
 # ── An audit is RUNNING and has not answered yet → allow, don't busy-wait ────
 # Level-triggered gate, edge-triggered remedy: an audit takes minutes, a re-block cycle
@@ -661,82 +1257,100 @@ audit_in_flight() {
   # Dossier absence is the runner's own proof it has not answered (it removes the file
   # before auditing). Redundant with the call site below the dossier branch, kept so the
   # predicate survives being hoisted.
-  [[ -r "$audit_lock_file" && ! -e "$verdict_file" ]] || return 1
-  local body pid deadline lock_mtime now
-  body="$(cat "$audit_lock_file" 2>/dev/null || echo '')"
+  [[ "$request_is_current" == true && -r "$audit_lock_file" && ! -e "$verdict_file" ]] \
+    || return 1
+  local record_snapshot body pid deadline lock_pgid lock_scope owner_token lock_generation
+  local lock_start_token extra actual_start_token
+  local lock_mtime now
+  audit_in_flight_pid=""
+  record_snapshot="$(verdict_audit_read_single_record_snapshot \
+    "$audit_lock_file" 2>/dev/null)" || return 1
+  [[ "$record_snapshot" == *$'\n'* ]] || return 1
+  lock_mtime="${record_snapshot%%$'\n'*}"
+  body="${record_snapshot#*$'\n'}"
   # Here-string, not `read < file`: the body has no trailing newline, so `read` assigns
   # and still exits 1 at EOF, which with `|| return 1` silently disables this rung.
-  read -r pid deadline <<< "$body"
+  read -r pid deadline lock_pgid lock_scope owner_token lock_generation \
+    lock_start_token extra <<< "$body"
   # `0` excluded: `kill -0 0` signals the caller's own process group and succeeds, so a
   # truncated write would buy a blanket allow. $$ is never 0.
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ "$session_scope" != "-" ]]; then
+    [[ "$lock_pgid" =~ ^(0|[1-9][0-9]*)$ \
+       && "$lock_scope" == "$session_scope" \
+       && "$owner_token" =~ ^[1-9][0-9]*-[0-9]+-[0-9]+$ \
+       && "$lock_generation" == "$audit_generation" \
+       && ( -z "$lock_start_token" \
+            || "$lock_start_token" =~ ^cksum-[0-9]+-[0-9]+$ ) \
+       && -z "$extra" ]] || return 1
+  fi
+  # Metadata and PID liveness are observations, not ownership: SIGKILL can strand the
+  # former and PID reuse can satisfy the latter. The runner's stable kernel lease is the
+  # authoritative proof. If Perl/flock is unavailable or errors, fail closed to triage.
+  [[ -e "$audit_mutex_file" ]] || return 1
+  command -v perl >/dev/null 2>&1 || return 1
+  perl -MFcntl=:DEFAULT,:flock -MErrno=EAGAIN,EWOULDBLOCK -e '
+    my $path = shift;
+    $SIG{ALRM} = sub { exit 2 };
+    alarm 1;
+    exit 2 if lstat($path) && -l _;
+    my $flags = O_RDWR | O_NONBLOCK;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $fh, $path, $flags) or exit 2;
+    my @opened = stat($fh);
+    my @named = lstat($path);
+    exit 2 unless @opened && @named && -f $fh && $opened[3] == 1
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    my $locked = flock($fh, LOCK_EX | LOCK_NB);
+    my $lock_errno = 0 + $!;
+    @opened = stat($fh);
+    @named = lstat($path);
+    exit 2 unless @opened && @named && -f $fh && $opened[3] == 1
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    exit 1 if $locked;
+    alarm 0;
+    $! = $lock_errno;
+    exit(($!{EAGAIN} || $!{EWOULDBLOCK}) ? 0 : 2);
+  ' "$audit_mutex_file" || return 1
   # A lock file alone proves nothing: the trap misses SIGKILL, orphaning the lock.
   kill -0 "$pid" 2>/dev/null || return 1
-  lock_mtime="$(file_mtime_epoch "$audit_lock_file")"
+  if [[ -n "$lock_start_token" ]]; then
+    actual_start_token="$(verdict_audit_process_start_token "$pid" 2>/dev/null)" \
+      || return 1
+    [[ "$actual_start_token" == "$lock_start_token" ]] || return 1
+  fi
   now="$(date +%s)"
+  [[ "$lock_mtime" =~ ^[0-9]+$ ]] || return 1
+  (( lock_mtime <= now )) || return 1
   # Only the runner knows VERDICT_AUDITOR_TIMEOUT, so it writes the deadline; bounding
   # by max_age_seconds (dossier staleness) would expire the lock mid-run. Past the
   # ceiling is rejected, not capped — that lock is not what we think it is.
-  if [[ "$deadline" =~ ^[1-9][0-9]*$ ]]; then
-    (( now <= deadline && deadline <= lock_mtime + audit_lock_max_seconds ))
+  if [[ -z "$deadline" ]]; then
+    # No deadline field: a lock from an older runner. Fall back to the conservative
+    # dossier-age bound rather than trusting an unbounded lease.
+    (( now - lock_mtime >= 0 && now - lock_mtime <= max_age_seconds )) || return 1
+  elif verdict_audit_epoch_is_bounded "$deadline"; then
+    (( now <= deadline && deadline <= lock_mtime + audit_lock_max_seconds )) || return 1
   else
-    # No deadline field: a lock from an older runner, or a torn write. Fall back to the
-    # conservative bound rather than trusting an unbounded lock.
-    (( now - lock_mtime <= max_age_seconds ))
+    # A present but malformed field is not legacy metadata. Fail closed before Bash can
+    # wrap it or reinterpret a torn/hostile lease as a plausible live deadline.
+    return 1
   fi
+  audit_in_flight_pid="$pid"
+  return 0
 }
 if audit_in_flight; then
   log_decision audit inflight-allow
-  allow_with_note "[verdict-gate] audit in flight (pid $(cut -d' ' -f1 "$audit_lock_file" 2>/dev/null)) → allow; its verdict gates the next turn"
+  allow_with_note "[verdict-gate] audit in flight (pid ${audit_in_flight_pid}) → allow; its verdict gates the next turn"
 fi
 
 # ── No (usable) dossier → triage: does the turn assert a verdict? ───────────
-extract_final_message
-# An empty extraction has two very different causes, and collapsing them into one exit
-# let real turns end UNJUDGED in silence:
-#   * no transcript — absent, unreadable, or zero bytes. Nothing to judge, and no
-#     amount of waiting will produce anything -> allow immediately.
-#   * a transcript WITH content that yields no assistant text — the hook could not SEE
-#     the turn. Either the harness had not flushed this turn's final message yet, or a
-#     torn mid-append write left the JSONL briefly unparseable (jq's failure above is
-#     swallowed, so it is indistinguishable from "no text"). That is a real turn about
-#     to slip past the gate, so give it the SAME bounded wait the identity guard below
-#     uses before failing open. Observed live: a turn whose text record landed 0.1s
-#     after this hook read the file logged `extract empty-allow` and was never triaged.
-transcript_had_content=false
-[[ -n "$transcript_path" && -s "$transcript_path" ]] && transcript_had_content=true
-if [[ -z "$FINAL_TEXT" && "$transcript_had_content" == true ]]; then
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.2
-    extract_final_message
-    [[ -n "$FINAL_TEXT" ]] && break
-  done
-fi
-
-# Codex permits a null transcript_path and supplies this stable Stop field for that
-# case. Apply it only after the transcript flush window so the last fragment cannot
-# hide an earlier verdict from the same turn.
-[[ -z "$FINAL_TEXT" ]] && use_payload_message
-
-if [[ -z "$FINAL_TEXT" ]]; then
-  if [[ "$transcript_had_content" == true ]]; then
-    # Still blind after the wait: fail open (never trap on absent state), but under a
-    # rung that says so. Logging this as `empty` would make a gate that never looked
-    # indistinguishable from a quiet session.
-    log_decision extract blind-allow
-    allow_with_note "[verdict-gate] transcript has content but no assistant text after 2s → allowing UNJUDGED"
-  else
-    log_decision extract empty-allow
-    allow
-  fi
-fi
-
 # Flush-race guard: if the newest transcript message is the one already judged, the
 # harness fired Stop before appending this turn's final text. Wait briefly for the
 # fresh message; if none arrives there is nothing new to judge → allow. A message
 # is never judged twice. A payload-only message has nothing to flush: only Codex's
 # active-hook signal plus an identical content identity proves that call is recursive.
-recorded_id="$(cat "$last_uuid_file" 2>/dev/null || echo '')"
+recorded_id="$(verdict_audit_read_single_record "$last_uuid_file" 2>/dev/null || echo '')"
 if [[ -n "$FINAL_ID" && -n "$recorded_id" && "$FINAL_ID" == "$recorded_id" ]]; then
   if [[ "$FINAL_SOURCE" == "payload" && "$stop_hook_active" == "true" ]]; then
     log_decision race stale-allow
@@ -759,8 +1373,9 @@ fi
 # `stripped` stays the pattern tiers' text; only the classifier gets citations.
 stripped="$(printf '%s\n' "$FINAL_TEXT" | strip_code_static)"
 stripped_cited="$(printf '%s\n' "$FINAL_TEXT" | strip_code_cited)"
+prompt_epoch_is_current || allow
 mkdir -p "$(dirname "$last_uuid_file")" 2>/dev/null || true
-printf '%s' "$FINAL_ID" > "$last_uuid_file" 2>/dev/null || true   # judged now, allow or block
+publish_record_for_current_epoch "$last_uuid_file" "$FINAL_ID" || allow # judged now
 
 # ── Tier A (0ms): harness text asserts nothing → allow without a model call ──
 # Placed AFTER the identity write so this allow path records what it judged, exactly
@@ -776,21 +1391,20 @@ fi
 asserted="$(printf '%s\n' "$stripped" | grep -Eio "$assertion_patterns" 2>/dev/null | head -n1 || true)"
 if [[ -n "$asserted" ]]; then
   log_decision assertion match-block
-  block "This turn asserts a verdict (\"${asserted}\") but no audited
-dossier backs it. A claim stated as established needs proof attached.
-$(verdict_instruction)"
+  block_with_verdict_instruction "This turn asserts a verdict (\"${asserted}\") but no audited
+dossier backs it. A claim stated as established needs proof attached."
 fi
 
 triage="$(should_audit "$stripped_cited")"
+prompt_epoch_is_current || allow
 if [[ "$triage" == "NO" ]]; then
   log_decision triage NO-allow
   allow_with_note "[verdict-gate] triage: NO — nothing taken on trust → allow"
 fi
 if [[ "$triage" == "YES" ]]; then
   log_decision triage YES-block
-  block "This turn asserts a verdict (triage: YES) but no audited
-dossier backs it. A claim stated as established needs proof attached.
-$(verdict_instruction)"
+  block_with_verdict_instruction "This turn asserts a verdict (triage: YES) but no audited
+dossier backs it. A claim stated as established needs proof attached."
 fi
 
 # Triage UNKNOWN (no model reachable) → deterministic pattern fallback.
@@ -801,6 +1415,5 @@ if [[ -z "$matched" ]]; then
 fi
 
 log_decision regex match-block
-block "This turn asserts a verdict (matched: \"${matched}\") but no audited
-dossier backs it. A claim stated as established needs proof attached.
-$(verdict_instruction)"
+block_with_verdict_instruction "This turn asserts a verdict (matched: \"${matched}\") but no audited
+dossier backs it. A claim stated as established needs proof attached."

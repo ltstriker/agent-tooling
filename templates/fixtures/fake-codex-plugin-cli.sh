@@ -49,7 +49,7 @@ elif [[ "$1 $2 $3" == "plugin marketplace add" ]]; then
   fi
   [[ -e "$state/marketplace" ]] || printf 'added\n' >> "$state/marketplace-additions"
   touch "$state/marketplace"
-  version="${FAKE_CODEX_MARKETPLACE_VERSION:-0.1.4}"
+  version="${FAKE_CODEX_MARKETPLACE_VERSION:-0.1.5}"
   printf '%s\n' "$version" > "$state/marketplace-version"
   write_marketplace_plugin_manifest "$version"
   printf '{"name":"boxlite-agent-tooling","alreadyAdded":false}\n'
@@ -58,7 +58,7 @@ elif [[ "$*" == "plugin marketplace upgrade boxlite-agent-tooling --json" ]]; th
     printf 'fixture marketplace upgrade failure\n' >&2
     exit 1
   }
-  version="${FAKE_CODEX_MARKETPLACE_VERSION:-0.1.4}"
+  version="${FAKE_CODEX_MARKETPLACE_VERSION:-0.1.5}"
   printf '%s\n' "$version" > "$state/marketplace-version"
   [[ "${FAKE_CODEX_FALSE_SUCCESS_MARKETPLACE_MANIFEST:-0}" == 1 ]] \
     || write_marketplace_plugin_manifest "$version"
@@ -80,7 +80,7 @@ elif [[ "$1 $2" == "plugin list" ]]; then
   [[ ! -e "$state/plugin-installed" ]] || installed=true
   [[ ! -e "$state/plugin-enabled" ]] || enabled=true
   if [[ "$installed" == true ]]; then
-    version="$(head -n1 "$state/plugin-version" 2>/dev/null || printf '0.1.4')"
+    version="$(head -n1 "$state/plugin-version" 2>/dev/null || printf '0.1.5')"
     if [[ "${FAKE_CODEX_INSTALLED_VERSION_NULL:-0}" == 1 ]]; then
       version_json=null
     else

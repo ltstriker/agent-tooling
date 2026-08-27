@@ -8,6 +8,7 @@ set -euo pipefail
 
 repo_root="${1:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 [[ -n "$repo_root" ]] || { printf 'agent-tooling: run inside a Git repository or pass its root\n' >&2; exit 2; }
+command -v perl >/dev/null 2>&1 || { printf 'agent-tooling: perl is required\n' >&2; exit 1; }
 profile_file="$repo_root/.agent-tooling/profile.json"
 [[ -r "$profile_file" ]] || { printf 'agent-tooling: missing %s\n' "$profile_file" >&2; exit 1; }
 

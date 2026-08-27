@@ -199,12 +199,12 @@ routing="$(
   subagent_instruction --agent verdict-auditor --root "$PLUGIN" --task audit
 )"
 case "$routing" in
-  *"Task(subagent_type='$plugin_name:verdict-auditor'"*)
+  *"Task(subagent_type=\"$plugin_name:verdict-auditor\""*)
     ok "claude route scopes the agent with the manifest name" ;;
   *) bad "claude route scopes the agent with the manifest name" ;;
 esac
 case "$routing" in
-  *"task_name='verdict_auditor'"*"$PLUGIN/.claude/agents/verdict-auditor.md"*)
+  *'task_name="verdict_auditor"'*"$PLUGIN/.claude/agents/verdict-auditor.md"*)
     ok "codex route normalizes task_name but preserves the spec path" ;;
   *) bad "codex route normalizes task_name but preserves the spec path" ;;
 esac
@@ -238,6 +238,19 @@ flattened="$(jq -r '[.hooks[][] | select((.hooks | type) != "array" or (.hooks |
 nontype="$(jq -r '[.hooks[][].hooks[] | select(.type != "command")] | length' "$HOOKS")"
 [ "$nontype" = "0" ] && ok "every hook object is type command" \
                      || bad "every hook object is type command ($nontype are not)"
+
+# UserPromptSubmit has two independent responsibilities. Cancellation must not be
+# hidden inside rule-recency.sh: that script's cross-host contract is a pure text
+# injector, and its bare-ack fast path includes exactly the prompts ("stop", "nvm")
+# that still need to cancel an obsolete audit.
+user_prompt_commands="$(jq -r '.hooks.UserPromptSubmit[].hooks[].command' "$HOOKS")"
+user_prompt_count="$(printf '%s\n' "$user_prompt_commands" | grep -c . || true)"
+[ "$user_prompt_count" = "2" ] && ok "UserPromptSubmit wires cancellation and recency separately" \
+                                  || bad "UserPromptSubmit wires cancellation and recency separately (got $user_prompt_count commands)"
+case "$user_prompt_commands" in
+  *cancel-verdict-audit.sh*rule-recency.sh*) ok "verdict cancellation is declared beside the pure recency hook" ;;
+  *) bad "verdict cancellation is declared beside the pure recency hook" ;;
+esac
 
 echo
 echo "## Every wired command runs on either host"
