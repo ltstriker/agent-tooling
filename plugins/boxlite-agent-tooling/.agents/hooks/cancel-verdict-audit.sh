@@ -72,7 +72,10 @@ if ! session_scope="$(verdict_audit_scope_from_hook_payload \
   exit 1
 fi
 state_dir="$project_dir/.agents/state"
-[[ -d "$state_dir" ]] || exit 0
+if ! mkdir -p "$state_dir" 2>/dev/null; then
+  printf 'cancel-verdict-audit.sh: could not create runtime state directory.\n' >&2
+  exit 2
+fi
 audit_request_file="$(verdict_audit_state_path "$state_dir/verdict-request" "$session_scope")"
 audit_publish_mutex_file="${audit_request_file}.publish.mutex"
 audit_decision_mutex_file="${audit_request_file}.decision.mutex"
@@ -83,6 +86,14 @@ previous_verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.prev.
 last_uuid_file="$(verdict_audit_state_path "$state_dir/verdict-last-uuid" "$session_scope")"
 payload_transcript_file="$(verdict_audit_state_path "$state_dir/verdict-stop-message.jsonl" "$session_scope")"
 prompt_epoch_file="$(verdict_audit_state_path "$state_dir/verdict-prompt-epoch" "$session_scope")"
+old_prompt_epoch="-"
+if [[ -e "$prompt_epoch_file" || -L "$prompt_epoch_file" ]]; then
+  # The repair path below already replaces unsafe epoch path types. Such state cannot
+  # authorize an override selection, so carry an impossible old epoch into the control
+  # transition rather than failing before the established cancellation repair runs.
+  old_prompt_epoch="$(verdict_audit_read_single_record "$prompt_epoch_file" 2>/dev/null)" \
+    || old_prompt_epoch="invalid"
+fi
 
 # Persist the steer before touching any mutex. A Stop invocation snapshots this token on
 # entry and refuses every later authority mutation when it changes, so cancellation stays
@@ -203,4 +214,22 @@ if [[ "$prompt_epoch_written" != true ]]; then
   # still recreate authority after this cleanup pass.
   exit 2
 fi
+
+# The same UserPromptSubmit edge owns override activation and revocation. Keeping it in
+# this hook (rather than a second matching hook) is required because Codex launches
+# matching command hooks concurrently: only this process knows the exact old/new epoch
+# pair that makes a late selection lose to terminal audit completion.
+auditor_control="$tooling_root/.agents/hooks/auditor-control.sh"
+if [[ ! -r "$auditor_control" ]]; then
+  printf 'cancel-verdict-audit.sh: missing %s — cannot update auditor override state.\n' \
+    "$auditor_control" >&2
+  exit 2
+fi
+if ! auditor_control_output="$(printf '%s' "$payload" \
+    | CLAUDE_PROJECT_DIR="$project_dir" bash "$auditor_control" \
+        handle-prompt "$old_prompt_epoch" "$prompt_epoch" 2>/dev/null)"; then
+  printf 'cancel-verdict-audit.sh: could not update auditor override state.\n' >&2
+  exit 2
+fi
+[[ -z "$auditor_control_output" ]] || printf '%s\n' "$auditor_control_output"
 exit 0

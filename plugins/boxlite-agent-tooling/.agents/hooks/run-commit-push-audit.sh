@@ -21,7 +21,28 @@ audit_file="$project_dir/.agents/state/last-audit.json"
 # trap a no-op on paths that never create a dir; the `:-` only guards that init
 # being dropped later.
 audit_tmp_dir=""
-trap 'rm -rf "${audit_tmp_dir:-}"' EXIT
+auditor_control="$tooling_root/.agents/hooks/auditor-control.sh"
+verdict_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+auditor_control_started=false
+auditor_control_terminal=unavailable
+auditor_generation=""
+
+cleanup_runner() {
+  local original_status=$?
+  trap - EXIT
+  if [[ "$auditor_control_started" == true ]]; then
+    if ! CLAUDE_PROJECT_DIR="$project_dir" bash "$auditor_control" external-stop \
+        commit-push-auditor "$auditor_generation" "$AUDITOR_SESSION_SCOPE" \
+        "$auditor_control_terminal" >/dev/null 2>&1; then
+      rm -f "$audit_file"
+      printf 'run-commit-push-audit: could not close auditor prompt state.\n' >&2
+      original_status=2
+    fi
+  fi
+  rm -rf "${audit_tmp_dir:-}"
+  exit "$original_status"
+}
+trap cleanup_runner EXIT
 schema_file="$tooling_root/.agents/hooks/commit-push-audit.schema.json"
 mkdir -p "$(dirname "$audit_file")"
 
@@ -122,9 +143,37 @@ write_audit() {
 write_fail() {
   findings=("$@")
   write_audit "FAIL" "$(findings_json)"
+  auditor_control_terminal=FAIL
   printf 'codex audit %s: FAIL\n' "$kind"
   printf '%s\n' "${findings[@]}" >&2
   exit 1
+}
+
+start_auditor_control() {
+  local configured_scope="${AUDITOR_SESSION_SCOPE:-}"
+  local configured_epoch="${AUDITOR_PROMPT_EPOCH:-}" current_epoch
+  if [[ -z "$configured_scope" && -z "$configured_epoch" ]]; then
+    return 0
+  fi
+  if [[ ! "$configured_scope" =~ ^git-[0-9a-f]{40}([0-9a-f]{24})?$ \
+       || ! "$configured_epoch" =~ ^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$ \
+       || ! -r "$verdict_state_lib" || ! -r "$auditor_control" ]]; then
+    write_fail "Internal: invalid or unavailable auditor lifecycle context"
+  fi
+  # shellcheck source=../lib/verdict-audit-state.sh
+  source "$verdict_state_lib"
+  current_epoch="$(verdict_audit_read_single_record \
+    "$project_dir/.agents/state/verdict-prompt-epoch.$configured_scope" 2>/dev/null)" \
+    || write_fail "Internal: auditor lifecycle prompt epoch is unavailable"
+  [[ "$current_epoch" == "$configured_epoch" ]] \
+    || write_fail "Internal: auditor lifecycle prompt epoch is stale"
+  auditor_generation="$command_hash"
+  if ! CLAUDE_PROJECT_DIR="$project_dir" bash "$auditor_control" external-start \
+      commit-push-auditor "$auditor_generation" "$configured_scope" \
+      "$configured_epoch" >/dev/null 2>&1; then
+    write_fail "Internal: could not start auditor lifecycle control"
+  fi
+  auditor_control_started=true
 }
 
 valid_push_audit_context() {
@@ -461,6 +510,8 @@ normalize_agentic_output() {
     write_fail "Internal: Codex audit returned FAIL without findings"
   fi
 
+  auditor_control_terminal="$audit_verdict"
+
   # Whitelist: a field omitted here is dropped silently, which for `advisories` would
   # look like the model never reported any.
   jq -c '{branch, head, command_kind, diff_hash, command_hash, commit_subject_hash, verdict, findings, advisories: (.advisories // [])}' "$raw_file" > "$audit_file"
@@ -515,6 +566,11 @@ run_agentic_audit() {
   if ! prompt_text="$(build_prompt 2>"$prompt_err")"; then
     write_fail "$(head -1 "$prompt_err" 2>/dev/null || printf 'Internal: could not build the audit prompt')"
   fi
+
+  # Native subagents are covered by SubagentStart/SubagentStop. This is the matching
+  # lifecycle edge for the headless Codex process, after local validation and prompt
+  # construction but before the external auditor actually begins.
+  start_auditor_control
 
   if ! printf '%s' "$prompt_text" | CODEX_AUDIT_HOOK=1 "$codex_bin" \
       --ask-for-approval never \

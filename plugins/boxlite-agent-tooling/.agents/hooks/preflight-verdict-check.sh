@@ -168,13 +168,15 @@ repo_root="$(cd "$repo_root" && pwd -P)"
 project_dir="$repo_root"
 tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 audit_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
-if [[ ! -r "$audit_state_lib" ]]; then
-  printf 'preflight-verdict-check: missing %s — cannot scope verdict state.\n' \
-    "$audit_state_lib" >&2
+override_state_lib="$tooling_root/.agents/lib/auditor-override-state.sh"
+if [[ ! -r "$audit_state_lib" || ! -r "$override_state_lib" ]]; then
+  printf 'preflight-verdict-check: shared audit state libraries are unavailable.\n' >&2
   exit 1
 fi
 # shellcheck source=../lib/verdict-audit-state.sh
 source "$audit_state_lib"
+# shellcheck source=../lib/auditor-override-state.sh
+source "$override_state_lib"
 if [[ "$has_session_id" == "true" ]]; then
   if ! session_scope="$(verdict_audit_scope_from_hook_payload \
       "$payload" "$project_dir" 2>/dev/null)"; then
@@ -361,6 +363,23 @@ compute_tree_hash() {
   GIT_INDEX_FILE="$idx" git -C "$repo_root" write-tree 2>/dev/null
   rm -f "$idx"
 }
+
+# A prompt-scoped user decision is a gate outcome, never an auditor verdict. It is
+# checked before dossier consumption so a valid override can release a retained FAIL,
+# but it writes only an OVERRIDDEN use record and never changes the dossier schema.
+if [[ "$session_scope" != "-" ]] \
+   && auditor_override_load_valid_grant \
+        "$repo_root" "$session_scope" "$entry_prompt_epoch"; then
+  override_tree_hash="$(compute_tree_hash)"
+  override_context_hash="$(printf '%s\n%s\n%s\n' "$branch" "$head" "$override_tree_hash" \
+    | shasum -a 256 | awk '{print $1}')"
+  if ! auditor_override_log_use "$repo_root" "$session_scope" stop \
+      "$override_context_hash" >/dev/null 2>&1; then
+    block "Auditor override evidence could not be recorded; the verdict gate remains closed."
+  fi
+  log_decision override overridden-allow
+  allow_with_note "[verdict-gate] OVERRIDDEN BY USER for this prompt; auditor PASS was not asserted"
+fi
 
 # ALL assistant text of the FINAL TURN — every text block emitted since the last
 # real user message — from the session transcript (JSONL). Turn-level, not

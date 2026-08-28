@@ -187,6 +187,12 @@ for spec in "$PLUGIN"/.claude/agents/*.md; do
 done
 [ "$found" -gt 0 ] && ok "agent specs exist ($found specs)" \
                    || bad "agent specs exist"
+known_auditors="$("$PLUGIN/.agents/hooks/auditor-control.sh" --known-auditors 2>/dev/null | sort)"
+shipped_auditors="$(find "$PLUGIN/.claude/agents" -maxdepth 1 -name '*-auditor.md' \
+  -exec basename {} .md \; | sort)"
+[ "$known_auditors" = "$shipped_auditors" ] \
+  && ok "every shipped auditor has override control mapping" \
+  || bad "every shipped auditor has override control mapping (known: ${known_auditors:-none})"
 # The deliberate asymmetry, pinned so nobody "fixes" it into a silent Codex failure.
 jq -e 'has("agents") | not' "$CODEX" >/dev/null 2>&1 \
   && ok "codex manifest declares no agents key (specs travel by path — see header)" \
@@ -228,7 +234,7 @@ unknown="$(jq -r '
     (.hooks | keys_unsorted[] | select(test("^[A-Z][A-Za-z]*$") | not)),
     (.hooks[][] | keys_unsorted[] | select(IN("hooks","matcher") | not)),
     (.hooks[][].hooks[] | keys_unsorted[]
-       | select(IN("type","command","statusMessage","timeout") | not))
+       | select(IN("type","command","statusMessage","timeout","async") | not))
   ] | join(",")' "$HOOKS" 2>/dev/null)"
 [ -z "$unknown" ] && ok "no unknown keys at any depth" \
                   || bad "no unknown keys at any depth (found: $unknown)"

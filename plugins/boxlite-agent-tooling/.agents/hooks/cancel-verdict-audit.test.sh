@@ -85,13 +85,14 @@ tree_hash_of() {
   rm -f "$idx"
 }
 
-echo "## No state and unsafe state are silent no-ops"
+echo "## Fresh and unsafe state fail closed without losing prompt scope"
 R="$(setup)"
 rm -rf "$R/.agents/state"
 absent_out="$(prompt_hook "$R" session-a turn-a 2>"$R/absent.err")"; absent_rc=$?
-absent_state="rc=$absent_rc stdout=${absent_out:-} stderr=$(cat "$R/absent.err") dir=$([[ -d "$R/.agents/state" ]] && echo present || echo absent)"
-check_eq "an absent runtime-state directory is a silent no-op" "$absent_state" \
-  "rc=0 stdout= stderr= dir=absent"
+fresh_epoch="$(session_state_path "$R" verdict-prompt-epoch session-a)"
+absent_state="rc=$absent_rc stdout=${absent_out:-} stderr=$(cat "$R/absent.err") dir=$([[ -d "$R/.agents/state" ]] && echo present || echo absent) epoch=$([[ -s "$fresh_epoch" ]] && echo present || echo absent)"
+check_eq "the first prompt creates runtime state and a prompt epoch" "$absent_state" \
+  "rc=0 stdout= stderr= dir=present epoch=present"
 mkdir -p "$R/.agents/state"
 out="$(prompt_hook "$R" session-a turn-a 2>"$R/hook.err")"; rc=$?
 check_eq "no lock -> exit 0" "$rc" 0

@@ -152,6 +152,42 @@ the already-running parent process. `/reload-plugins` is therefore the final one
 step; later valid starts are silent. Repository trust remains a human decision and is
 not pre-approved by these files.
 
+### Long-running auditor choice
+
+`commit-push-auditor` and `verdict-auditor` run normally for their first 30 seconds.
+After that, an asynchronous lifecycle hook publishes one prompt state for the exact
+session, prompt epoch, auditor, and audit generation. The choices are:
+
+- keep waiting (recommended),
+- override both auditors for this prompt, or
+- cancel the task.
+
+Doing nothing leaves the audit running. A terminal auditor result closes the prompt;
+a selection racing a terminal result loses and is ignored. Hosts that render richer UI
+can watch `.agents/state/auditor-control/events.<session-scope>.jsonl` and the adjacent
+`prompt.*.json` records to display and close a card. Current portable hooks surface the
+same choice as a non-blocking status message at the next safe conversation point; they
+do not expose an API that opens and closes a native question card directly.
+The host submits a card choice by piping
+`{"session_id":"...","choice":"keep_waiting|override_all|cancel_task","reason":"..."}`
+to `.agents/hooks/auditor-control.sh select`. Its response resolves the card; on
+`cancel-task`, the host must also cancel the owning task because repository hooks cannot
+terminate host-managed work themselves.
+
+For headless or accessibility use, submit this as the first non-empty prompt line:
+
+```text
+force-pass-auditors: <required reason>
+```
+
+The override is bound to the canonical repository, host session, and new prompt epoch,
+expires within one hour, and is revoked by the next real prompt. Runtime state stores a
+nonce hash and reason hash, not the bearer or reason. Gate-use logs say `OVERRIDDEN` and
+bind commit, push, and Stop uses to their actual diff/subject/tree context. No PASS
+dossier is created or rewritten. Installation and guidance checks, PR-review
+acknowledgement, chained framework hooks, exact push-ref calculation, PR watching,
+host permissions, and remote protections remain in force.
+
 ## Shared engineering guidance
 
 `plugins/boxlite-agent-tooling/guidance/workflow.md` is the canonical, domain-neutral
