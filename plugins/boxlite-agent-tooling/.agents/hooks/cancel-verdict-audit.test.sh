@@ -13,6 +13,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNNER="$REPO_ROOT/.agents/hooks/run-verdict-audit.sh"
 HOOK="$REPO_ROOT/.agents/hooks/cancel-verdict-audit.sh"
+CONTROL="$REPO_ROOT/.agents/hooks/auditor-control.sh"
 PREFLIGHT="$REPO_ROOT/.agents/hooks/preflight-verdict-check.sh"
 
 pass=0
@@ -93,6 +94,274 @@ fresh_epoch="$(session_state_path "$R" verdict-prompt-epoch session-a)"
 absent_state="rc=$absent_rc stdout=${absent_out:-} stderr=$(cat "$R/absent.err") dir=$([[ -d "$R/.agents/state" ]] && echo present || echo absent) epoch=$([[ -s "$fresh_epoch" ]] && echo present || echo absent)"
 check_eq "the first prompt creates runtime state and a prompt epoch" "$absent_state" \
   "rc=0 stdout= stderr= dir=present epoch=present"
+
+echo "## Claude auditor wake notifications are generation-bound"
+wake_start="$(jq -nc --arg s session-a --arg id wake-audit \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+wake_rc=0
+printf '%s' "$wake_start" | (
+  cd "$R" && env -u PLUGIN_ROOT CLAUDE_PROJECT_DIR="$R" \
+    CLAUDE_PLUGIN_ROOT="$REPO_ROOT" AUDITOR_PROMPT_AFTER_SECONDS=0 bash "$CONTROL"
+) > "$R/wake.out" 2> "$R/wake.err" || wake_rc=$?
+wake_marker="$(sed -n 's/.*\(\[auditor-wake:[0-9a-f][0-9a-f]*\]\).*/\1/p' "$R/wake.err" | head -1)"
+wake_request="$(session_state_path "$R" verdict-request session-a)"
+printf 'keep\n' > "$wake_request"
+wake_epoch_before="$(cat "$fresh_epoch")"
+wake_prompt="$(printf '<task-notification>\n<summary>%s</summary>\n</task-notification>' "$wake_marker")"
+wake_payload="$(jq -nc --arg s session-a --arg p "$wake_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+wake_out="$(printf '%s' "$wake_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") 2>"$R/wake-cancel.err")"
+wake_cancel_rc=$?
+check_eq "a valid one-time wake marker preserves the active audit before transcript publication" \
+  "start_rc=$wake_rc marker=$([[ "$wake_marker" =~ ^\[auditor-wake:[0-9a-f]{64}\]$ ]] && echo valid || echo invalid) cancel_rc=$wake_cancel_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$wake_epoch_before" ]] && echo same || echo changed) stdout=${wake_out:-} stderr=$(cat "$R/wake-cancel.err")" \
+  "start_rc=2 marker=valid cancel_rc=0 request=present epoch=same stdout= stderr="
+
+wake_stop="$(jq -nc --arg s session-a --arg id wake-audit \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$wake_stop" | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+completion_epoch_before="$(cat "$fresh_epoch")"
+completion_prompt=$'<task-notification>\n<task-id>wake-audit</task-id>\n<status>completed</status>\n</task-notification>'
+completion_payload="$(jq -nc --arg s session-a --arg p "$completion_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+completion_out="$(printf '%s' "$completion_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") 2>"$R/completion.err")"
+completion_rc=$?
+check_eq "the matching one-time auditor completion notification preserves the prompt epoch" \
+  "rc=$completion_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$completion_epoch_before" ]] && echo same || echo changed) stdout=${completion_out:-} stderr=$(cat "$R/completion.err")" \
+  "rc=0 request=present epoch=same stdout= stderr="
+
+reused_epoch_before="$(cat "$fresh_epoch")"
+reused_out="$(printf '%s' "$wake_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") 2>"$R/reused-wake.err")"
+reused_rc=$?
+check_eq "a marker cannot be reused after its auditor reaches a terminal result" \
+  "rc=$reused_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$reused_epoch_before" ]] && echo same || echo changed) stdout=${reused_out:-} stderr=$(cat "$R/reused-wake.err")" \
+  "rc=0 request=gone epoch=changed stdout= stderr="
+
+printf 'keep\n' > "$wake_request"
+forged_epoch_before="$(cat "$fresh_epoch")"
+forged_wake_payload="$(printf '%s' "$wake_payload" | jq -c \
+  '.prompt |= sub("auditor-wake:[0-9a-f]+"; "auditor-wake:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")')"
+forged_wake_out="$(printf '%s' "$forged_wake_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") 2>"$R/forged-wake.err")"
+forged_wake_rc=$?
+check_eq "a forged wake marker is still a new prompt" \
+  "rc=$forged_wake_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$forged_epoch_before" ]] && echo same || echo changed) stdout=${forged_wake_out:-} stderr=$(cat "$R/forged-wake.err")" \
+  "rc=0 request=gone epoch=changed stdout= stderr="
+
+late_wake_start="$(jq -nc --arg s session-a --arg id late-wake-audit \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+late_wake_rc=0
+printf '%s' "$late_wake_start" | (
+  cd "$R" && env -u PLUGIN_ROOT CLAUDE_PROJECT_DIR="$R" \
+    CLAUDE_PLUGIN_ROOT="$REPO_ROOT" AUDITOR_PROMPT_AFTER_SECONDS=0 bash "$CONTROL"
+) > "$R/late-wake.out" 2> "$R/late-wake.err" || late_wake_rc=$?
+late_wake_marker="$(sed -n 's/.*\(\[auditor-wake:[0-9a-f][0-9a-f]*\]\).*/\1/p' \
+  "$R/late-wake.err" | head -1)"
+late_wake_stop="$(jq -nc --arg s session-a --arg id late-wake-audit \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$late_wake_stop" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+prompt_hook "$R" session-a intervening-human-prompt >/dev/null
+late_wake_epoch_before="$(cat "$fresh_epoch")"
+printf 'new-audit\n' > "$wake_request"
+late_wake_prompt="$(printf '<task-notification>\n<summary>%s</summary>\n</task-notification>' \
+  "$late_wake_marker")"
+late_wake_payload="$(jq -nc --arg s session-a --arg p "$late_wake_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+late_wake_out="$(printf '%s' "$late_wake_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") 2>"$R/late-wake-cancel.err")"
+late_wake_cancel_rc=$?
+check_eq "a queued wake remains internal after terminal state and a newer human prompt" \
+  "start_rc=$late_wake_rc marker=$([[ "$late_wake_marker" =~ ^\[auditor-wake:[0-9a-f]{64}\]$ ]] && echo valid || echo invalid) cancel_rc=$late_wake_cancel_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$late_wake_epoch_before" ]] && echo same || echo changed) stdout=${late_wake_out:-} stderr=$(cat "$R/late-wake-cancel.err")" \
+  "start_rc=2 marker=valid cancel_rc=0 request=present epoch=same stdout= stderr="
+
+late_completion_start="$(jq -nc --arg s session-a --arg id late-completion-audit \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+printf '%s' "$late_completion_start" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" AUDITOR_PROMPT_AFTER_SECONDS=0 \
+      bash "$CONTROL") >/dev/null
+late_completion_stop="$(jq -nc --arg s session-a --arg id late-completion-audit \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$late_completion_stop" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+prompt_hook "$R" session-a another-human-prompt >/dev/null
+late_completion_epoch_before="$(cat "$fresh_epoch")"
+printf 'newer-audit\n' > "$wake_request"
+late_completion_prompt=$'<task-notification>\n<task-id>late-completion-audit</task-id>\n<status>completed</status>\n</task-notification>'
+late_completion_payload="$(jq -nc --arg s session-a --arg p "$late_completion_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+late_completion_out="$(printf '%s' "$late_completion_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") \
+      2>"$R/late-completion-cancel.err")"
+late_completion_rc=$?
+check_eq "a queued completion remains internal after a newer human prompt" \
+  "rc=$late_completion_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$late_completion_epoch_before" ]] && echo same || echo changed) stdout=${late_completion_out:-} stderr=$(cat "$R/late-completion-cancel.err")" \
+  "rc=0 request=present epoch=same stdout= stderr="
+
+pre_escalation_start="$(jq -nc --arg s session-a --arg id pre-escalation-audit \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+printf '%s' "$pre_escalation_start" | (
+  cd "$R" && env -u PLUGIN_ROOT CLAUDE_PROJECT_DIR="$R" \
+    CLAUDE_PLUGIN_ROOT="$REPO_ROOT" AUDITOR_PROMPT_AFTER_SECONDS=2 bash "$CONTROL"
+) > "$R/pre-escalation.out" 2> "$R/pre-escalation.err" &
+pre_escalation_start_pid=$!
+pre_escalation_active="$R/.agents/state/auditor-control/active.$(session_scope_of "$R" session-a).verdict-auditor.json"
+for _ in $(seq 1 100); do
+  [[ -s "$pre_escalation_active" ]] && break
+  sleep 0.01
+done
+prompt_hook "$R" session-a prompt-before-escalation >/dev/null
+pre_escalation_epoch_before="$(cat "$fresh_epoch")"
+printf 'newest-audit\n' > "$wake_request"
+pre_escalation_stop="$(jq -nc --arg s session-a --arg id pre-escalation-audit \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$pre_escalation_stop" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+pre_escalation_prompt=$'<task-notification>\n<task-id>pre-escalation-audit</task-id>\n<status>completed</status>\n</task-notification>'
+pre_escalation_payload="$(jq -nc --arg s session-a --arg p "$pre_escalation_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+pre_escalation_out="$(printf '%s' "$pre_escalation_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") \
+      2>"$R/pre-escalation-completion.err")"
+pre_escalation_rc=$?
+wait "$pre_escalation_start_pid" 2>/dev/null || true
+check_eq "a pre-escalation audit completing after a newer prompt stays internal" \
+  "rc=$pre_escalation_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$pre_escalation_epoch_before" ]] && echo same || echo changed) stdout=${pre_escalation_out:-} stderr=$(cat "$R/pre-escalation-completion.err")" \
+  "rc=0 request=present epoch=same stdout= stderr="
+
+repeated_start="$(jq -nc --arg s session-a --arg id repeated-audit \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+repeated_stop="$(jq -nc --arg s session-a --arg id repeated-audit \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+for _ in 1 2; do
+  printf '%s' "$repeated_start" \
+    | (cd "$R" && CLAUDE_PROJECT_DIR="$R" AUDITOR_PROMPT_AFTER_SECONDS=0 \
+        bash "$CONTROL") >/dev/null
+  printf '%s' "$repeated_stop" \
+    | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+done
+repeated_prompt=$'<task-notification>\n<task-id>repeated-audit</task-id>\n<status>completed</status>\n</task-notification>'
+repeated_payload="$(jq -nc --arg s session-a --arg p "$repeated_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+repeated_epoch_before="$(cat "$fresh_epoch")"
+printf 'repeated-new-audit\n' > "$wake_request"
+for _ in 1 2; do
+  printf '%s' "$repeated_payload" \
+    | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") >/dev/null
+done
+check_eq "each repeated stop retains one completion-notification credit" \
+  "request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$repeated_epoch_before" ]] && echo same || echo changed)" \
+  "request=present epoch=same"
+
+control_scope="$(session_scope_of "$R" session-a)"
+overlap_old_start="$(jq -nc --arg s session-a --arg id overlap-old \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+overlap_new_start="$(jq -nc --arg s session-a --arg id overlap-new \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+printf '%s' "$overlap_old_start" | (
+  cd "$R" && CLAUDE_PROJECT_DIR="$R" AUDITOR_PROMPT_AFTER_SECONDS=2 bash "$CONTROL"
+) >/dev/null & overlap_old_pid=$!
+overlap_active="$R/.agents/state/auditor-control/active.$control_scope.verdict-auditor.json"
+for _ in $(seq 1 100); do
+  [[ "$(jq -r '.generation // ""' "$overlap_active" 2>/dev/null)" == overlap-old ]] && break
+  sleep 0.01
+done
+printf '%s' "$overlap_new_start" | (
+  cd "$R" && CLAUDE_PROJECT_DIR="$R" AUDITOR_PROMPT_AFTER_SECONDS=2 bash "$CONTROL"
+) >/dev/null & overlap_new_pid=$!
+for _ in $(seq 1 100); do
+  [[ "$(jq -r '.generation // ""' "$overlap_active" 2>/dev/null)" == overlap-new ]] && break
+  sleep 0.01
+done
+overlap_old_stop="$(jq -nc --arg s session-a --arg id overlap-old \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$overlap_old_stop" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+printf 'overlap-new-request\n' > "$wake_request"
+overlap_epoch_before="$(cat "$fresh_epoch")"
+overlap_prompt=$'<task-notification>\n<task-id>overlap-old</task-id>\n<status>completed</status>\n</task-notification>'
+overlap_payload="$(jq -nc --arg s session-a --arg p "$overlap_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+printf '%s' "$overlap_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") >/dev/null
+check_eq "a replaced pre-escalation generation retains its completion credit" \
+  "request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$overlap_epoch_before" ]] && echo same || echo changed)" \
+  "request=present epoch=same"
+overlap_new_stop="$(jq -nc --arg s session-a --arg id overlap-new \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$overlap_new_stop" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+wait "$overlap_old_pid" "$overlap_new_pid" 2>/dev/null || true
+
+printf 'forged-completion-request\n' > "$wake_request"
+forged_completion_epoch_before="$(cat "$fresh_epoch")"
+forged_completion_generation=forged-completion
+forged_completion_file="$R/.agents/state/auditor-control/completion.$control_scope.not-an-auditor.$forged_completion_generation.json"
+jq -nc --arg scope "$control_scope" --arg generation "$forged_completion_generation" \
+  --argjson now "$(date +%s)" \
+  '{auditor:"not-an-auditor",generation:$generation,session_scope:$scope,
+    created_at:$now,remaining:1}' > "$forged_completion_file"
+forged_completion_prompt="$(printf '<task-notification>\n<task-id>%s</task-id>\n<status>completed</status>\n</task-notification>' \
+  "$forged_completion_generation")"
+forged_completion_payload="$(jq -nc --arg s session-a --arg p "$forged_completion_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+printf '%s' "$forged_completion_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") >/dev/null
+check_eq "an unknown-auditor completion cache cannot suppress a real prompt" \
+  "request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$forged_completion_epoch_before" ]] && echo same || echo changed)" \
+  "request=gone epoch=changed"
+
+tailed_start="$(jq -nc --arg s session-a --arg id tailed-audit \
+  '{hook_event_name:"SubagentStart",session_id:$s,agent_id:$id,agent_type:"verdict-auditor"}')"
+tailed_stop="$(jq -nc --arg s session-a --arg id tailed-audit \
+  '{hook_event_name:"SubagentStop",session_id:$s,agent_id:$id,agent_type:"verdict-auditor",last_assistant_message:"PASS"}')"
+printf '%s' "$tailed_start" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" AUDITOR_PROMPT_AFTER_SECONDS=0 \
+      bash "$CONTROL") >/dev/null
+printf '%s' "$tailed_stop" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$CONTROL") >/dev/null
+printf 'tailed-audit-request\n' > "$wake_request"
+tailed_epoch_before="$(cat "$fresh_epoch")"
+tailed_prompt=$'<task-notification>\n<task-id>tailed-audit</task-id>\n<status>completed</status>\n</task-notification>\nreal user request'
+tailed_payload="$(jq -nc --arg s session-a --arg p "$tailed_prompt" \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
+tailed_out="$(printf '%s' "$tailed_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" bash "$HOOK") 2>"$R/tailed.err")"
+tailed_rc=$?
+check_eq "text after a task-notification envelope remains a real user prompt" \
+  "rc=$tailed_rc request=$([[ -e "$wake_request" ]] && echo present || echo gone) epoch=$([[ "$(cat "$fresh_epoch")" == "$tailed_epoch_before" ]] && echo same || echo changed) stdout=${tailed_out:-} stderr=$(cat "$R/tailed.err")" \
+  "rc=0 request=gone epoch=changed stdout= stderr="
+
+control_scope="$(session_scope_of "$R" session-a)"
+malformed_active="$R/.agents/state/auditor-control/active.$control_scope.verdict-auditor.json"
+printf '{not-json\n' > "$malformed_active"
+malformed_epoch_before="$(cat "$fresh_epoch")"
+malformed_out="$(prompt_hook "$R" session-a malformed-control-state 2>"$R/malformed-control.err")"
+malformed_rc=$?
+rm -f "$malformed_active"
+check_eq "malformed non-authorizing auditor cache cannot block a real user prompt" \
+  "rc=$malformed_rc epoch=$([[ "$(cat "$fresh_epoch")" == "$malformed_epoch_before" ]] && echo same || echo changed) stdout=${malformed_out:-} stderr=$(cat "$R/malformed-control.err")" \
+  "rc=0 epoch=changed stdout= stderr="
+
+unsafe_escalation="$R/.agents/state/auditor-control/escalation.$control_scope.verdict-auditor.unsafe.json"
+mkfifo "$R/unsafe-escalation-fifo"
+ln -s "$R/unsafe-escalation-fifo" "$unsafe_escalation"
+unsafe_escalation_payload="$(jq -nc --arg s session-a \
+  '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:"ok"}')"
+unsafe_escalation_started="$(date +%s)"
+printf '%s' "$unsafe_escalation_payload" | (cd "$R" && CLAUDE_PROJECT_DIR="$R" \
+  perl -e 'alarm 5; exec @ARGV' bash "$HOOK") >/dev/null 2>"$R/unsafe-escalation.err"
+unsafe_escalation_rc=$?
+unsafe_escalation_elapsed="$(( $(date +%s) - unsafe_escalation_started ))"
+unsafe_escalation_state="rc=$unsafe_escalation_rc bounded=no stderr=$(cat "$R/unsafe-escalation.err")"
+(( unsafe_escalation_elapsed <= 2 )) \
+  && unsafe_escalation_state="rc=$unsafe_escalation_rc bounded=yes stderr=$(cat "$R/unsafe-escalation.err")"
+check_eq "unsafe non-authorizing escalation cache cannot stall a real user prompt" \
+  "$unsafe_escalation_state" "rc=0 bounded=yes stderr="
+rm -f "$unsafe_escalation" "$R/unsafe-escalation-fifo"
+
 mkdir -p "$R/.agents/state"
 out="$(prompt_hook "$R" session-a turn-a 2>"$R/hook.err")"; rc=$?
 check_eq "no lock -> exit 0" "$rc" 0

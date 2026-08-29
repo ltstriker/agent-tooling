@@ -1,6 +1,9 @@
 # Agent Tooling Development
 
 - Keep reusable implementation in `plugins/boxlite-agent-tooling/`.
+- When changing non-trivial Bash hooks, gates, or libraries, load
+  `plugins/boxlite-agent-tooling/.agents/skills/shell-engineering/SKILL.md` and
+  preserve the executable's host-facing stdin/stdout/stderr/exit contract.
 - Keep consumer manifests declarative and free of secrets.
 - Preserve fail-closed validation: invalid profiles and missing dependencies
   must write a clear error to stderr and exit nonzero.
@@ -21,6 +24,9 @@
 - Host-specific assets reach the generic layout through symlinks: `skills` ->
   `.agents/skills` and `agents` -> `.claude/agents`. Add a host by pointing a manifest
   at those names, not by copying the trees.
+- Hook manifests are normalized twins, not one parser-agnostic file: Claude discovers
+  `hooks/hooks.json` with `asyncRewake`; Codex and the generic manifest declare
+  `hooks/codex-hooks.json` with `async`. No other behavioral drift is allowed.
 - `guidance/workflow.md` is the canonical engineering workflow every consumer's
   AGENTS.md/CLAUDE.md carries in a marker-fenced block (`scripts/sync-guidance.sh`
   splices on explicit install; the commit/push gates verify with `--check` —
@@ -30,10 +36,11 @@
   the begin marker's content hash is what tells tampering from staleness.
 - `plugins/boxlite-agent-tooling/host-parity.test.sh` pins the cross-host contract:
   same identity in every manifest, marketplaces advertising the shipped version, one
-  skills tree, one agent-spec set, one hooks file inside the schema both hosts parse.
-  Run it after touching any manifest, marketplace, symlink, or hooks.json.
+  skills tree, one agent-spec set, and normalized hook manifests whose only allowed
+  difference is the host-specific background-delivery key. Run it after touching any
+  manifest, marketplace, symlink, or hooks JSON.
 
-<!-- agent-tooling:guidance:begin rev=4714bd98cd1e-dirty sha256=8c3ff708fa4f -->
+<!-- agent-tooling:guidance:begin rev=7d86a1478761-dirty sha256=29f917c92f67 -->
 
 > Managed by **boxlite-ai/agent-tooling** — do not edit between the markers. Change `plugins/boxlite-agent-tooling/guidance/workflow.md` there, then rerun `./.agent-tooling/install.sh` here.
 
@@ -106,7 +113,7 @@ Every change goes: understand → research → design → implement → test →
 
 - Verify external findings against the working tree before acting. Reviews, lint, and PR comments work from a snapshot — they may name deleted code. `git grep` and `git diff` first.
 - Audit verdicts through the Stop gate: when a turn asserts something as established — a fix that works, tests that pass, a root cause, an ops/infra finding, "no issues", a factual answer — let the gate triage the final turn. If it blocks, invoke the `verdict-auditor` subagent synchronously (Task, run_in_background: false) using the exact transcript, session-scoped dossier paths, and audit generation in the block instruction; the auditor (never you) writes the dossier. Retain its handle while waiting: if a real user message is steered in before it returns, cancel/interrupt the auditor, revoke that audit generation, discard its dossier, and handle the new message; re-audit only if the revised turn still needs a verdict. The Stop gate triages the WHOLE final turn (every assistant text since the last real user message) straight from the transcript — triage is a three-tier cascade, cheapest first: text the _harness_ wrote into the assistant slot (API errors, quota notices) asserts nothing and is allowed with no model call; a small set of assertion-only forms ("173/173 tests pass", a line-initial "Verified …", a whole-line "done.") blocks with no model call; everything else goes to a fast model judging "is this a conclusion the reader must take on trust, with nothing shown that produced it?" — so a turn that quotes the output, counts or file:line behind its claims ends freely, while one that just asserts the result does not — falling back to a curated pattern list (EN+中文) when no model is reachable — and it blocks until a fresh dossier exists. Prose-ambiguous phrasings ("tests pass", "root cause is", "deploy is healthy") stay with the model on purpose, so a turn merely _discussing_ verdict wording is still allowed. Every allow announces its decision to the human via systemMessage (invisible to the model); a FAIL keeps blocking until its findings are addressed (that loop is deliberate), and a still-fresh FAIL is parked to the matching session-scoped previous-dossier path when your fix moves the tree so the next audit re-checks those findings instead of starting cold; stale/mismatched dossiers are discarded and aged-out ones dropped outright, never blocked on; while `run-verdict-audit.sh` is actually running the gate allows under an `inflight-allow` rung rather than re-blocking you once every few seconds for the whole length of the audit it just demanded — that audit's verdict gates your NEXT turn instead; chat and question turns end freely; when your turn's text has not reached the transcript yet the gate waits briefly, and if it still cannot read it the turn ends UNJUDGED under a `blind-allow` rung; a judged message is never judged twice (flush-race guard). Triage can misread — declaring remains your duty, not only the hook's.
-- An auditor still running after 30 seconds opens one non-blocking choice prompt for that audit generation: keep waiting (recommended), override all auditors for this prompt, or cancel the task. No response leaves the auditor running; PASS/FAIL closes the prompt. The portable fallback is a first non-empty line of `force-pass-auditors: <required reason>`. An override is recorded as `OVERRIDDEN BY USER`, never PASS, expires within one hour, and is revoked by the next real prompt. It bypasses only `commit-push-auditor` and `verdict-auditor`; installation/guidance checks, PR-review acknowledgement, chained hooks, push ref binding/watchers, permissions, and remote protections still run.
+- An auditor still running after 30 seconds opens one interactive choice on hosts that support asynchronous re-wake: Keep waiting, or Force pass because the auditor is taking too long. No response leaves the auditor running. The host cannot dismiss an outstanding question when PASS/FAIL arrives, so a stale card may remain; its generation-bound selection is rejected after terminal completion or replacement. Other hosts publish a non-blocking typed status instead. The first non-empty line `force-pass-auditors: <required reason>` remains the headless/accessibility fallback. An override is recorded as `OVERRIDDEN BY USER`, never PASS, expires within one hour, and is revoked by the next real prompt. It bypasses only `commit-push-auditor` and `verdict-auditor`; installation/guidance checks, PR-review acknowledgement, chained hooks, push ref binding/watchers, permissions, and remote protections still run.
 - Honor scope reduction: "drop X" means drop X. Don't bundle adjacent improvements unprompted.
 - Treat every failure as a class, not an instance: when one surfaces, find and fix every sibling of the same shape in the same pass — grounded in what's actually there, not speculation. A single-site fix to a systemic bug isn't done.
 

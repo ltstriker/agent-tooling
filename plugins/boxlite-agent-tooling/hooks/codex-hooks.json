@@ -20,7 +20,7 @@
           {
             "type": "command",
             "command": "/usr/bin/env bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/.agents/hooks/auditor-control.sh\"",
-            "asyncRewake": true,
+            "async": true,
             "timeout": 3600
           }
         ]

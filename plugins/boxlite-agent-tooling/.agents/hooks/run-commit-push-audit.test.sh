@@ -50,7 +50,9 @@ setup() {  # -> repo path
     "$REPO_ROOT/.agents/hooks/auditor-control.sh" "$d/.agents/hooks/"
   cp "$REPO_ROOT/.agents/lib/subagent.sh" \
     "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
-    "$REPO_ROOT/.agents/lib/auditor-override-state.sh" "$d/.agents/lib/"
+    "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+    "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+    "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$d/.agents/lib/"
   cp "$REPO_ROOT/.agents/prompts/"*.md "$d/.agents/prompts/"
   printf 'base\n' > "$d/f"
   git -C "$d" add -A
@@ -161,8 +163,8 @@ lifecycle_output="$(bound_output "$R_LIFECYCLE" PASS '[]')"
 ) >/dev/null 2>&1
 lifecycle_rc=$?
 lifecycle_generation="$(printf '%s' "$CMD" | shasum -a 256 | awk '{print $1}')"
-lifecycle_prompt="$R_LIFECYCLE/.agents/state/auditor-control/prompt.$lifecycle_scope.commit-push-auditor.$lifecycle_generation.json"
-lifecycle_state="rc=$lifecycle_rc state=$(jq -r '.state // "missing"' "$lifecycle_prompt" 2>/dev/null) terminal=$(jq -r '.terminal // "missing"' "$lifecycle_prompt" 2>/dev/null)"
+lifecycle_escalation="$R_LIFECYCLE/.agents/state/auditor-control/escalation.$lifecycle_scope.commit-push-auditor.$lifecycle_generation.json"
+lifecycle_state="rc=$lifecycle_rc state=$(jq -r '.state // "missing"' "$lifecycle_escalation" 2>/dev/null) terminal=$(jq -r '.terminal // "missing"' "$lifecycle_escalation" 2>/dev/null)"
 if [[ "$lifecycle_state" == "rc=0 state=closed terminal=PASS" ]]; then
   ok "the headless runner opens and closes escalation around the real Codex audit"
 else

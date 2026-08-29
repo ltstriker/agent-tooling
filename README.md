@@ -152,27 +152,36 @@ the already-running parent process. `/reload-plugins` is therefore the final one
 step; later valid starts are silent. Repository trust remains a human decision and is
 not pre-approved by these files.
 
-### Long-running auditor choice
+### Long-running auditor escalation
 
 `commit-push-auditor` and `verdict-auditor` run normally for their first 30 seconds.
-After that, an asynchronous lifecycle hook publishes one prompt state for the exact
-session, prompt epoch, auditor, and audit generation. The choices are:
+After that, Claude Code's asynchronous `SubagentStart` hook uses `asyncRewake` to wake
+the parent with an instruction to open one `AskUserQuestion` card:
 
-- keep waiting (recommended),
-- override both auditors for this prompt, or
-- cancel the task.
+- **Keep waiting (Recommended)** — dismiss this escalation and leave the auditor active.
+- **Force pass — auditor is taking too long** — override both auditor gates for this
+  prompt with that user-selected reason.
 
-Doing nothing leaves the audit running. A terminal auditor result closes the prompt;
-a selection racing a terminal result loses and is ignored. Hosts that render richer UI
-can watch `.agents/state/auditor-control/events.<session-scope>.jsonl` and the adjacent
-`prompt.*.json` records to display and close a card. Current portable hooks surface the
-same choice as a non-blocking status message at the next safe conversation point; they
-do not expose an API that opens and closes a native question card directly.
-The host submits a card choice by piping
-`{"session_id":"...","choice":"keep_waiting|override_all|cancel_task","reason":"..."}`
-to `.agents/hooks/auditor-control.sh select`. Its response resolves the card; on
-`cancel-task`, the host must also cancel the owning task because repository hooks cannot
-terminate host-managed work themselves.
+The card blocks the parent conversation but not the auditor. If the user does nothing,
+the audit keeps running. Claude Code exposes no completion hook that can dismiss an
+already-rendered question, so the card may remain stale after the audit finishes; a
+later click is still safe because the selection command rejects a terminal or replaced
+generation. `SubagentStop` closes the exact session, prompt epoch, auditor, and
+generation record when completion arrives.
+Claude's host-generated `<task-notification>` wake and completion envelopes do not
+advance the human prompt epoch. The wake consumes a random generation-bound marker;
+prompt closure or same-auditor replacement retains a non-authorizing pending-stop
+receipt for each displaced active generation, and every `SubagentStop` adds one
+matching completion-delivery credit. Each host completion consumes one credit,
+including repeated notifications from a resumed task. This avoids relying on the
+transcript, which Claude appends only after
+`UserPromptSubmit` hooks finish.
+
+Codex's strict hook schema accepts `async` but not `asyncRewake`, so the generic and
+Codex manifests use `hooks/codex-hooks.json`; Claude conventionally discovers
+`hooks/hooks.json`. `host-parity.test.sh` normalizes the one delivery-key difference and
+requires every command and all remaining behavior to match. Codex receives the same
+non-blocking typed status instruction at its next safe conversation point.
 
 For headless or accessibility use, submit this as the first non-empty prompt line:
 
@@ -319,9 +328,9 @@ bash templates/claude-plugin-bootstrap.test.sh
 
 The parity suite is the cross-host check the two host validators cannot make: it
 asserts Claude Code's conventional discovery, Codex's declared paths, and the generic
-manifest all resolve to the same skills, agent specs, and hooks file, that every wired
-command resolves its root on both hosts, and that the marketplaces advertise the
-version the manifests actually carry.
+manifest all resolve to the same skills and agent specs, that the host hook manifests
+normalize to the same behavior, that every wired command resolves its root on both
+hosts, and that the marketplaces advertise the version the manifests actually carry.
 
 After installation, configure repository Git hooks explicitly:
 

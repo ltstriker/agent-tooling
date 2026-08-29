@@ -172,7 +172,9 @@ setup() {
   # repo running a COPY of the hook therefore needs both staged beside it.
   cp "$REPO_ROOT/.agents/lib/subagent.sh" \
      "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
-     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" "$d/.agents/lib/"
+     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+     "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$d/.agents/lib/"
   cp "$REPO_ROOT/.agents/prompts/"*.md "$d/.agents/prompts/"
   printf 'x\n' > "$d/f"
 
@@ -182,7 +184,9 @@ setup() {
   cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$REPO_ROOT/guidance" "$plugin/"
   mkdir -p "$plugin/.agents/lib"
   cp "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
-     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" "$plugin/.agents/lib/"
+     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+     "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$plugin/.agents/lib/"
   git -C "$scratch" init -q
   git -C "$scratch" config user.email t@t.test
   git -C "$scratch" config user.name tester
@@ -618,9 +622,9 @@ printf '%s' "$(jq -nc --arg command "$push_command" --arg session "$push_lifecyc
     CODEX_BIN="$R/bin/codex" CODEX_FAKE_DELAY=0.2 AUDITOR_PROMPT_AFTER_SECONDS=0 \
     git push -q origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
 check_eq "Codex delegated pre-push self-audits exact ref update" "$?" 0
-push_lifecycle_prompt="$(find "$R/.agents/state/auditor-control" -type f \
-  -name "prompt.$push_lifecycle_scope.commit-push-auditor.*.json" -print -quit 2>/dev/null)"
-push_lifecycle_state="$(jq -r '.state + ":" + .terminal' "$push_lifecycle_prompt" 2>/dev/null)"
+push_lifecycle_escalation="$(find "$R/.agents/state/auditor-control" -type f \
+  -name "escalation.$push_lifecycle_scope.commit-push-auditor.*.json" -print -quit 2>/dev/null)"
+push_lifecycle_state="$(jq -r '.state + ":" + .terminal' "$push_lifecycle_escalation" 2>/dev/null)"
 check_eq "automatic pre-push carries session lifecycle into the real headless audit" \
   "$push_lifecycle_state" "closed:PASS"
 grep -q 'Sanitized pre-push ref-update diff' "$R/push-prompt.txt" && exact_prompt=yes || exact_prompt=no

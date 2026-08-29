@@ -43,7 +43,9 @@ stage_lib() {  # $1 = fake repo root
   mkdir -p "$1/.agents/lib" "$1/.agents/prompts"
   cp "$REPO_ROOT/.agents/lib/subagent.sh" \
      "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
-     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" "$1/.agents/lib/"
+     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+     "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$1/.agents/lib/"
   # The prompts travel with the library: they are the text it loads, and the hook
   # treats a missing prompt document as an error rather than improvising one.
   cp "$REPO_ROOT/.agents/prompts/"*.md "$1/.agents/prompts/"

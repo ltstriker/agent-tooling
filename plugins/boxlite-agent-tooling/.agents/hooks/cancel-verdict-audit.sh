@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # UserPromptSubmit hook: revoke a headless verdict audit owned by this same session.
 #
 # Native Task/collaboration auditors are harness-owned and are canceled by the parent
@@ -15,7 +16,7 @@
 # primitive or prevent the newer prompt from entering the task.
 set -uo pipefail
 
-for required_command in jq perl; do
+for required_command in jq perl shasum awk; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
     printf 'cancel-verdict-audit.sh: required dependency not found: %s\n' \
       "$required_command" >&2
@@ -55,7 +56,6 @@ if ! repo_root="$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null)";
 fi
 project_dir="$(cd "$repo_root" && pwd -P)"
 tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
 audit_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
 if [[ ! -r "$audit_state_lib" ]]; then
   printf 'cancel-verdict-audit.sh: missing %s — cannot scope audit state.\n' \
@@ -71,6 +71,39 @@ if ! session_scope="$(verdict_audit_scope_from_hook_payload \
   printf 'cancel-verdict-audit.sh: could not derive the session audit scope.\n' >&2
   exit 1
 fi
+
+# Claude dispatches the asyncRewake UserPromptSubmit hook before appending its host
+# notification to the transcript. Authenticate this one internal wake from the payload
+# itself: the escalation stores only a hash, and the control facade consumes it under
+# the session mutex. A valid queued wake remains internal after terminal or prompt state
+# moves on; a missing, forged, reused, or expired marker falls through as a real prompt.
+prompt_text="$(printf '%s' "$payload" | jq -r '
+  if (.prompt | type) == "string" then .prompt else "" end
+')"
+if [[ "$prompt_text" == '<task-notification>'$'\n'*$'\n</task-notification>' ]]; then
+  completion_generation="$(printf '%s' "$prompt_text" | jq -Rer '
+    capture("<task-id>(?<generation>[A-Za-z0-9][A-Za-z0-9._-]{0,127})</task-id>").generation
+  ' 2>/dev/null || true)"
+  if [[ "$completion_generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] \
+     && CLAUDE_PROJECT_DIR="$project_dir" bash \
+       "$tooling_root/.agents/hooks/auditor-control.sh" \
+       consume-completion "$session_scope" "$completion_generation" \
+       >/dev/null 2>&1; then
+    exit 0
+  fi
+  wake_nonce="$(printf '%s' "$prompt_text" | jq -Rer '
+    capture("\\[auditor-wake:(?<nonce>[0-9a-f]{64})\\]").nonce
+  ' 2>/dev/null || true)"
+  if [[ "$wake_nonce" =~ ^[0-9a-f]{64}$ ]]; then
+    wake_nonce_hash="$(printf '%s' "$wake_nonce" | shasum -a 256 | awk '{print $1}')"
+    if CLAUDE_PROJECT_DIR="$project_dir" bash \
+      "$tooling_root/.agents/hooks/auditor-control.sh" \
+      consume-wake "$session_scope" "$wake_nonce_hash" >/dev/null 2>&1; then
+      exit 0
+    fi
+  fi
+fi
+
 state_dir="$project_dir/.agents/state"
 if ! mkdir -p "$state_dir" 2>/dev/null; then
   printf 'cancel-verdict-audit.sh: could not create runtime state directory.\n' >&2
