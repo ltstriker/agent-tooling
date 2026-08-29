@@ -152,6 +152,51 @@ the already-running parent process. `/reload-plugins` is therefore the final one
 step; later valid starts are silent. Repository trust remains a human decision and is
 not pre-approved by these files.
 
+### Long-running auditor escalation
+
+`commit-push-auditor` and `verdict-auditor` run normally for their first 30 seconds.
+After that, Claude Code's asynchronous `SubagentStart` hook uses `asyncRewake` to wake
+the parent with an instruction to open one `AskUserQuestion` card:
+
+- **Keep waiting (Recommended)** — dismiss this escalation and leave the auditor active.
+- **Force pass — auditor is taking too long** — override both auditor gates for this
+  prompt with that user-selected reason.
+
+The card blocks the parent conversation but not the auditor. If the user does nothing,
+the audit keeps running. Claude Code exposes no completion hook that can dismiss an
+already-rendered question, so the card may remain stale after the audit finishes; a
+later click is still safe because the selection command rejects a terminal or replaced
+generation. `SubagentStop` closes the exact session, prompt epoch, auditor, and
+generation record when completion arrives.
+Claude's host-generated `<task-notification>` wake and completion envelopes do not
+advance the human prompt epoch. The wake consumes a random generation-bound marker;
+prompt closure or same-auditor replacement retains a non-authorizing pending-stop
+receipt for each displaced active generation, and every `SubagentStop` adds one
+matching completion-delivery credit. Each host completion consumes one credit,
+including repeated notifications from a resumed task. This avoids relying on the
+transcript, which Claude appends only after
+`UserPromptSubmit` hooks finish.
+
+Codex's strict hook schema accepts `async` but not `asyncRewake`, so the generic and
+Codex manifests use `hooks/codex-hooks.json`; Claude conventionally discovers
+`hooks/hooks.json`. `host-parity.test.sh` normalizes the one delivery-key difference and
+requires every command and all remaining behavior to match. Codex receives the same
+non-blocking typed status instruction at its next safe conversation point.
+
+For headless or accessibility use, submit this as the first non-empty prompt line:
+
+```text
+force-pass-auditors: <required reason>
+```
+
+The override is bound to the canonical repository, host session, and new prompt epoch,
+expires within one hour, and is revoked by the next real prompt. Runtime state stores a
+nonce hash and reason hash, not the bearer or reason. Gate-use logs say `OVERRIDDEN` and
+bind commit, push, and Stop uses to their actual diff/subject/tree context. No PASS
+dossier is created or rewritten. Installation and guidance checks, PR-review
+acknowledgement, chained framework hooks, exact push-ref calculation, PR watching,
+host permissions, and remote protections remain in force.
+
 ## Shared engineering guidance
 
 `plugins/boxlite-agent-tooling/guidance/workflow.md` is the canonical, domain-neutral
@@ -283,9 +328,9 @@ bash templates/claude-plugin-bootstrap.test.sh
 
 The parity suite is the cross-host check the two host validators cannot make: it
 asserts Claude Code's conventional discovery, Codex's declared paths, and the generic
-manifest all resolve to the same skills, agent specs, and hooks file, that every wired
-command resolves its root on both hosts, and that the marketplaces advertise the
-version the manifests actually carry.
+manifest all resolve to the same skills and agent specs, that the host hook manifests
+normalize to the same behavior, that every wired command resolves its root on both
+hosts, and that the marketplaces advertise the version the manifests actually carry.
 
 After installation, configure repository Git hooks explicitly:
 

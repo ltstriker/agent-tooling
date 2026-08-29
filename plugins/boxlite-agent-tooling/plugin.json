@@ -1,6 +1,6 @@
 {
   "name": "boxlite-agent-tooling",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Shared BoxLite coding-agent skills, auditors, hooks, and repository tooling.",
   "author": {
     "name": "BoxLite",
@@ -12,5 +12,5 @@
   "keywords": ["agent-tooling", "boxlite", "codex", "claude", "copilot"],
   "agents": "agents/",
   "skills": "skills/",
-  "hooks": "hooks/hooks.json"
+  "hooks": "hooks/codex-hooks.json"
 }

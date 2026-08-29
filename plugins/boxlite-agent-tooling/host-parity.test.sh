@@ -17,11 +17,10 @@
 #   - Codex's declared skills/hooks paths resolve to the SAME files Claude Code's
 #     conventions discover, through the symlinks AGENTS.md prescribes
 #     (skills -> .agents/skills, agents -> .claude/agents).
-#   - hooks/hooks.json stays inside the schema BOTH hosts accept. Since 2b56fc0 the
-#     stricter parser reads this file too: Codex rejects an unknown key at any depth
-#     by loading no hooks at all, without logging a parse error — the whole gate set
-#     vanishes on one host and the suite that exercises the scripts directly stays
-#     green. Same lesson templates/prompt-rules.test.sh pins for the consumer copies.
+#   - Claude and Codex hook manifests stay behaviorally identical except for their
+#     background-delivery primitive: Claude uses asyncRewake so a 30-second escalation
+#     wakes the model, while Codex uses async because its strict schema does not accept
+#     asyncRewake. Unknown keys still make Codex silently load no hooks at all.
 #   - Every wired command resolves the plugin root as ${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}
 #     — Codex exports the first name, Claude Code the second. A bare single-host
 #     variable expands empty on the other host and the hook runs /nonexistent.
@@ -43,7 +42,8 @@ REPO_ROOT="$(cd "$PLUGIN/../.." && pwd)"
 GENERIC="$PLUGIN/plugin.json"
 CLAUDE="$PLUGIN/.claude-plugin/plugin.json"
 CODEX="$PLUGIN/.codex-plugin/plugin.json"
-HOOKS="$PLUGIN/hooks/hooks.json"
+CLAUDE_HOOKS="$PLUGIN/hooks/hooks.json"
+CODEX_HOOKS="$PLUGIN/hooks/codex-hooks.json"
 CLAUDE_MKT="$REPO_ROOT/.claude-plugin/marketplace.json"
 CODEX_MKT="$REPO_ROOT/.agents/plugins/marketplace.json"
 COPILOT_MKT="$REPO_ROOT/.github/plugin/marketplace.json"
@@ -187,6 +187,12 @@ for spec in "$PLUGIN"/.claude/agents/*.md; do
 done
 [ "$found" -gt 0 ] && ok "agent specs exist ($found specs)" \
                    || bad "agent specs exist"
+known_auditors="$("$PLUGIN/.agents/hooks/auditor-control.sh" --known-auditors 2>/dev/null | sort)"
+shipped_auditors="$(find "$PLUGIN/.claude/agents" -maxdepth 1 -name '*-auditor.md' \
+  -exec basename {} .md \; | sort)"
+[ "$known_auditors" = "$shipped_auditors" ] \
+  && ok "every shipped auditor has override control mapping" \
+  || bad "every shipped auditor has override control mapping (known: ${known_auditors:-none})"
 # The deliberate asymmetry, pinned so nobody "fixes" it into a silent Codex failure.
 jq -e 'has("agents") | not' "$CODEX" >/dev/null 2>&1 \
   && ok "codex manifest declares no agents key (specs travel by path — see header)" \
@@ -210,40 +216,60 @@ case "$routing" in
 esac
 
 echo
-echo "## hooks/hooks.json — one file, both hosts, both parsers"
-hooks_file="$(resolve_file "$HOOKS")"
-[ -n "$hooks_file" ] && ok "conventional hooks/hooks.json exists (claude discovery)" \
-                     || bad "conventional hooks/hooks.json exists (claude discovery)"
+echo "## Host hooks differ only at the background-delivery boundary"
+claude_hooks_file="$(resolve_file "$CLAUDE_HOOKS")"
+[ -n "$claude_hooks_file" ] && ok "conventional hooks/hooks.json exists (claude discovery)" \
+                            || bad "conventional hooks/hooks.json exists (claude discovery)"
+codex_hooks_file="$(resolve_file "$CODEX_HOOKS")"
+[ -n "$codex_hooks_file" ] && ok "codex hooks file exists" \
+                           || bad "codex hooks file exists"
 for pair in "generic:$(jq -r .hooks "$GENERIC")" "codex:$(jq -r .hooks "$CODEX")"; do
   label="${pair%%:*}"; declared="${pair#*:}"
   got="$(resolve_file "$PLUGIN/$declared")"
-  [ "$got" = "$hooks_file" ] && ok "$label manifest hooks resolve to hooks/hooks.json" \
-                             || bad "$label manifest hooks resolve to hooks/hooks.json (got: ${got:-unresolvable})"
+  [ "$got" = "$codex_hooks_file" ] && ok "$label manifest hooks resolve to hooks/codex-hooks.json" \
+                                   || bad "$label manifest hooks resolve to hooks/codex-hooks.json (got: ${got:-unresolvable})"
 done
-jq -e . "$HOOKS" >/dev/null 2>&1 && ok "valid JSON" || bad "valid JSON"
-# Unknown keys at ANY depth: the silent-rejection schema shared with the templates,
-# minus `env` — that allowance exists for .claude/settings.json, not for a plugin file.
-unknown="$(jq -r '
-  [ (keys_unsorted[] | select(. != "hooks")),
-    (.hooks | keys_unsorted[] | select(test("^[A-Z][A-Za-z]*$") | not)),
-    (.hooks[][] | keys_unsorted[] | select(IN("hooks","matcher") | not)),
-    (.hooks[][].hooks[] | keys_unsorted[]
-       | select(IN("type","command","statusMessage","timeout") | not))
-  ] | join(",")' "$HOOKS" 2>/dev/null)"
-[ -z "$unknown" ] && ok "no unknown keys at any depth" \
-                  || bad "no unknown keys at any depth (found: $unknown)"
-flattened="$(jq -r '[.hooks[][] | select((.hooks | type) != "array" or (.hooks | length) == 0)] | length' "$HOOKS")"
-[ "$flattened" = "0" ] && ok "every event entry nests a non-empty hooks array" \
-                       || bad "every event entry nests a non-empty hooks array ($flattened flat entries)"
-nontype="$(jq -r '[.hooks[][].hooks[] | select(.type != "command")] | length' "$HOOKS")"
-[ "$nontype" = "0" ] && ok "every hook object is type command" \
-                     || bad "every hook object is type command ($nontype are not)"
+for pair in "claude:$CLAUDE_HOOKS:asyncRewake" "codex:$CODEX_HOOKS:async"; do
+  label="${pair%%:*}"; rest="${pair#*:}"; file="${rest%%:*}"; async_key="${rest##*:}"
+  jq -e . "$file" >/dev/null 2>&1 && ok "$label: valid JSON" || bad "$label: valid JSON"
+  unknown="$(jq -r --arg async_key "$async_key" '
+    [ (keys_unsorted[] | select(. != "hooks")),
+      (.hooks | keys_unsorted[] | select(test("^[A-Z][A-Za-z]*$") | not)),
+      (.hooks[][] | keys_unsorted[] | select(IN("hooks","matcher") | not)),
+      (.hooks[][].hooks[] | keys_unsorted[]
+         | select(IN("type","command","statusMessage","timeout",$async_key) | not))
+    ] | join(",")' "$file" 2>/dev/null)"
+  [ -z "$unknown" ] && ok "$label: no unknown keys at any depth" \
+                    || bad "$label: no unknown keys at any depth (found: $unknown)"
+  flattened="$(jq -r '[.hooks[][] | select((.hooks | type) != "array" or (.hooks | length) == 0)] | length' "$file")"
+  [ "$flattened" = "0" ] && ok "$label: every event entry nests a non-empty hooks array" \
+                         || bad "$label: every event entry nests a non-empty hooks array ($flattened flat entries)"
+  nontype="$(jq -r '[.hooks[][].hooks[] | select(.type != "command")] | length' "$file")"
+  [ "$nontype" = "0" ] && ok "$label: every hook object is type command" \
+                       || bad "$label: every hook object is type command ($nontype are not)"
+done
+claude_normalized="$(jq -Sc '
+  .hooks.SubagentStart[].hooks[] |=
+    (if has("asyncRewake") then .async = .asyncRewake | del(.asyncRewake) else . end)
+' "$CLAUDE_HOOKS")"
+codex_normalized="$(jq -Sc . "$CODEX_HOOKS")"
+[ "$claude_normalized" = "$codex_normalized" ] \
+  && ok "hook manifests normalize to the same behavior" \
+  || bad "hook manifests normalize to the same behavior"
+jq -e '.hooks.SubagentStart[].hooks[] | .asyncRewake == true and has("async") == false' \
+  "$CLAUDE_HOOKS" >/dev/null 2>&1 \
+  && ok "claude SubagentStart uses asyncRewake" \
+  || bad "claude SubagentStart uses asyncRewake"
+jq -e '.hooks.SubagentStart[].hooks[] | .async == true and has("asyncRewake") == false' \
+  "$CODEX_HOOKS" >/dev/null 2>&1 \
+  && ok "codex SubagentStart stays inside its async schema" \
+  || bad "codex SubagentStart stays inside its async schema"
 
 # UserPromptSubmit has two independent responsibilities. Cancellation must not be
 # hidden inside rule-recency.sh: that script's cross-host contract is a pure text
 # injector, and its bare-ack fast path includes exactly the prompts ("stop", "nvm")
 # that still need to cancel an obsolete audit.
-user_prompt_commands="$(jq -r '.hooks.UserPromptSubmit[].hooks[].command' "$HOOKS")"
+user_prompt_commands="$(jq -r '.hooks.UserPromptSubmit[].hooks[].command' "$CODEX_HOOKS")"
 user_prompt_count="$(printf '%s\n' "$user_prompt_commands" | grep -c . || true)"
 [ "$user_prompt_count" = "2" ] && ok "UserPromptSubmit wires cancellation and recency separately" \
                                   || bad "UserPromptSubmit wires cancellation and recency separately (got $user_prompt_count commands)"
@@ -269,7 +295,7 @@ while IFS= read -r cmd; do
   else
     bad "command quotes its script path (got: $cmd)"
   fi
-done < <(jq -r '.hooks[][].hooks[].command' "$HOOKS")
+done < <(jq -r '.hooks[][].hooks[].command' "$CLAUDE_HOOKS" "$CODEX_HOOKS" | sort -u)
 
 echo
 echo "RESULT: $pass passed, $fail failed"

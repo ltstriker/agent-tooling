@@ -13,6 +13,7 @@ fi
 
 if [[ "$is_agent" == 1 ]]; then
   repo_root="$(git rev-parse --show-toplevel)"
+  tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   # Same reason as resolve_gate in pre-commit/pre-push: where core.hooksPath is
   # configured absolute rather than the relative value `make setup` sets, this one
   # hook can run for worktrees on either side of the marker move. Take whichever
@@ -27,6 +28,60 @@ if [[ "$is_agent" == 1 ]]; then
   }
   audit_file="$(resolve_marker last-audit.json)"
   handoff_file="$(resolve_marker last-audit-handoff.json)"
+  verdict_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+  override_state_lib="$tooling_root/.agents/lib/auditor-override-state.sh"
+  if [[ ! -r "$verdict_state_lib" || ! -r "$override_state_lib" ]]; then
+    printf 'Auditor override state validation is unavailable.\n' >&2
+    exit 1
+  fi
+  # shellcheck source=../.agents/lib/verdict-audit-state.sh
+  source "$verdict_state_lib"
+  # shellcheck source=../.agents/lib/auditor-override-state.sh
+  source "$override_state_lib"
+  # Assigned by auditor_override_load_valid_grant; initialize the sourced public output
+  # explicitly so `set -u` and static analysis share the same boundary contract.
+  auditor_override_nonce_hash=""
+
+  validate_override_handoff() {
+    local handoff_branch handoff_head handoff_kind expected_diff_hash scope epoch nonce
+    local owner_pid owner_token
+    local actual_diff_hash actual_subject actual_subject_hash current_branch current_head
+    [[ -r "$handoff_file" ]] || return 1
+    handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null)"
+    handoff_head="$(jq -r '.head // ""' "$handoff_file" 2>/dev/null)"
+    handoff_kind="$(jq -r '.command_kind // ""' "$handoff_file" 2>/dev/null)"
+    expected_diff_hash="$(jq -r '.diff_hash // ""' "$handoff_file" 2>/dev/null)"
+    scope="$(jq -r '.override.session_scope // ""' "$handoff_file" 2>/dev/null)"
+    epoch="$(jq -r '.override.prompt_epoch // ""' "$handoff_file" 2>/dev/null)"
+    nonce="$(jq -r '.override.nonce_hash // ""' "$handoff_file" 2>/dev/null)"
+    owner_pid="$(jq -r '.owner.pid // ""' "$handoff_file" 2>/dev/null)"
+    owner_token="$(jq -r '.owner.start_token // ""' "$handoff_file" 2>/dev/null)"
+    current_branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || echo '?')"
+    current_head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo '?')"
+    actual_diff_hash="$(git -C "$repo_root" diff --cached --no-ext-diff \
+      | shasum -a 256 | awk '{print $1}')"
+    [[ "$handoff_branch" == "$current_branch" && "$handoff_head" == "$current_head" \
+       && "$handoff_kind" == commit && "$expected_diff_hash" == "$actual_diff_hash" \
+       && "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
+    verdict_audit_process_has_ancestor "$owner_pid" "$owner_token" || return 1
+    auditor_override_load_valid_grant "$repo_root" "$scope" "$epoch" || return 1
+    [[ "$auditor_override_nonce_hash" == "$nonce" ]] || return 1
+    actual_subject="$(sed -n '1p' "$1")"
+    actual_subject_hash="$(printf '%s' "$actual_subject" | shasum -a 256 | awk '{print $1}')"
+    if ! auditor_override_log_use "$repo_root" "$scope" commit-msg \
+        "$actual_diff_hash" "$actual_subject_hash" >/dev/null 2>&1; then
+      printf 'Auditor override evidence could not be recorded; commit remains gated.\n' >&2
+      return 1
+    fi
+    rm -f "$repo_root/.agents/state/last-audit-handoff.json" \
+      "$repo_root/.claude/.last-audit-handoff.json"
+    printf 'OVERRIDDEN BY USER: commit auditor skipped; no PASS verdict was created.\n' >&2
+    return 0
+  }
+
+  if validate_override_handoff "$1"; then
+    exit 0
+  fi
   if [[ ! -r "$audit_file" ]]; then
     printf 'No commit audit remained for commit-msg validation.\n' >&2
     exit 1

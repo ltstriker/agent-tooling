@@ -107,6 +107,9 @@ audit_lock_file="$(verdict_audit_state_path "$state_dir/verdict-audit.lock" "$se
 audit_mutex_file="${audit_lock_file}.mutex"
 audit_request_file="$(verdict_audit_state_path "$state_dir/verdict-request" "$session_scope")"
 audit_publish_mutex_file="${audit_request_file}.publish.mutex"
+prompt_epoch_file="$(verdict_audit_state_path "$state_dir/verdict-prompt-epoch" "$session_scope")"
+auditor_control="$tooling_root/.agents/hooks/auditor-control.sh"
+auditor_control_started=false
 audit_cancellation_file="$(verdict_audit_cancellation_path \
   "$state_dir" "$session_scope" "$audit_generation")"
 # Session-aware audits write to a runner-owned generation file first. Promotion happens
@@ -366,11 +369,35 @@ stop_request_monitor() {
 # shellcheck disable=SC2329
 cleanup_audit_lock() {
   local original_status=$? body owner_pid owner_token extra _ lease_status=0
+  local control_cleanup_failed=false
+  if [[ "$auditor_control_started" == true ]]; then
+    control_terminal="${audit_verdict:-unavailable}"
+    (( original_status == 0 )) || control_terminal=unavailable
+    if ! CLAUDE_PROJECT_DIR="$project_dir" bash "$auditor_control" external-stop \
+      verdict-auditor "$audit_generation" "$session_scope" "$control_terminal" \
+      >/dev/null 2>&1; then
+      control_cleanup_failed=true
+    fi
+    auditor_control_started=false
+  fi
   # A successful audit is not committed until the holder's clean-release handshake.
   # Keep request revocation observable through that wait; non-success exits no longer
   # need the monitor and tear it down immediately.
   (( original_status == 0 )) || stop_request_monitor
-  [[ "$owns_audit_lock" == true ]] || return 0
+  if [[ "$owns_audit_lock" == true ]]; then
+    :
+  else
+    if [[ "$control_cleanup_failed" == true ]]; then
+      remove_verified_publication
+      rm -f "$audit_output_file" 2>/dev/null || true
+      remove_owned_verdict
+      retire_matching_session_verdict
+      printf 'run-verdict-audit.sh: could not close auditor prompt state.\n' >&2
+      trap - EXIT
+      exit 2
+    fi
+    return 0
+  fi
   if body="$(verdict_audit_read_single_record "$audit_lock_file" 2>/dev/null)"; then
     read -r owner_pid _ _ _ owner_token _ _ extra <<< "$body"
     if [[ "$owner_pid" == "$$" && "$owner_token" == "$audit_token" && -z "$extra" ]]; then
@@ -393,6 +420,16 @@ cleanup_audit_lock() {
       >&2
     trap - EXIT
     exit 143
+  fi
+  if [[ "$control_cleanup_failed" == true ]]; then
+    stop_request_monitor
+    remove_verified_publication
+    rm -f "$audit_output_file" 2>/dev/null || true
+    remove_owned_verdict
+    retire_matching_session_verdict
+    printf 'run-verdict-audit.sh: could not close auditor prompt state.\n' >&2
+    trap - EXIT
+    exit 2
   fi
   if (( original_status == 0 )); then
     if ! audit_request_is_current; then
@@ -672,6 +709,23 @@ take_audit_lock() {
 take_audit_lock
 if ! audit_request_is_current; then
   cancel_audit 130 "the audit generation was revoked before launch"
+fi
+if [[ "$session_scope" != "-" ]]; then
+  audit_prompt_epoch="$(verdict_audit_read_single_record \
+    "$prompt_epoch_file" 2>/dev/null)" || audit_prompt_epoch=""
+  if [[ -n "$audit_prompt_epoch" ]]; then
+    [[ -r "$auditor_control" ]] || {
+      printf 'run-verdict-audit.sh: auditor lifecycle control is unavailable.\n' >&2
+      exit 2
+    }
+    if ! CLAUDE_PROJECT_DIR="$project_dir" bash "$auditor_control" external-start \
+        verdict-auditor "$audit_generation" "$session_scope" "$audit_prompt_epoch" \
+        >/dev/null 2>&1; then
+      printf 'run-verdict-audit.sh: could not start auditor prompt state.\n' >&2
+      exit 2
+    fi
+    auditor_control_started=true
+  fi
 fi
 
 # Frontmatter (--- ... ---) is subagent WIRING — name, tools, and now the model and

@@ -232,6 +232,30 @@ verdict_audit_process_start_token() {  # pid
   printf 'cksum-%s-%s' "$checksum" "$bytes"
 }
 
+# A repository handoff may be read by every process in that checkout. Bind it to the
+# long-lived harness process that launched the originating hook, then require later git
+# hooks to descend from that same live process. The start token closes PID-reuse races.
+verdict_audit_process_has_ancestor() {  # ancestor-pid ancestor-start-token [start-pid]
+  local expected_pid="$1" expected_token="$2" current_pid="${3:-$$}" parent_pid token
+  local depth=0
+  [[ "$expected_pid" =~ ^[1-9][0-9]*$ \
+     && "$expected_token" =~ ^cksum-[0-9]+-[0-9]+$ \
+     && "$current_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  while (( depth < 64 )); do
+    if [[ "$current_pid" == "$expected_pid" ]]; then
+      token="$(verdict_audit_process_start_token "$current_pid" 2>/dev/null)" || return 1
+      [[ "$token" == "$expected_token" ]]
+      return $?
+    fi
+    parent_pid="$(ps -p "$current_pid" -o ppid= 2>/dev/null)" || return 1
+    parent_pid="${parent_pid//[[:space:]]/}"
+    [[ "$parent_pid" =~ ^[1-9][0-9]*$ && "$parent_pid" != "$current_pid" ]] || return 1
+    current_pid="$parent_pid"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
 # Write stdin only when the exact destination path does not already exist. O_EXCL and
 # O_NONBLOCK make a pre-created FIFO/symlink/directory a fast error; inode checks prove
 # the opened descriptor is the regular file now named at that path.

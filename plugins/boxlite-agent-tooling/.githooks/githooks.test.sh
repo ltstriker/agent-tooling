@@ -36,6 +36,9 @@ unset CODEX_SANDBOX CLAUDECODE AGENT_GATED GITHOOK_DELEGATED GITHOOK_KEEP_AUDIT 
 # suite from another worktree silently tests THAT checkout's copy instead of the
 # one shipped beside these tests, and a two-side check reports a false pass.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_LIB="$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+# shellcheck source=../.agents/lib/verdict-audit-state.sh
+source "$STATE_LIB"
 
 pass=0
 fail=0
@@ -161,12 +164,17 @@ setup() {
   mkdir -p "$d/.agents/hooks" "$d/.agents/state" "$d/.agents/lib" "$d/.agents/prompts"
   cp "$REPO_ROOT/.agents/hooks/preflight-commit-push.sh" \
      "$REPO_ROOT/.agents/hooks/run-commit-push-audit.sh" \
+     "$REPO_ROOT/.agents/hooks/auditor-control.sh" \
      "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
      "$d/.agents/hooks/"
   # The gate resolves its shared library and prompt documents from its own location,
   # and refuses to gate without them rather than waving the commit through. A fake
   # repo running a COPY of the hook therefore needs both staged beside it.
-  cp "$REPO_ROOT/.agents/lib/subagent.sh" "$d/.agents/lib/"
+  cp "$REPO_ROOT/.agents/lib/subagent.sh" \
+     "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+     "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$d/.agents/lib/"
   cp "$REPO_ROOT/.agents/prompts/"*.md "$d/.agents/prompts/"
   printf 'x\n' > "$d/f"
 
@@ -174,6 +182,11 @@ setup() {
   plugin="$scratch/plugins/boxlite-agent-tooling"
   mkdir -p "$plugin"
   cp -R "$REPO_ROOT/.githooks" "$REPO_ROOT/scripts" "$REPO_ROOT/guidance" "$plugin/"
+  mkdir -p "$plugin/.agents/lib"
+  cp "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+     "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+     "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$plugin/.agents/lib/"
   git -C "$scratch" init -q
   git -C "$scratch" config user.email t@t.test
   git -C "$scratch" config user.name tester
@@ -259,6 +272,27 @@ stage_change() {
   printf 'y\n' >> "$repo/f"; git -C "$repo" add -A
 }
 
+activate_override_handoff() {  # repo session kind command
+  local repo="$1" session="$2" kind="$3" command="$4" scope epoch now repo_hash
+  scope="git-$(printf '%s' "$session" | git -C "$repo" hash-object --stdin)"
+  epoch="701-702-3"
+  now="$(date +%s)"
+  printf '%s\n' "$epoch" > "$repo/.agents/state/verdict-prompt-epoch.$scope"
+  repo_hash="$(printf '%s' "$(cd "$repo" && pwd -P)" | git -C "$repo" hash-object --stdin)"
+  mkdir -p "$repo/.agents/state/auditor-control"
+  jq -nc --arg repo_hash "$repo_hash" --arg scope "$scope" --arg epoch "$epoch" \
+    --arg nonce_hash "$(printf nonce | shasum -a 256 | awk '{print $1}')" \
+    --arg reason_hash "$(printf reason | shasum -a 256 | awk '{print $1}')" \
+    --argjson created "$now" --argjson expires "$((now + 3600))" \
+    '{repo_hash:$repo_hash,session_scope:$scope,prompt_epoch:$epoch,created_at:$created,
+      expires_at:$expires,nonce_hash:$nonce_hash,reason_hash:$reason_hash}' \
+    > "$repo/.agents/state/auditor-control/grant.$scope.json"
+  printf '%s' "$(jq -nc --arg command "$command" --arg session "$session" \
+    '{session_id:$session,tool_input:{command:$command}}')" \
+    | (cd "$repo" && CLAUDE_PROJECT_DIR="$repo" \
+        bash "$repo/.agents/hooks/preflight-commit-push.sh") >/dev/null
+}
+
 # Run `git commit` in the fixture as agent or human; echo the exit code.
 # env -i gives a hermetic environment: the ambient session's own harness markers
 # (CLAUDECODE, CLAUDE_PROJECT_DIR, plugin CODEX_COMPANION_*) must not leak into
@@ -324,6 +358,60 @@ R="$(setup)"; stage_change "$R"; write_audit "$R" commit
 check_eq "agent + PASS audit → commit allowed"      "$(run_commit "$R" agent)" 0
 [[ -e "$R/.agents/state/last-audit.json" ]] && consumed=no || consumed=yes
 check_eq "audit consumed by the git-level gate"     "$consumed" "yes"
+rm -rf "$R"
+
+R="$(setup)"; stage_change "$R"
+activate_override_handoff "$R" session-override commit "git commit"
+check_eq "prompt-scoped override allows an editor-style commit without an audit dossier" \
+  "$(run_commit "$R" agent 'test: overridden commit')" 0
+override_scope="git-$(printf '%s' session-override | git -C "$R" hash-object --stdin)"
+override_log="$R/.agents/state/auditor-control/uses.$override_scope.log"
+override_commit_state="grant=$([[ -e "$R/.agents/state/auditor-control/grant.$override_scope.json" ]] && echo kept || echo gone) audit=$([[ -e "$R/.agents/state/last-audit.json" ]] && echo yes || echo no) preflight=$(grep -c 'boundary=commit-preflight' "$override_log" 2>/dev/null) commitmsg=$(grep -c 'boundary=commit-msg' "$override_log" 2>/dev/null)"
+check_eq "commit override keeps the grant and logs pre-commit plus actual-subject use" \
+  "$override_commit_state" "grant=kept audit=no preflight=1 commitmsg=1"
+rm -rf "$R"
+
+R="$(setup)"; stage_change "$R"
+activate_override_handoff "$R" session-foreign-owner commit "git commit"
+perl -e 'select(undef,undef,undef,10)' & foreign_owner_pid=$!
+foreign_owner_token="$(verdict_audit_process_start_token "$foreign_owner_pid")"
+jq --argjson pid "$foreign_owner_pid" --arg token "$foreign_owner_token" \
+  '.owner={pid:$pid,start_token:$token}' \
+  "$R/.agents/state/last-audit-handoff.json" > "$R/.agents/state/foreign-owner.json" \
+  && mv "$R/.agents/state/foreign-owner.json" "$R/.agents/state/last-audit-handoff.json"
+foreign_owner_rc="$(run_commit "$R" agent 'test: foreign override rejected')"
+kill "$foreign_owner_pid" 2>/dev/null || true
+wait "$foreign_owner_pid" 2>/dev/null || true
+check_eq "a concurrent agent process cannot consume another session override handoff" \
+  "$foreign_owner_rc" 1
+rm -rf "$R"
+
+R="$(setup)"; stage_change "$R"
+activate_override_handoff "$R" session-override-log-fail commit "git commit"
+override_scope="git-$(printf '%s' session-override-log-fail | git -C "$R" hash-object --stdin)"
+override_log="$R/.agents/state/auditor-control/uses.$override_scope.log"
+rm -f "$override_log"
+printf 'outside\n' > "$R/outside-use-log"
+ln -s "$R/outside-use-log" "$override_log"
+check_eq "commit override fails closed when pre-commit use evidence cannot be written" \
+  "$(run_commit "$R" agent 'test: rejected override evidence')" 1
+rm -rf "$R"
+
+R="$(setup)"; stage_change "$R"
+activate_override_handoff "$R" session-override-msg-log-fail commit "git commit"
+override_scope="git-$(printf '%s' session-override-msg-log-fail | git -C "$R" hash-object --stdin)"
+override_log="$R/.agents/state/auditor-control/uses.$override_scope.log"
+printf '{"tool_input":{"command":"git commit"}}' \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" GITHOOK_DELEGATED=1 \
+      GITHOOK_KEEP_AUDIT=1 bash "$R/.agents/hooks/preflight-commit-push.sh") >/dev/null
+rm -f "$override_log"
+printf 'outside\n' > "$R/outside-use-log"
+ln -s "$R/outside-use-log" "$override_log"
+printf 'test: rejected commit-msg evidence\n' > "$R/msg.txt"
+(cd "$R" && CLAUDECODE=1 "$R/.githooks/commit-msg" "$R/msg.txt" \
+  >/dev/null 2>"$R/err.txt")
+check_eq "commit-msg override fails closed when actual-subject use evidence cannot be written" \
+  "$?" 1
 rm -rf "$R"
 
 R="$(setup)"; stage_change "$R"; write_audit "$R" commit
@@ -472,6 +560,20 @@ rm -rf "$R" "$B"
 R="$(setup)"
 B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
 branch_ref="$(current_branch_ref "$R")"
+activate_override_handoff "$R" session-push-override push "git push origin $branch_ref:$branch_ref"
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CLAUDECODE=1 BOXLITE_PR_WATCH=0 \
+    git push -q origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
+check_eq "prompt-scoped override allows the exact pre-push ref update without an audit dossier" "$?" 0
+push_override_scope="git-$(printf '%s' session-push-override | git -C "$R" hash-object --stdin)"
+push_override_log="$R/.agents/state/auditor-control/uses.$push_override_scope.log"
+push_override_state="grant=$([[ -e "$R/.agents/state/auditor-control/grant.$push_override_scope.json" ]] && echo kept || echo gone) audit=$([[ -e "$R/.agents/state/last-audit.json" ]] && echo yes || echo no) exact=$(grep -c 'boundary=push-preflight' "$push_override_log" 2>/dev/null) remote=$(git -C "$R" ls-remote origin "$branch_ref" | wc -l | tr -d ' ')"
+check_eq "push override keeps downstream push behavior and logs exact-diff use" \
+  "$push_override_state" "grant=kept audit=no exact=1 remote=1"
+rm -rf "$R" "$B"
+
+R="$(setup)"
+B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
+branch_ref="$(current_branch_ref "$R")"
 ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" git push -q origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
 printf 'codex push\n' >> "$R/f"; git -C "$R" add -A; git -C "$R" commit -qm 'test(hooks): codex delegated push audit'
 mkdir -p "$R/bin"
@@ -501,10 +603,30 @@ command_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected command hash: //p'
 jq -nc --arg b "$branch" --arg h "$head" --arg dh "$diff_hash" --arg ch "$command_hash" \
   '{branch:$b, head:$h, command_kind:"push", diff_hash:$dh, command_hash:$ch, commit_subject_hash:"", verdict:"PASS", findings:[]}' \
   > "$output"
+if [[ -n "${CODEX_FAKE_DELAY:-}" ]]; then
+  perl -e 'select(undef,undef,undef,$ARGV[0])' "$CODEX_FAKE_DELAY"
+fi
 PUSH_FAKE_CODEX
 chmod +x "$R/bin/codex"
-( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" git push -q origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
+push_lifecycle_session="session-codex-push"
+push_lifecycle_scope="git-$(printf '%s' "$push_lifecycle_session" | git -C "$R" hash-object --stdin)"
+push_lifecycle_epoch=1201-1202-12
+printf '%s\n' "$push_lifecycle_epoch" \
+  > "$R/.agents/state/verdict-prompt-epoch.$push_lifecycle_scope"
+push_command="git push origin $branch_ref:$branch_ref"
+printf '%s' "$(jq -nc --arg command "$push_command" --arg session "$push_lifecycle_session" \
+  '{session_id:$session,tool_input:{command:$command}}')" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" \
+      bash "$R/.agents/hooks/preflight-commit-push.sh") >/dev/null
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt \
+    CODEX_BIN="$R/bin/codex" CODEX_FAKE_DELAY=0.2 AUDITOR_PROMPT_AFTER_SECONDS=0 \
+    git push -q origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
 check_eq "Codex delegated pre-push self-audits exact ref update" "$?" 0
+push_lifecycle_escalation="$(find "$R/.agents/state/auditor-control" -type f \
+  -name "escalation.$push_lifecycle_scope.commit-push-auditor.*.json" -print -quit 2>/dev/null)"
+push_lifecycle_state="$(jq -r '.state + ":" + .terminal' "$push_lifecycle_escalation" 2>/dev/null)"
+check_eq "automatic pre-push carries session lifecycle into the real headless audit" \
+  "$push_lifecycle_state" "closed:PASS"
 grep -q 'Sanitized pre-push ref-update diff' "$R/push-prompt.txt" && exact_prompt=yes || exact_prompt=no
 check_eq "Codex push audit prompt uses pre-push diff context" "$exact_prompt" "yes"
 grep -q 'Commit subjects in the exact pre-push ref-update context' "$R/push-prompt.txt" && exact_subjects=yes || exact_subjects=no
@@ -977,6 +1099,7 @@ compat_root="$COMPAT"
 # The extracted function also checks the installed plugin before consumer-local
 # compatibility paths. Point that location at an absent fixture so these cases
 # continue to isolate the transition fallbacks.
+# shellcheck disable=SC2034 # Referenced by the function body loaded through eval below.
 tooling_root="$COMPAT/nonexistent-plugin"
 # shellcheck disable=SC1090
 eval "$(sed -n '/^resolve_gate() {/,/^}/p' "$REPO_ROOT/.githooks/pre-push" | sed 's|\$repo_root|\$compat_root|g')"

@@ -46,8 +46,13 @@ setup() {  # -> repo path
   git -C "$d" config user.email t@t.test
   git -C "$d" config user.name tester
   mkdir -p "$d/.agents/hooks" "$d/.agents/state" "$d/.agents/lib" "$d/.agents/prompts" "$d/bin"
-  cp "$RUNNER" "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" "$d/.agents/hooks/"
-  cp "$REPO_ROOT/.agents/lib/subagent.sh" "$d/.agents/lib/"
+  cp "$RUNNER" "$REPO_ROOT/.agents/hooks/commit-push-audit.schema.json" \
+    "$REPO_ROOT/.agents/hooks/auditor-control.sh" "$d/.agents/hooks/"
+  cp "$REPO_ROOT/.agents/lib/subagent.sh" \
+    "$REPO_ROOT/.agents/lib/verdict-audit-state.sh" \
+    "$REPO_ROOT/.agents/lib/auditor-override-state.sh" \
+    "$REPO_ROOT/.agents/lib/auditor-control-state.sh" \
+    "$REPO_ROOT/.agents/lib/hook-interactive-prompt.sh" "$d/.agents/lib/"
   cp "$REPO_ROOT/.agents/prompts/"*.md "$d/.agents/prompts/"
   printf 'base\n' > "$d/f"
   git -C "$d" add -A
@@ -87,6 +92,9 @@ done
   printf 'schema=%s\n' "$([[ -r "$schema" ]] && echo readable || echo MISSING)"
 } > "$FAKE_DIR/flags.txt"
 printf '%s' "${CODEX_FAKE_OUTPUT:-}" > "$out"
+if [[ -n "${CODEX_FAKE_DELAY:-}" ]]; then
+  perl -e 'select(undef,undef,undef,$ARGV[0])' "$CODEX_FAKE_DELAY"
+fi
 exit "${CODEX_FAKE_RC:-0}"
 STUB
   chmod +x "$1/bin/codex"
@@ -136,6 +144,33 @@ R="$(setup)"; install_stub "$R"
 expect_fail "not JSON at all → FAIL"            "$(audit "$R" 'this is not json')"        "malformed"
 expect_fail "valid JSON, wrong shape → FAIL"    "$(audit "$R" '{"verdict":"PASS"}')"      "malformed"
 expect_fail "verdict outside the enum → FAIL"   "$(audit "$R" "$(bound_output "$R" MAYBE '[]')")" "malformed"
+
+echo
+echo "## Headless timing follows the actual auditor process"
+R_LIFECYCLE="$(setup)"; install_stub "$R_LIFECYCLE"
+lifecycle_session=session-lifecycle
+lifecycle_scope="git-$(printf '%s' "$lifecycle_session" | git -C "$R_LIFECYCLE" hash-object --stdin)"
+lifecycle_epoch=1101-1102-11
+printf '%s\n' "$lifecycle_epoch" \
+  > "$R_LIFECYCLE/.agents/state/verdict-prompt-epoch.$lifecycle_scope"
+lifecycle_output="$(bound_output "$R_LIFECYCLE" PASS '[]')"
+( cd "$R_LIFECYCLE" && CLAUDE_PROJECT_DIR="$R_LIFECYCLE" FAKE_DIR="$R_LIFECYCLE" \
+    CODEX_BIN="$R_LIFECYCLE/bin/codex" CODEX_FAKE_OUTPUT="$lifecycle_output" \
+    CODEX_FAKE_DELAY=0.2 CODEX_COMMIT_PUSH_AUDIT_MODE=agentic \
+    AUDITOR_SESSION_SCOPE="$lifecycle_scope" AUDITOR_PROMPT_EPOCH="$lifecycle_epoch" \
+    AUDITOR_PROMPT_AFTER_SECONDS=0 \
+    bash "$R_LIFECYCLE/.agents/hooks/run-commit-push-audit.sh" commit "$CMD" \
+) >/dev/null 2>&1
+lifecycle_rc=$?
+lifecycle_generation="$(printf '%s' "$CMD" | shasum -a 256 | awk '{print $1}')"
+lifecycle_escalation="$R_LIFECYCLE/.agents/state/auditor-control/escalation.$lifecycle_scope.commit-push-auditor.$lifecycle_generation.json"
+lifecycle_state="rc=$lifecycle_rc state=$(jq -r '.state // "missing"' "$lifecycle_escalation" 2>/dev/null) terminal=$(jq -r '.terminal // "missing"' "$lifecycle_escalation" 2>/dev/null)"
+if [[ "$lifecycle_state" == "rc=0 state=closed terminal=PASS" ]]; then
+  ok "the headless runner opens and closes escalation around the real Codex audit"
+else
+  bad "the headless runner opens and closes escalation around the real Codex audit ($lifecycle_state)"
+fi
+rm -rf "$R_LIFECYCLE"
 
 echo
 echo "## A dossier must bind to the tree it claims to have audited"

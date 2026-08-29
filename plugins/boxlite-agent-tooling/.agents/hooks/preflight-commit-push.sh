@@ -66,6 +66,19 @@ project_dir="${CLAUDE_PROJECT_DIR:-$repo_root}"
 tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 audit_file="$project_dir/.agents/state/last-audit.json"
 handoff_file="$project_dir/.agents/state/last-audit-handoff.json"
+verdict_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+override_state_lib="$tooling_root/.agents/lib/auditor-override-state.sh"
+if [[ ! -r "$verdict_state_lib" || ! -r "$override_state_lib" ]]; then
+  printf 'preflight-commit-push: shared audit state libraries are unavailable.\n' >&2
+  exit 2
+fi
+# shellcheck source=../lib/verdict-audit-state.sh
+source "$verdict_state_lib"
+# shellcheck source=../lib/auditor-override-state.sh
+source "$override_state_lib"
+# Assigned by auditor_override_load_valid_grant; initialize the sourced public output
+# explicitly so `set -u` and static analysis share the same boundary contract.
+auditor_override_nonce_hash=""
 # Transition mirrors. Where core.hooksPath is configured absolute rather than the
 # relative value `make setup` sets, one installed hook serves every worktree, so a
 # commit-msg from BEFORE this move can be the one that runs while this gate —
@@ -139,6 +152,113 @@ current_diff_hash() {
 
 diff_hash="$(current_diff_hash)"
 command_hash="$(printf '%s' "$command" | hash_stdin)"
+override_active=false
+override_scope=""
+override_epoch=""
+hook_session_scope=""
+hook_prompt_epoch=""
+handoff_owner_pid=""
+handoff_owner_start_token=""
+
+read_override_epoch() {  # session scope
+  local epoch_path="$project_dir/.agents/state/verdict-prompt-epoch.$1" epoch
+  epoch="$(verdict_audit_read_single_record "$epoch_path" 2>/dev/null)" || return 1
+  [[ "$epoch" =~ ^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$ ]] || return 1
+  printf '%s' "$epoch"
+}
+
+load_session_override() {
+  local session_state session_scope epoch
+  session_state="$(printf '%s' "$payload" | jq -r '
+    if (.session_id | type) == "string" and (.session_id | length) > 0
+    then "valid" else "absent" end
+  ' 2>/dev/null || echo absent)"
+  [[ "$session_state" == valid ]] || return 1
+  session_scope="$(verdict_audit_scope_from_hook_payload \
+    "$payload" "$repo_root" 2>/dev/null)" || return 1
+  epoch="$(read_override_epoch "$session_scope" 2>/dev/null)" || return 1
+  hook_session_scope="$session_scope"
+  hook_prompt_epoch="$epoch"
+  auditor_override_load_valid_grant "$repo_root" "$session_scope" "$epoch" || return 1
+  override_scope="$session_scope"
+  override_epoch="$epoch"
+  override_active=true
+}
+
+load_handoff_owner() {
+  local owner_pid owner_token
+  [[ -r "$handoff_file" ]] || return 1
+  owner_pid="$(jq -r '.owner.pid // ""' "$handoff_file" 2>/dev/null)"
+  owner_token="$(jq -r '.owner.start_token // ""' "$handoff_file" 2>/dev/null)"
+  verdict_audit_process_has_ancestor "$owner_pid" "$owner_token" || return 1
+  handoff_owner_pid="$owner_pid"
+  handoff_owner_start_token="$owner_token"
+}
+
+load_handoff_override() {
+  local handoff_scope handoff_epoch handoff_nonce handoff_branch handoff_head handoff_kind
+  load_handoff_owner || return 1
+  [[ -r "$handoff_file" ]] || return 1
+  handoff_scope="$(jq -r '.override.session_scope // ""' "$handoff_file" 2>/dev/null)"
+  handoff_epoch="$(jq -r '.override.prompt_epoch // ""' "$handoff_file" 2>/dev/null)"
+  handoff_nonce="$(jq -r '.override.nonce_hash // ""' "$handoff_file" 2>/dev/null)"
+  handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null)"
+  handoff_head="$(jq -r '.head // ""' "$handoff_file" 2>/dev/null)"
+  handoff_kind="$(jq -r '.command_kind // ""' "$handoff_file" 2>/dev/null)"
+  [[ "$handoff_branch" == "$branch" && "$handoff_head" == "$head" \
+     && "$handoff_kind" == "$kind" && "$handoff_nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
+  auditor_override_load_valid_grant \
+    "$repo_root" "$handoff_scope" "$handoff_epoch" || return 1
+  [[ "$auditor_override_nonce_hash" == "$handoff_nonce" ]] || return 1
+  override_scope="$handoff_scope"
+  override_epoch="$handoff_epoch"
+  override_active=true
+}
+
+load_handoff_lifecycle() {
+  local handoff_scope handoff_epoch handoff_branch handoff_head handoff_kind current_epoch
+  load_handoff_owner || return 1
+  [[ -r "$handoff_file" ]] || return 1
+  handoff_scope="$(jq -r '.lifecycle.session_scope // ""' "$handoff_file" 2>/dev/null)"
+  handoff_epoch="$(jq -r '.lifecycle.prompt_epoch // ""' "$handoff_file" 2>/dev/null)"
+  handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null)"
+  handoff_head="$(jq -r '.head // ""' "$handoff_file" 2>/dev/null)"
+  handoff_kind="$(jq -r '.command_kind // ""' "$handoff_file" 2>/dev/null)"
+  [[ "$handoff_scope" =~ ^git-[0-9a-f]{40}([0-9a-f]{24})?$ \
+     && "$handoff_epoch" =~ ^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$ \
+     && "$handoff_branch" == "$branch" && "$handoff_head" == "$head" \
+     && "$handoff_kind" == "$kind" ]] || return 1
+  current_epoch="$(read_override_epoch "$handoff_scope" 2>/dev/null)" || return 1
+  [[ "$current_epoch" == "$handoff_epoch" ]] || return 1
+  hook_session_scope="$handoff_scope"
+  hook_prompt_epoch="$handoff_epoch"
+}
+
+if [[ -n "${GITHOOK_DELEGATED:-}" ]]; then
+  load_handoff_lifecycle 2>/dev/null || true
+  load_handoff_override 2>/dev/null || true
+else
+  # Hook commands run in a short-lived launcher child. The launcher disappears before
+  # git starts, while its parent is the task runner shared by both command trees.
+  handoff_owner_pid="$(ps -p "$PPID" -o ppid= 2>/dev/null)"
+  handoff_owner_pid="${handoff_owner_pid//[[:space:]]/}"
+  [[ "$handoff_owner_pid" =~ ^[1-9][0-9]*$ ]] || handoff_owner_pid="$PPID"
+  handoff_owner_start_token="$(verdict_audit_process_start_token "$handoff_owner_pid" 2>/dev/null)" \
+    || { printf 'preflight-commit-push: could not bind git handoff ownership.\n' >&2; exit 2; }
+  load_session_override 2>/dev/null || true
+fi
+
+# Derive lifecycle ownership even when no override grant exists yet. The denied
+# attempt records this context in the handoff; native SubagentStart or the headless
+# runner starts the 30-second clock only when the actual auditor begins.
+if [[ -z "$hook_session_scope" && -z "${GITHOOK_DELEGATED:-}" ]]; then
+  hook_session_scope="$(verdict_audit_scope_from_hook_payload \
+    "$payload" "$repo_root" 2>/dev/null)" || hook_session_scope=""
+  if [[ -n "$hook_session_scope" ]]; then
+    hook_prompt_epoch="$(read_override_epoch "$hook_session_scope" 2>/dev/null)" \
+      || hook_prompt_epoch=""
+  fi
+fi
 
 deny() {
   jq -nc --arg r "$1" '{
@@ -155,13 +275,33 @@ write_command_handoff() {
   # The state dir is gitignored, so it does not exist in a fresh clone and the
   # redirect below would fail before jq ever ran.
   mkdir -p "$(dirname "$handoff_file")" 2>/dev/null || true
+  local override_json='null' lifecycle_json='null'
+  [[ "$handoff_owner_pid" =~ ^[1-9][0-9]*$ \
+     && "$handoff_owner_start_token" =~ ^cksum-[0-9]+-[0-9]+$ ]] || return 1
+  if [[ "$override_active" == true ]]; then
+    override_json="$(jq -nc --arg scope "$override_scope" --arg epoch "$override_epoch" \
+      --arg nonce "$auditor_override_nonce_hash" \
+      '{session_scope:$scope,prompt_epoch:$epoch,nonce_hash:$nonce}')"
+  fi
+  if [[ -n "$hook_session_scope" && -n "$hook_prompt_epoch" ]]; then
+    lifecycle_json="$(jq -nc --arg scope "$hook_session_scope" \
+      --arg epoch "$hook_prompt_epoch" \
+      '{session_scope:$scope,prompt_epoch:$epoch}')"
+  fi
   jq -nc \
     --arg branch "$branch" \
     --arg head "$head" \
     --arg command_kind "$kind" \
     --arg diff_hash "$diff_hash" \
     --arg command_hash "$command_hash" \
-    '{branch:$branch, head:$head, command_kind:$command_kind, diff_hash:$diff_hash, command_hash:$command_hash}' \
+    --argjson owner_pid "$handoff_owner_pid" \
+    --arg owner_start_token "$handoff_owner_start_token" \
+    --argjson override "$override_json" \
+    --argjson lifecycle "$lifecycle_json" \
+    '{branch:$branch, head:$head, command_kind:$command_kind, diff_hash:$diff_hash,
+      command_hash:$command_hash,
+      owner:{pid:$owner_pid,start_token:$owner_start_token},
+      override:$override, lifecycle:$lifecycle}' \
     > "$handoff_file"
   # `|| true` is load-bearing: this is the last command in the function, and the
   # defer path calls the function unguarded under `set -e`. Without it a mirror
@@ -170,8 +310,21 @@ write_command_handoff() {
   mirror_to_legacy "$handoff_file" "$legacy_handoff_file" || true
 }
 
+allow_override() {
+  local boundary="${kind}-pretool"
+  [[ -n "${GITHOOK_DELEGATED:-}" ]] && boundary="${kind}-preflight"
+  if ! auditor_override_log_use "$repo_root" "$override_scope" "$boundary" \
+      "$diff_hash" >/dev/null 2>&1; then
+    deny "Auditor override evidence could not be recorded; git ${kind} remains gated."
+  fi
+  jq -nc --arg kind "$kind" '{hookSpecificOutput:{hookEventName:"PreToolUse",
+    additionalContext:("OVERRIDDEN BY USER: " + $kind + " auditor skipped for this prompt; no PASS verdict was created.")}}'
+  exit 0
+}
+
 valid_handoff_command_hash() {
   [[ -r "$handoff_file" ]] || return 1
+  load_handoff_owner || return 1
 
   local handoff_branch handoff_head handoff_kind handoff_diff_hash handoff_command_hash handoff_mtime now_epoch handoff_age
   handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null || echo '')"
@@ -221,7 +374,7 @@ invoke_instruction="$(subagent_instruction \
   --description 'CLAUDE.md audit' \
   --artifact '.agents/state/last-audit.json' \
   --task "$(subagent_prompt commit-push-task "$tooling_root" "kind=${kind}" "branch=${branch}")" \
-  --headless "CODEX_COMMIT_PUSH_AUDIT_MODE=agentic bash '${tooling_root}/.agents/hooks/run-commit-push-audit.sh' ${kind} '<target command>'
+  --headless "AUDITOR_SESSION_SCOPE='${hook_session_scope}' AUDITOR_PROMPT_EPOCH='${hook_prompt_epoch}' CODEX_COMMIT_PUSH_AUDIT_MODE=agentic bash '${tooling_root}/.agents/hooks/run-commit-push-audit.sh' ${kind} '<target command>'
     (set CODEX_BIN if the default codex command is not usable)")
 
 Retry the same git command after the verdict reports PASS."
@@ -243,7 +396,6 @@ ${invoke_instruction}"
   audit_command_hash="$(jq -r '.command_hash // ""' "$audit_file" 2>/dev/null || echo '')"
   audit_commit_subject_hash="$(jq -r '.commit_subject_hash // ""' "$audit_file" 2>/dev/null || echo '')"
   audit_verdict="$(jq -r '.verdict // ""' "$audit_file" 2>/dev/null || echo '')"
-
   if [[ "$kind" == "push" && ! "$push_diff_hash_from_command" =~ ^[0-9a-f]{64}$ ]]; then
     deny "Push audits must be bound to git pre-push ref-update stdin via pushed_diff_sha256.
 
@@ -372,6 +524,13 @@ if [[ -z "${GITHOOK_DELEGATED:-}" ]]; then
   fi
 fi
 
+# Installation/guidance/framework checks remain owned by the git hooks above this
+# delegated call. This branch skips only the auditor verdict and deliberately returns
+# context (not permissionDecision:"allow"), so host approval policy is unchanged.
+if [[ "$override_active" == true ]]; then
+  allow_override
+fi
+
 # A push audit can only be produced HERE. validate_audit refuses any push dossier not
 # bound to pushed_diff_sha256, and that hash comes from the ref-update stdin git hands
 # the pre-push hook — input that exists for the duration of this call and cannot be
@@ -381,7 +540,9 @@ fi
 if [[ -n "${CODEX_SANDBOX:-}" && -n "${GITHOOK_DELEGATED:-}" && "$kind" == "push" ]]; then
   headless_auditor="$tooling_root/.agents/hooks/run-commit-push-audit.sh"
   if [[ -r "$headless_auditor" ]]; then
-    bash "$headless_auditor" "$kind" "$command" >/dev/null 2>&1 || true
+    AUDITOR_SESSION_SCOPE="$hook_session_scope" \
+      AUDITOR_PROMPT_EPOCH="$hook_prompt_epoch" \
+      bash "$headless_auditor" "$kind" "$command" >/dev/null 2>&1 || true
   fi
 fi
 

@@ -1952,6 +1952,44 @@ fi
 rm -rf "$D"
 
 echo
+echo "## Terminal-control failure retracts a headless verdict"
+R="$(setup)"
+generation=901-902-12
+session="session-a"
+scope="$(session_scope_of "$R" "$session")"
+write_session_request "$R" "$session" "$generation"
+printf '801-802-11\n' > "$R/.agents/state/verdict-prompt-epoch.$scope"
+TERMINAL_FAILURE_STUB='cat >/dev/null
+  control="$CLAUDE_PROJECT_DIR/.agents/state/auditor-control"
+  prompt="$control/prompt.$PROBE_SCOPE.verdict-auditor.$VERDICT_AUDITOR_GENERATION.json"
+  for _ in $(seq 1 100); do
+    [[ -r "$prompt" ]] && break
+    perl -e "select(undef,undef,undef,0.01)"
+  done
+  mutex="$control/control.$PROBE_SCOPE.mutex"
+  rm -f "$mutex"
+  mkfifo "$CLAUDE_PROJECT_DIR/terminal-fifo"
+  ln -s "$CLAUDE_PROJECT_DIR/terminal-fifo" "$mutex"
+  target="$VERDICT_AUDITOR_OUTPUT_FILE"
+  printf "{\"branch\":\"main\",\"head\":\"h\",\"tree_hash\":\"t\",\"generation\":\"%s\",\"verdict\":\"PASS\",\"proof\":[],\"findings\":[]}" \
+    "$VERDICT_AUDITOR_GENERATION" > "$target"'
+(
+  cd "$R" && CLAUDE_PROJECT_DIR="$R" PROBE_SCOPE="$scope" \
+    AUDITOR_PROMPT_AFTER_SECONDS=0 VERDICT_AUDITOR_CMD="$TERMINAL_FAILURE_STUB" \
+    bash "$RUNNER" "$R/transcript.jsonl" "$session" "$generation" "$scope" \
+      >"$R/out" 2>"$R/err"
+)
+terminal_failure_rc=$?
+terminal_publication="$(find "$R/.agents/state" -maxdepth 1 \
+  -name 'last-verdict*' -type f -print -quit)"
+terminal_failure_message=no
+grep -q 'could not close auditor prompt state' "$R/err" && terminal_failure_message=yes
+check_eq "terminal-control failure rejects and retracts the headless verdict" \
+  "rc=$terminal_failure_rc dossier=$([[ -n "$terminal_publication" ]] && echo present || echo absent) message=$terminal_failure_message" \
+  "rc=2 dossier=absent message=yes"
+rm -rf "$R"
+
+echo
 echo "## Frontmatter stripping: subagent wiring must never reach the model"
 # strip_frontmatter() is only called from the claude-CLI branch, so every other case in
 # this file leaves it uncovered — the keys it parses (name/tools/model/effort) decide
