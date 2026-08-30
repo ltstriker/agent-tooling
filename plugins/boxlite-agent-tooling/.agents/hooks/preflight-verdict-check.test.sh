@@ -427,6 +427,17 @@ if [[ "$native_cancel_contract" == "yes" ]]; then
 else
   fail=$((fail+1)); printf '  FAIL  %s\n' "native verdict instruction lacks a fresh cancelable handle"
 fi
+
+# Codex renders a Stop denial as hook feedback and retries with that feedback in the
+# user slot. The retry must still deliver the answer the user asked for; an audit status
+# or dossier path is workflow metadata, not a replacement conclusion.
+if [[ "$native_reason" == *"If the audit PASSes, repeat the blocked answer verbatim"* \
+   && "$native_reason" == *"If it FAILs, revise the answer"* \
+   && "$native_reason" == *"Do not substitute audit status or dossier metadata"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "verdict instruction preserves the blocked user-facing answer"
+else
+  fail=$((fail+1)); printf '  FAIL  %s\n' "verdict instruction lets audit feedback replace the user-facing answer"
+fi
 rm -rf "$R"
 
 # Native auditors publish to generation-owned paths. Even if canceled generation A
