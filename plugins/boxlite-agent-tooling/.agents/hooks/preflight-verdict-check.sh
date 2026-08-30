@@ -659,7 +659,9 @@ verdict_patterns+='|(部署|服务|线上)(正常|健康|稳定)'
 #     hand-edit the dossier (that is grading its own homework / confabulating proof).
 #   • Offer the honest exits: IN_PROGRESS if not actually done; a `blocked` proof
 #     entry (with residual risk) if proof genuinely can't be produced in this env.
-#   • After the auditor reports, end the turn again; this hook re-checks.
+#   • After the auditor reports, deliver the intended user-facing answer again. PASS
+#     repeats the blocked text so its checksum stays bound; FAIL revises and re-audits.
+#     Hook feedback and audit metadata are control-plane output, not the conclusion.
 #
 #   • When a prior audit FAILED on this same work, hand its findings to the auditor so
 #     round N+1 re-checks them against the delta instead of re-deriving every claim
@@ -996,7 +998,9 @@ active Task. Do not wait for an audit whose question the user just superseded.
 
 If you are pausing or asking the user something, have the auditor record IN_PROGRESS
 with what remains; if a claim genuinely cannot be proven here, it can mark that proof
-'blocked' with the residual risk. Then end your turn again.${prior}
+'blocked' with the residual risk. After the audit completes, deliver the user-facing answer again.
+If the audit PASSes, repeat the blocked answer verbatim. If it FAILs, revise the answer to address the findings; the revised answer must be re-audited.
+Do not substitute audit status or dossier metadata for that answer. Then end your turn again.${prior}
 EOF
 }
 
