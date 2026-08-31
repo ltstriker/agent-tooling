@@ -307,7 +307,7 @@ run_commit() {  # repo  agent|human [message]
   echo $?
 }
 
-write_broken_preflight() {  # repo exit|invalid
+write_broken_preflight() {  # repo exit|invalid|decisionless|allow-empty|capture-allow
   local repo="$1" mode="$2"
   case "$mode" in
     exit)
@@ -332,6 +332,22 @@ BROKEN_PREFLIGHT
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n'
 BROKEN_PREFLIGHT
       ;;
+    allow-empty)
+      cat > "$repo/.agents/hooks/preflight-commit-push.sh" <<'BROKEN_PREFLIGHT'
+#!/usr/bin/env bash
+exit 0
+BROKEN_PREFLIGHT
+      ;;
+    capture-allow)
+      cat > "$repo/.agents/hooks/preflight-commit-push.sh" <<'BROKEN_PREFLIGHT'
+#!/usr/bin/env bash
+repo="$(git rev-parse --show-toplevel)"
+context="$(git rev-parse --git-path codex-audit/last-push-audit-context.diff)"
+[[ "$context" == /* ]] || context="$repo/$context"
+cp "$context" "$repo/captured-push-evidence.diff"
+exit 0
+BROKEN_PREFLIGHT
+      ;;
   esac
   chmod +x "$repo/.agents/hooks/preflight-commit-push.sh"
 }
@@ -342,7 +358,13 @@ try_commit() {  # repo  agent|human
   run_commit "$repo" "$who"
 }
 
-grep -q 'last-push-audit-context.diff' "$REPO_ROOT/.claude/agents/commit-push-auditor.md" && auditor_exact=yes || auditor_exact=no
+if grep -q 'last-push-audit-context.json' "$REPO_ROOT/.claude/agents/commit-push-auditor.md" \
+    && grep -q '\.diff.*companion' "$REPO_ROOT/.claude/agents/commit-push-auditor.md" \
+    && grep -q "context diff file's SHA-256" "$REPO_ROOT/.claude/agents/commit-push-auditor.md"; then
+  auditor_exact=yes
+else
+  auditor_exact=no
+fi
 check_eq "commit-push auditor prompt uses exact push context" "$auditor_exact" "yes"
 grep -q 'git log origin/main..HEAD' "$REPO_ROOT/.claude/agents/commit-push-auditor.md" && auditor_broad=yes || auditor_broad=no
 check_eq "commit-push auditor prompt omits broad push subject range" "$auditor_broad" "no"
@@ -536,6 +558,112 @@ rm -rf "$R" "$B"
 
 echo
 echo "## pre-push: same contract at the push boundary"
+
+# The real Git protocol is a stream. The hook must cap that stream before it
+# expands each update into logs/diffs; the runner's later 16 MiB read cap cannot
+# reclaim time or disk already spent by this producer.
+R="$(setup)"
+B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
+same_sha="$(git -C "$R" rev-parse HEAD)"
+large_ref_component="$(perl -e 'print "r" x 180')"
+many_refs="$R/many-ref-updates.in"
+installed_pre_push="$(git -C "$R" config --worktree --get core.hooksPath)/pre-push"
+: > "$many_refs"
+for many_ref_index in $(seq 1 1000); do
+  printf 'refs/heads/%s-%04d %s refs/heads/%s-%04d %s\n' \
+    "$large_ref_component" "$many_ref_index" "$same_sha" \
+    "$large_ref_component" "$many_ref_index" "$same_sha" >> "$many_refs"
+done
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CLAUDECODE=1 \
+    BOXLITE_PR_WATCH=0 bash "$installed_pre_push" origin "$B" \
+    < "$many_refs" >/dev/null 2>"$R/err.txt" )
+many_refs_rc=$?
+check_eq "oversized ref-update ingress fails closed before diff expansion" \
+  "$many_refs_rc" 1
+grep -q 'ref-update input exceeds the 262144-byte ingress limit' "$R/err.txt" \
+  && many_refs_named=yes || many_refs_named=no
+check_eq "oversized ref-update rejection names its hard ingress limit" \
+  "$many_refs_named" yes
+rm -rf "$R" "$B"
+
+R="$(setup)"
+B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
+perl -e 'print "large pushed diff line: ", "x" x (17 * 1024 * 1024)' > "$R/large-diff.txt"
+git -C "$R" add large-diff.txt
+env -i PATH="$PATH" HOME="$HOME" git -C "$R" \
+  -c user.email=t@t.test -c user.name=tester commit -qm 'test(hooks): large push ingress'
+large_sha="$(git -C "$R" rev-parse HEAD)"
+installed_pre_push="$(git -C "$R" config --worktree --get core.hooksPath)/pre-push"
+printf 'refs/heads/large %s refs/heads/large %s\n' \
+  "$large_sha" "$(zero_sha)" > "$R/large-ref-update.in"
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CLAUDECODE=1 \
+    BOXLITE_PR_WATCH=0 bash "$installed_pre_push" origin "$B" \
+    < "$R/large-ref-update.in" >/dev/null 2>"$R/err.txt" )
+large_diff_rc=$?
+check_eq "oversized expanded push diff fails closed at the producer" \
+  "$large_diff_rc" 1
+grep -q 'expanded push context exceeds the 16777216-byte ingress limit' "$R/err.txt" \
+  && large_diff_named=yes || large_diff_named=no
+check_eq "expanded-context rejection names its producer-side limit" \
+  "$large_diff_named" yes
+rm -rf "$R" "$B"
+
+# The remote-advertised old object may be absent from a shallow/stale local
+# object database. An empty header is not review evidence, and pre-push may not
+# fetch, so this boundary must reject before calling the delegated auditor.
+R="$(setup)"
+B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
+write_broken_preflight "$R" allow-empty
+installed_pre_push="$(git -C "$R" config --worktree --get core.hooksPath)/pre-push"
+local_sha="$(git -C "$R" rev-parse HEAD)"
+missing_old_sha="1111111111111111111111111111111111111111"
+printf 'refs/heads/main %s refs/heads/main %s\n' \
+  "$local_sha" "$missing_old_sha" > "$R/missing-old-ref-update.in"
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CLAUDECODE=1 \
+    BOXLITE_PR_WATCH=0 bash "$installed_pre_push" origin "$B" \
+    < "$R/missing-old-ref-update.in" >/dev/null 2>"$R/err.txt" )
+missing_old_rc=$?
+check_eq "missing remote old object rejects evidence-free push audit" \
+  "$missing_old_rc" 1
+grep -q 'advertised old object .* is unavailable locally; fetch before pushing' \
+  "$R/err.txt" && missing_old_named=yes || missing_old_named=no
+check_eq "missing-old-object rejection explains the local evidence requirement" \
+  "$missing_old_named" yes
+rm -rf "$R" "$B"
+
+# Replace refs alter ordinary revision traversal, but Git pushes the raw object
+# named by the ref. The audit context must therefore ignore replacements too.
+# This drives a real push and inspects both sides of the boundary: the evidence
+# captured by the delegated gate and the raw file stored by the bare remote.
+R="$(setup)"
+B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
+base_sha="$(git -C "$R" rev-parse HEAD)"
+printf 'bad raw payload\n' > "$R/f"
+git -C "$R" add f
+env -i PATH="$PATH" HOME="$HOME" git -C "$R" \
+  -c user.email=t@t.test -c user.name=tester \
+  commit -qm 'test(hooks): raw replacement payload'
+raw_bad_sha="$(git -C "$R" rev-parse HEAD)"
+base_tree="$(git -C "$R" rev-parse "${base_sha}^{tree}")"
+clean_replacement_sha="$(printf 'test(hooks): clean replacement view\n' \
+  | git -C "$R" -c user.email=t@t.test -c user.name=tester \
+      commit-tree "$base_tree" -p "$base_sha")"
+git -C "$R" replace "$raw_bad_sha" "$clean_replacement_sha"
+write_broken_preflight "$R" capture-allow
+replace_remote_ref="refs/heads/replace-evidence"
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CLAUDECODE=1 \
+    BOXLITE_PR_WATCH=0 git push -q origin \
+    "HEAD:$replace_remote_ref" >/dev/null 2>"$R/err.txt" )
+replace_push_rc=$?
+replace_remote_sha="$(git --git-dir="$B" rev-parse "$replace_remote_ref" 2>/dev/null || true)"
+replace_remote_body="$(git --git-dir="$B" show "$replace_remote_ref:f" 2>/dev/null || true)"
+grep -q '^+bad raw payload$' "$R/captured-push-evidence.diff" 2>/dev/null \
+  && replace_evidence=raw || replace_evidence=sanitized
+check_eq "push evidence ignores replace objects and matches the raw remote commit" \
+  "$replace_push_rc:$replace_remote_sha:$replace_remote_body:$replace_evidence" \
+  "0:$raw_bad_sha:bad raw payload:raw"
+rm -rf "$R" "$B"
+
 R="$(setup)"
 B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
 branch_ref="$(current_branch_ref "$R")"
@@ -547,6 +675,34 @@ context_path="$(git -C "$R" rev-parse --git-path codex-audit/last-push-audit-con
 [[ "$context_path" != /* ]] && context_path="$R/$context_path"
 [[ -e "$context_path" && "$context_path" != "$R/.agents/state/"* ]] && context_retained=yes || context_retained=no
 check_eq "rejected push keeps git-private diff context" "$context_retained" "yes"
+rm -rf "$R" "$B"
+
+R="$(setup)"
+B="$(mktemp -d)"; git init -q --bare "$B"; git -C "$R" remote add origin "$B"
+branch_ref="$(current_branch_ref "$R")"
+context_dir="$(git -C "$R" rev-parse --git-path codex-audit)"
+[[ "$context_dir" != /* ]] && context_dir="$R/$context_dir"
+mkdir -p "$context_dir"
+printf 'outside diff sentinel\n' > "$R/outside-context.diff"
+printf 'outside metadata sentinel\n' > "$R/outside-context.json"
+ln -s "$R/outside-context.diff" "$context_dir/last-push-audit-context.diff"
+ln -s "$R/outside-context.json" "$context_dir/last-push-audit-context.json"
+( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CLAUDECODE=1 BOXLITE_PR_WATCH=0 \
+    git push -q origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
+unsafe_publish_rc=$?
+if [[ "$unsafe_publish_rc" == 1 \
+   && "$(cat "$R/outside-context.diff")" == "outside diff sentinel" \
+   && "$(cat "$R/outside-context.json")" == "outside metadata sentinel" \
+   && -f "$context_dir/last-push-audit-context.diff" \
+   && ! -L "$context_dir/last-push-audit-context.diff" \
+   && -f "$context_dir/last-push-audit-context.json" \
+   && ! -L "$context_dir/last-push-audit-context.json" ]]; then
+  unsafe_publish=atomic
+else
+  unsafe_publish=followed
+fi
+check_eq "pre-push context publication never follows destination symlinks" \
+  "$unsafe_publish" atomic
 rm -rf "$R" "$B"
 
 R="$(setup)"
@@ -596,6 +752,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 printf '%s\n' "$prompt" > "$cd_arg/push-prompt.txt"
+evidence_path_json="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence path JSON: //p' | head -1)"
+evidence_path="$(printf '%s' "$evidence_path_json" | jq -er 'select(type == "string")')"
+evidence_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence SHA-256: //p' | head -1)"
+[[ -r "$evidence_path" ]]
+[[ "$(shasum -a 256 < "$evidence_path" | awk '{print $1}')" == "$evidence_hash" ]]
+cp "$evidence_path" "$cd_arg/push-evidence.txt"
 branch="$(git -C "$cd_arg" branch --show-current)"
 head="$(git -C "$cd_arg" rev-parse HEAD)"
 diff_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected diff hash: //p')"
@@ -627,16 +789,27 @@ push_lifecycle_escalation="$(find "$R/.agents/state/auditor-control" -type f \
 push_lifecycle_state="$(jq -r '.state + ":" + .terminal' "$push_lifecycle_escalation" 2>/dev/null)"
 check_eq "automatic pre-push carries session lifecycle into the real headless audit" \
   "$push_lifecycle_state" "closed:PASS"
-grep -q 'Sanitized pre-push ref-update diff' "$R/push-prompt.txt" && exact_prompt=yes || exact_prompt=no
-check_eq "Codex push audit prompt uses pre-push diff context" "$exact_prompt" "yes"
-grep -q 'Commit subjects in the exact pre-push ref-update context' "$R/push-prompt.txt" && exact_subjects=yes || exact_subjects=no
-check_eq "Codex push audit prompt uses exact ref-update subjects" "$exact_subjects" "yes"
-grep -q '"test(hooks): codex delegated push audit"' "$R/push-prompt.txt" && pushed_subject=yes || pushed_subject=no
-check_eq "Codex push audit prompt includes pushed subject JSON" "$pushed_subject" "yes"
-grep -q '"base"' "$R/push-prompt.txt" && base_subject=yes || base_subject=no
-check_eq "Codex push audit prompt excludes already-pushed subject JSON" "$base_subject" "no"
-grep -q 'Commit subjects on origin/main..HEAD' "$R/push-prompt.txt" && broad_subjects=yes || broad_subjects=no
-check_eq "Codex push audit prompt omits broad branch subjects" "$broad_subjects" "no"
+grep -Eq '^Evidence path JSON: ".*"$' "$R/push-prompt.txt" \
+  && grep -Eq '^Evidence SHA-256: [0-9a-f]{64}$' "$R/push-prompt.txt" \
+  && evidence_binding=yes || evidence_binding=no
+check_eq "Codex push prompt binds readable private evidence by path and hash" "$evidence_binding" "yes"
+grep -q 'Sanitized pre-push ref-update diff' "$R/push-evidence.txt" && exact_prompt=yes || exact_prompt=no
+check_eq "Codex push audit evidence uses pre-push diff context" "$exact_prompt" "yes"
+grep -q 'Commit subjects in the exact pre-push ref-update context' "$R/push-evidence.txt" && exact_subjects=yes || exact_subjects=no
+check_eq "Codex push audit evidence uses exact ref-update subjects" "$exact_subjects" "yes"
+grep -q '"test(hooks): codex delegated push audit"' "$R/push-evidence.txt" && pushed_subject=yes || pushed_subject=no
+check_eq "Codex push audit evidence includes pushed subject JSON" "$pushed_subject" "yes"
+grep -q '"base"' "$R/push-evidence.txt" && base_subject=yes || base_subject=no
+check_eq "Codex push audit evidence excludes already-pushed subject JSON" "$base_subject" "no"
+grep -q 'Commit subjects on origin/main..HEAD' "$R/push-evidence.txt" && broad_subjects=yes || broad_subjects=no
+check_eq "Codex push audit evidence omits broad branch subjects" "$broad_subjects" "no"
+if grep -q 'Sanitized pre-push ref-update diff' "$R/push-prompt.txt" \
+    || grep -q '"test(hooks): codex delegated push audit"' "$R/push-prompt.txt"; then
+  eager_context=yes
+else
+  eager_context=no
+fi
+check_eq "Codex push prompt keeps full diff and subjects lazy" "$eager_context" "no"
 rm -rf "$R" "$B"
 
 R="$(setup)"
@@ -666,6 +839,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 printf '%s\n' "$prompt" > "$cd_arg/new-ref-prompt.txt"
+evidence_path_json="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence path JSON: //p' | head -1)"
+evidence_path="$(printf '%s' "$evidence_path_json" | jq -er 'select(type == "string")')"
+evidence_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence SHA-256: //p' | head -1)"
+[[ -r "$evidence_path" ]]
+[[ "$(shasum -a 256 < "$evidence_path" | awk '{print $1}')" == "$evidence_hash" ]]
+cp "$evidence_path" "$cd_arg/new-ref-evidence.txt"
 branch="$(git -C "$cd_arg" branch --show-current)"
 head="$(git -C "$cd_arg" rev-parse HEAD)"
 diff_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected diff hash: //p')"
@@ -677,7 +856,7 @@ NEW_REF_FAKE_CODEX
 chmod +x "$R/bin/codex"
 ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" git push -q origin "refs/heads/new-ref-test:refs/heads/new-ref-test" >/dev/null 2>"$R/err.txt" )
 check_eq "Codex delegated new-ref push self-audits from remote base" "$?" 0
-grep -q '+new ref' "$R/new-ref-prompt.txt" && grep -q 'commit-subject .*test(hooks): new ref audit' "$R/new-ref-prompt.txt" && ! grep -q 'commit-subject .*base' "$R/new-ref-prompt.txt" && new_ref_context=yes || new_ref_context=no
+grep -q '+new ref' "$R/new-ref-evidence.txt" && grep -q 'commit-subject .*test(hooks): new ref audit' "$R/new-ref-evidence.txt" && ! grep -q 'commit-subject .*base' "$R/new-ref-evidence.txt" && new_ref_context=yes || new_ref_context=no
 check_eq "new-ref audit excludes unchanged base history" "$new_ref_context" "yes"
 rm -rf "$R" "$B"
 
@@ -724,6 +903,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 printf '%s\n' "$prompt" > "$cd_arg/closest-base-prompt.txt"
+evidence_path_json="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence path JSON: //p' | head -1)"
+evidence_path="$(printf '%s' "$evidence_path_json" | jq -er 'select(type == "string")')"
+evidence_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence SHA-256: //p' | head -1)"
+[[ -r "$evidence_path" ]]
+[[ "$(shasum -a 256 < "$evidence_path" | awk '{print $1}')" == "$evidence_hash" ]]
+cp "$evidence_path" "$cd_arg/closest-base-evidence.txt"
 branch="$(git -C "$cd_arg" branch --show-current)"
 head="$(git -C "$cd_arg" rev-parse HEAD)"
 diff_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected diff hash: //p')"
@@ -735,9 +920,9 @@ CLOSEST_BASE_FAKE_CODEX
 chmod +x "$R/bin/codex"
 ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" git push -q origin "refs/heads/closest-base-test:refs/heads/closest-base-test" >/dev/null 2>"$R/err.txt" )
 check_eq "Codex delegated closest-base push self-audits" "$?" 0
-grep -q 'commit-subject .*closest base new commit' "$R/closest-base-prompt.txt" \
-  && ! grep -q 'commit-subject .*zzz-late c1' "$R/closest-base-prompt.txt" \
-  && ! grep -q 'commit-subject .*zzz-late c2' "$R/closest-base-prompt.txt" \
+grep -q 'commit-subject .*closest base new commit' "$R/closest-base-evidence.txt" \
+  && ! grep -q 'commit-subject .*zzz-late c1' "$R/closest-base-evidence.txt" \
+  && ! grep -q 'commit-subject .*zzz-late c2' "$R/closest-base-evidence.txt" \
   && closest_base_context=yes || closest_base_context=no
 check_eq "new-ref base picks closest ancestor, not first in ref order" "$closest_base_context" "yes"
 rm -rf "$R" "$B" "$aaa_zzz_err"
@@ -790,6 +975,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 printf '%s\n' "$prompt" > "$cd_arg/moved-on-prompt.txt"
+evidence_path_json="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence path JSON: //p' | head -1)"
+evidence_path="$(printf '%s' "$evidence_path_json" | jq -er 'select(type == "string")')"
+evidence_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence SHA-256: //p' | head -1)"
+[[ -r "$evidence_path" ]]
+[[ "$(shasum -a 256 < "$evidence_path" | awk '{print $1}')" == "$evidence_hash" ]]
+cp "$evidence_path" "$cd_arg/moved-on-evidence.txt"
 branch="$(git -C "$cd_arg" branch --show-current)"
 head="$(git -C "$cd_arg" rev-parse HEAD)"
 diff_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected diff hash: //p')"
@@ -801,10 +992,10 @@ MOVED_ON_FAKE_CODEX
 chmod +x "$R/bin/codex"
 ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" git push -q origin "refs/heads/moved-on-feature:refs/heads/moved-on-feature" >/dev/null 2>"$moved_on_err" )
 check_eq "Codex delegated moved-on-base push self-audits" "$?" 0
-grep -q 'commit-subject .*feature before main moves on' "$R/moved-on-prompt.txt" \
-  && grep -q 'commit-subject .*feature after main moved on' "$R/moved-on-prompt.txt" \
-  && ! grep -q 'commit-subject .*main moved on c1' "$R/moved-on-prompt.txt" \
-  && ! grep -q 'commit-subject .*main moved on c2' "$R/moved-on-prompt.txt" \
+grep -q 'commit-subject .*feature before main moves on' "$R/moved-on-evidence.txt" \
+  && grep -q 'commit-subject .*feature after main moved on' "$R/moved-on-evidence.txt" \
+  && ! grep -q 'commit-subject .*main moved on c1' "$R/moved-on-evidence.txt" \
+  && ! grep -q 'commit-subject .*main moved on c2' "$R/moved-on-evidence.txt" \
   && moved_on_context=yes || moved_on_context=no
 check_eq "new-ref base finds real fork point after default branch moves on" "$moved_on_context" "yes"
 rm -rf "$R" "$B" "$moved_on_err"
@@ -839,6 +1030,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 printf '%s\n' "$prompt" > "$cd_arg/rewind-prompt.txt"
+evidence_path_json="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence path JSON: //p' | head -1)"
+evidence_path="$(printf '%s' "$evidence_path_json" | jq -er 'select(type == "string")')"
+evidence_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence SHA-256: //p' | head -1)"
+[[ -r "$evidence_path" ]]
+[[ "$(shasum -a 256 < "$evidence_path" | awk '{print $1}')" == "$evidence_hash" ]]
+cp "$evidence_path" "$cd_arg/rewind-evidence.txt"
 branch="$(git -C "$cd_arg" branch --show-current)"
 head="$(git -C "$cd_arg" rev-parse HEAD)"
 diff_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected diff hash: //p')"
@@ -850,7 +1047,7 @@ REWIND_FAKE_CODEX
 chmod +x "$R/bin/codex"
 ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" git push -q --force origin "$branch_ref:$branch_ref" >/dev/null 2>"$R/err.txt" )
 check_eq "Codex delegated force-push rewind self-audits" "$?" 0
-grep -q '^-force rewind' "$R/rewind-prompt.txt" && rewind_diff=yes || rewind_diff=no
+grep -q '^-force rewind' "$R/rewind-evidence.txt" && rewind_diff=yes || rewind_diff=no
 check_eq "force-push rewind audit includes reverse diff" "$rewind_diff" "yes"
 rm -rf "$R" "$B"
 
@@ -879,6 +1076,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 printf '%s\n' "$prompt" > "$cd_arg/delete-prompt.txt"
+evidence_path_json="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence path JSON: //p' | head -1)"
+evidence_path="$(printf '%s' "$evidence_path_json" | jq -er 'select(type == "string")')"
+evidence_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Evidence SHA-256: //p' | head -1)"
+[[ -r "$evidence_path" ]]
+[[ "$(shasum -a 256 < "$evidence_path" | awk '{print $1}')" == "$evidence_hash" ]]
+cp "$evidence_path" "$cd_arg/delete-evidence.txt"
 branch="$(git -C "$cd_arg" branch --show-current)"
 head="$(git -C "$cd_arg" rev-parse HEAD)"
 diff_hash="$(printf '%s\n' "$prompt" | sed -n 's/^Expected diff hash: //p')"
@@ -890,7 +1093,7 @@ DELETE_FAKE_CODEX
 chmod +x "$R/bin/codex"
 ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" CODEX_SANDBOX=seatbelt CODEX_BIN="$R/bin/codex" git push -q origin ":$delete_ref" >/dev/null 2>"$R/err.txt" )
 check_eq "Codex delegated delete-ref push self-audits" "$?" 0
-grep -q "deleted $delete_ref" "$R/delete-prompt.txt" && delete_diff=yes || delete_diff=no
+grep -q "deleted $delete_ref" "$R/delete-evidence.txt" && delete_diff=yes || delete_diff=no
 check_eq "delete-ref audit includes deletion context" "$delete_diff" "yes"
 rm -rf "$R" "$B"
 

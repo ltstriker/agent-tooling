@@ -353,6 +353,27 @@ check_eq "Stop records OVERRIDDEN without writing a PASS dossier" \
   "note=$(printf '%s' "$stop_out" | jq -r '.systemMessage | contains("OVERRIDDEN BY USER")') dossier=$([[ -e "$R/.agents/state/last-verdict.json.$scope" ]] && echo yes || echo no)" \
   "note=true dossier=no"
 
+# A syntactically decimal timestamp wider than Bash's signed integer wraps before
+# the lifetime comparison. Persist the hostile values as strings so jq does not
+# round them, then prove the shared grant reader rejects them at its boundary.
+override_now="$(date +%s)"
+overflow_created="$(perl -Mbignum -e 'print 18446744073709551616 + $ARGV[0] - 1' \
+  "$override_now")"
+overflow_expires="$(perl -Mbignum -e 'print 18446744073709551616 + $ARGV[0] + 60' \
+  "$override_now")"
+override_repo_hash="$(auditor_override_repo_identity "$R")"
+jq -nc --arg created "$overflow_created" --arg expires "$overflow_expires" \
+  --arg scope "$scope" --arg epoch 301-302-8 --arg repo "$override_repo_hash" '
+  {created_at:$created,expires_at:$expires,session_scope:$scope,prompt_epoch:$epoch,
+   repo_hash:$repo,nonce_hash:("a"*64),reason_hash:("b"*64)}' > "$grant_file"
+if auditor_override_load_valid_grant "$R" "$scope" 301-302-8; then
+  overflow_grant_valid=yes
+else
+  overflow_grant_valid=no
+fi
+check_eq "override grants reject timestamps wider than Bash arithmetic" \
+  "$overflow_grant_valid" no
+
 normal_payload="$(jq -nc --arg s "$session" --arg p 'next request' \
   '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"
 handle_prompt "$R" "$normal_payload" 301-302-8 401-402-9 >/dev/null

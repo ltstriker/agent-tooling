@@ -826,5 +826,17 @@ check_eq "a duplicate runner cannot displace the session's cancellable owner" \
 rm -rf "$R"
 
 echo
+echo "## Prompt cancellation removes generation-owned native prior snapshots"
+R="$(setup)"
+prior_prefix="$(session_state_path "$R" verdict-previous-dossier.json session-a).input-"
+printf '%s\n' old > "${prior_prefix}101-102-3"
+printf '%s\n' newer > "${prior_prefix}201-202-4"
+prompt_hook "$R" session-a turn-a >/dev/null 2>&1
+remaining_prior_inputs="$(compgen -G "${prior_prefix}*" | head -n 1 || true)"
+check_eq "a new prompt removes every generation-owned native prior snapshot" \
+  "${remaining_prior_inputs:-none}" none
+rm -rf "$R"
+
+echo
 echo "RESULT: $pass passed, $fail failed"
 exit $(( fail > 0 ? 1 : 0 ))

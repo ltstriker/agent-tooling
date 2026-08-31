@@ -49,6 +49,19 @@ echo "## The canonical document is small and domain-neutral"
 lines="$(wc -l < "$CANON" | tr -d ' ')"
 [[ "$lines" -le 150 ]] && ok "canonical stays within the 150-line budget ($lines)" \
                        || bad "canonical exceeds the 150-line budget ($lines)"
+# The repository-specific preface is eager context too, but deliberately lives
+# outside the frozen canonical block. Keep its separate budget here so adding a local
+# release rule cannot quietly undo the context reduction guarded below.
+REPO_INSTRUCTIONS="$PLUGIN_ROOT/../../AGENTS.md"
+preface="$(awk '/^<!-- agent-tooling:guidance:begin / { exit } { print }' \
+  "$REPO_INSTRUCTIONS")"
+preface_bytes="$(LC_ALL=C printf '%s' "$preface" | wc -c | tr -d ' ')"
+preface_words="$(printf '%s' "$preface" | wc -w | tr -d ' ')"
+if (( preface_bytes <= 2048 && preface_words <= 250 )); then
+  ok "repository preface stays within its eager-context budget (${preface_words}w/${preface_bytes}b)"
+else
+  bad "repository preface exceeds 250 words or 2048 bytes (${preface_words}w/${preface_bytes}b)"
+fi
 # Line 1 is the managed-by notice and legitimately names the tooling repo; every
 # other line must be free of repo-, path-, and toolchain-specific residue.
 leaks="$(tail -n +2 "$CANON" | grep -inE 'boxlite|imagemanager|jailer' || true)"
@@ -60,6 +73,35 @@ leaks="$(tail -n +2 "$CANON" | grep -nE '\]\(\./|/codex:|src/|`make [a-z]' || tr
 grep -q 'agent-tooling:guidance:' "$CANON" \
   && bad "canonical must not contain its own marker string" \
   || ok "canonical does not contain its own marker string"
+
+# Size alone is not a safety contract. Pin the eager kernel's non-negotiable
+# semantics on single rules so prose reduction cannot delete one unnoticed.
+require_semantic_rule() { # description, same-line ERE
+  local description="$1" pattern="$2"
+  if grep -Ei "$pattern" "$CANON" >/dev/null 2>&1; then
+    ok "$description"
+  else
+    bad "$description"
+  fi
+}
+require_semantic_rule "guidance pins source-first understanding" \
+  'README/CONTRIBUTING.*actual source before editing'
+require_semantic_rule "guidance pins focused scope" \
+  'small, deliberate changes.*don.t rewrite or reformat unrelated code'
+require_semantic_rule "guidance pins explicit errors and secret masking" \
+  'Explicit errors.*fail fast.*Never swallow silently.*Mask secrets'
+require_semantic_rule "guidance pins bounded concurrent work and cleanup" \
+  'Concurrency:.*No unbounded.*Close/release'
+require_semantic_rule "guidance pins input validation and shell safety" \
+  'Security: no secrets.*Validate before.*Avoid shell execution with untrusted input'
+require_semantic_rule "guidance pins full-revert red proof" \
+  'revert .*every.* production change.*only the test remains'
+require_semantic_rule "guidance pins production-boundary tests" \
+  'data must come from production code under test'
+require_semantic_rule "guidance pins evidence-qualified reporting" \
+  'Don.t claim tests passed unless they actually ran.*residual risk'
+require_semantic_rule "guidance pins auditor ownership of proof" \
+  'auditor .*never you.* writes the dossier'
 
 echo
 echo "## A repository with no instructions files gets the canonical layout"

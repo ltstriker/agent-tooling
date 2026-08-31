@@ -46,9 +46,10 @@ chmod +x "$consumer/.agent-tooling/codex-plugin-bootstrap.sh"
 ```
 
 If `.codex/hooks.json` already contains unrelated project hooks, merge the template's
-`SessionStart` entry instead of overwriting the file. Do not combine it with the
-prompt-only `templates/codex-hooks.json`: the installed plugin already supplies that
-`UserPromptSubmit` rule.
+`SessionStart` entry instead of overwriting the file. Add the prompt-only
+`templates/codex-hooks.json` only when the repository explicitly wants its compact
+reply reminder; the full plugin keeps `UserPromptSubmit` silent except for audit
+cancellation.
 
 The clone-side flow is:
 
@@ -230,7 +231,7 @@ body — fails closed, while a block merely behind the adopted revision only war
 hand-edited block deliberately with
 `AGENT_TOOLING_GUIDANCE_FORCE=1 ./.agent-tooling/install.sh`.
 
-The canonical text is pinned by `scripts/sync-guidance.test.sh` to stay under 150
+The canonical text is pinned by `scripts/sync-guidance.test.sh` to stay within 150
 lines and free of repo-specific residue — concrete exemplars belong in each
 consumer's own half of the file. A consumer CI backstop is two commands:
 `./.agent-tooling/install.sh && git diff --exit-code -- AGENTS.md CLAUDE.md`
@@ -262,7 +263,17 @@ such as `env`, and overwriting it would drop them:
 ```sh
 mkdir -p "$consumer/.claude"
 if [ -f "$consumer/.claude/settings.json" ]; then
-  jq -s '.[0] * .[1]' "$consumer/.claude/settings.json" templates/claude-settings.json \
+  jq -s '
+    .[0] as $current | .[1] as $rules |
+    ($current * $rules) |
+    .hooks.UserPromptSubmit = (
+      reduce (
+        (($current.hooks.UserPromptSubmit // []) +
+         ($rules.hooks.UserPromptSubmit // []))[]
+      ) as $entry
+        ([]; if index($entry) == null then . + [$entry] else . end)
+    )
+  ' "$consumer/.claude/settings.json" templates/claude-settings.json \
     > "$consumer/.claude/settings.json.new" &&
     mv "$consumer/.claude/settings.json.new" "$consumer/.claude/settings.json"
 else

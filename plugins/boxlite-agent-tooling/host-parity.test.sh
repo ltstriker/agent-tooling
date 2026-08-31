@@ -161,8 +161,24 @@ found=0
 for skill_dir in "$PLUGIN"/.agents/skills/*/; do
   [ -d "$skill_dir" ] || continue
   found=$((found + 1))
-  [ -f "$skill_dir/SKILL.md" ] && ok "skill has SKILL.md: $(basename "$skill_dir")" \
-                               || bad "skill has SKILL.md: $(basename "$skill_dir")"
+  skill_file="$skill_dir/SKILL.md"
+  skill_name="$(basename "$skill_dir")"
+  if [ -f "$skill_file" ]; then
+    ok "skill has SKILL.md: $skill_name"
+    skill_bytes="$(wc -c < "$skill_file" | tr -d ' ')"
+    [ "$skill_bytes" -le 6144 ] && ok "skill body stays below the selected-body cap: $skill_name ($skill_bytes bytes)" \
+                                  || bad "skill body exceeds 6144 bytes: $skill_name ($skill_bytes bytes)"
+    skill_description="$(awk 'BEGIN{fm=0} NR==1 && /^---$/{fm=1; next} fm==1 && /^---$/{exit} fm==1 && /^description:/{sub(/^description:[[:space:]]*/, ""); print; exit}' "$skill_file")"
+    if [[ "$skill_description" == ">" || "$skill_description" == "|" ]]; then
+      bad "skill catalog description is a budgeted single line: $skill_name"
+    else
+      ok "skill catalog description is a budgeted single line: $skill_name"
+    fi
+    [ "${#skill_description}" -le 96 ] && ok "skill catalog description stays below the host clipping budget: $skill_name (${#skill_description} chars)" \
+                                          || bad "skill catalog description exceeds 96 chars: $skill_name (${#skill_description} chars)"
+  else
+    bad "skill has SKILL.md: $skill_name"
+  fi
 done
 [ "$found" -gt 0 ] && ok "skills tree is not empty ($found skills)" \
                    || bad "skills tree is not empty"
@@ -184,6 +200,21 @@ for spec in "$PLUGIN"/.claude/agents/*.md; do
   fm_name="$(awk 'BEGIN{fm=0} NR==1 && /^---$/{fm=1; next} fm==1 && /^---$/{exit} fm==1 && /^name:/{sub(/^name:[[:space:]]*/, ""); print; exit}' "$spec")"
   [ "$fm_name" = "$stem" ] && ok "spec name matches filename: $stem" \
                            || bad "spec name matches filename: $stem (frontmatter says: ${fm_name:-nothing})"
+  spec_description="$(awk 'BEGIN{fm=0} NR==1 && /^---$/{fm=1; next} fm==1 && /^---$/{exit} fm==1 && /^description:/{sub(/^description:[[:space:]]*/, ""); print; exit}' "$spec")"
+  if [[ "$spec_description" != ">" && "$spec_description" != "|" \
+     && "${#spec_description}" -le 180 ]]; then
+    ok "agent catalog description is concise: $stem (${#spec_description} chars)"
+  else
+    bad "agent catalog description must be one line and <=180 chars: $stem"
+  fi
+  spec_bytes="$(wc -c < "$spec" | tr -d ' ')"
+  [ "$spec_bytes" -le 6144 ] && ok "agent spec is lazy and compact: $stem ($spec_bytes bytes)" \
+                                || bad "agent spec exceeds 6144 bytes: $stem ($spec_bytes bytes)"
+  if grep -Eq 'CLAUDE\.md:[0-9]' "$spec"; then
+    bad "agent spec avoids brittle CLAUDE.md line references: $stem"
+  else
+    ok "agent spec avoids brittle CLAUDE.md line references: $stem"
+  fi
 done
 [ "$found" -gt 0 ] && ok "agent specs exist ($found specs)" \
                    || bad "agent specs exist"
@@ -209,6 +240,19 @@ case "$routing" in
     ok "claude route scopes the agent with the manifest name" ;;
   *) bad "claude route scopes the agent with the manifest name" ;;
 esac
+case "$routing" in
+  *'fork_turns="none"'*) ok "codex auditors start without cloning parent history" ;;
+  *) bad "codex auditors start without cloning parent history" ;;
+esac
+
+for prompt in "$PLUGIN"/.agents/prompts/*.md; do
+  prompt_bytes="$(wc -c < "$prompt" | tr -d ' ')"
+  [ "$prompt_bytes" -le 2048 ] && ok "agent prompt is compact: $(basename "$prompt") ($prompt_bytes bytes)" \
+                                  || bad "agent prompt exceeds 2048 bytes: $(basename "$prompt") ($prompt_bytes bytes)"
+done
+grep -q 'Spawn subagents' "$PLUGIN/.agents/prompts/commit-push-runner.md" \
+  && bad "commit audit does not multiply into unconditional reviewers" \
+  || ok "commit audit does not multiply into unconditional reviewers"
 case "$routing" in
   *'task_name="verdict_auditor"'*"$PLUGIN/.claude/agents/verdict-auditor.md"*)
     ok "codex route normalizes task_name but preserves the spec path" ;;
@@ -265,17 +309,19 @@ jq -e '.hooks.SubagentStart[].hooks[] | .async == true and has("asyncRewake") ==
   && ok "codex SubagentStart stays inside its async schema" \
   || bad "codex SubagentStart stays inside its async schema"
 
-# UserPromptSubmit has two independent responsibilities. Cancellation must not be
-# hidden inside rule-recency.sh: that script's cross-host contract is a pure text
-# injector, and its bare-ack fast path includes exactly the prompts ("stop", "nvm")
-# that still need to cancel an obsolete audit.
+# Full plugin prompts stay silent: cancellation is required, while prose recency is
+# available only through the explicit standalone template.
 user_prompt_commands="$(jq -r '.hooks.UserPromptSubmit[].hooks[].command' "$CODEX_HOOKS")"
 user_prompt_count="$(printf '%s\n' "$user_prompt_commands" | grep -c . || true)"
-[ "$user_prompt_count" = "2" ] && ok "UserPromptSubmit wires cancellation and recency separately" \
-                                  || bad "UserPromptSubmit wires cancellation and recency separately (got $user_prompt_count commands)"
+[ "$user_prompt_count" = "1" ] && ok "UserPromptSubmit wires only cancellation" \
+                                  || bad "UserPromptSubmit wires only cancellation (got $user_prompt_count commands)"
 case "$user_prompt_commands" in
-  *cancel-verdict-audit.sh*rule-recency.sh*) ok "verdict cancellation is declared beside the pure recency hook" ;;
-  *) bad "verdict cancellation is declared beside the pure recency hook" ;;
+  *cancel-verdict-audit.sh*) ok "verdict cancellation remains wired" ;;
+  *) bad "verdict cancellation remains wired" ;;
+esac
+case "$user_prompt_commands" in
+  *rule-recency.sh*) bad "full plugin does not inject recurring prose" ;;
+  *) ok "full plugin does not inject recurring prose" ;;
 esac
 
 echo

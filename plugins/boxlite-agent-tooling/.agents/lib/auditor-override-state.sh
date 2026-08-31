@@ -45,7 +45,8 @@ auditor_override_load_valid_grant() {  # repo session-scope prompt-epoch
     "$repo/.agents/state/verdict-prompt-epoch.$scope" 2>/dev/null)" || return 1
   now="$(date +%s)"
 
-  [[ "$created" =~ ^[1-9][0-9]*$ && "$expires" =~ ^[1-9][0-9]*$ \
+  [[ "$created" =~ ^[1-9][0-9]*$ && ${#created} -le 18 \
+     && "$expires" =~ ^[1-9][0-9]*$ && ${#expires} -le 18 \
      && "$record_scope" == "$scope" && "$record_epoch" == "$epoch" \
      && "$current_epoch" == "$epoch" \
      && "$record_repo" == "$repo_id" \

@@ -118,6 +118,7 @@ verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.json" "$sessio
 previous_verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.prev.json" "$session_scope")"
 last_uuid_file="$(verdict_audit_state_path "$state_dir/verdict-last-uuid" "$session_scope")"
 payload_transcript_file="$(verdict_audit_state_path "$state_dir/verdict-stop-message.jsonl" "$session_scope")"
+prior_audit_input_file="$(verdict_audit_state_path "$state_dir/verdict-previous-dossier.json" "$session_scope")"
 prompt_epoch_file="$(verdict_audit_state_path "$state_dir/verdict-prompt-epoch" "$session_scope")"
 old_prompt_epoch="-"
 if [[ -e "$prompt_epoch_file" || -L "$prompt_epoch_file" ]]; then
@@ -159,7 +160,7 @@ fi
 # mutex path must not leave a superseded request/PASS consumable; the serialized cleanup
 # below closes the hidden-quarantine and late-publication races when the mutex is usable.
 rm -f "$audit_request_file" "$previous_verdict_file" "$last_uuid_file" \
-  "$payload_transcript_file" "$verdict_file"
+  "$payload_transcript_file" "$prior_audit_input_file" "$verdict_file"
 
 # The short decision mutex orders UserPromptSubmit against a Stop gate that has hidden a
 # dossier under a quarantine pathname. Once held, revoke first so the live runner wakes;
@@ -168,7 +169,7 @@ rm -f "$audit_request_file" "$previous_verdict_file" "$last_uuid_file" \
 # in one Perl process so the decision lock remains held through both cleanup passes.
 perl -MFcntl=:DEFAULT,:flock -e '
   my ($decision_path, $publish_path, $request, $previous, $last_uuid,
-      $payload_transcript, $cancel_prefix, $verdict) = @ARGV;
+      $payload_transcript, $prior_input, $cancel_prefix, $verdict) = @ARGV;
 
   sub unlink_prefixed {
     my ($prefix) = @_;
@@ -186,7 +187,8 @@ perl -MFcntl=:DEFAULT,:flock -e '
   }
 
   sub unlink_state {
-    unlink($request, $previous, $last_uuid, $payload_transcript, $verdict);
+    unlink($request, $previous, $last_uuid, $payload_transcript, $prior_input, $verdict);
+    unlink_prefixed($prior_input . ".input-");
     unlink_prefixed($cancel_prefix . ".");
     unlink_prefixed($verdict . ".audit-");
   }
@@ -235,7 +237,8 @@ perl -MFcntl=:DEFAULT,:flock -e '
   alarm 0;
 ' "$audit_decision_mutex_file" "$audit_publish_mutex_file" \
   "$audit_request_file" "$previous_verdict_file" "$last_uuid_file" \
-  "$payload_transcript_file" "$audit_cancellation_prefix" "$verdict_file" \
+  "$payload_transcript_file" "$prior_audit_input_file" \
+  "$audit_cancellation_prefix" "$verdict_file" \
   >/dev/null 2>&1 || {
     printf 'cancel-verdict-audit.sh: could not serialize audit cancellation.\n' >&2
     exit 1

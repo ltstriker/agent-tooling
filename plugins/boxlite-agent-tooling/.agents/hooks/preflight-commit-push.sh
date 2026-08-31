@@ -92,27 +92,21 @@ legacy_handoff_file="$project_dir/.claude/.last-audit-handoff.json"
 # Returns 0 only when dest now holds a copy of src, so a caller that wants to
 # hand the marker over can safely delete the original.
 mirror_to_legacy() {
-  local src="$1" dest="$2"
-  [[ -r "$src" ]] || return 1
+  local src="$1" dest="$2" temporary="${2}.mirror-$$-${RANDOM:-0}" identity
   mkdir -p "$(dirname "$dest")" 2>/dev/null || return 1
-  cp -f "$src" "$dest" 2>/dev/null || return 1
+  verdict_audit_copy_regular_state "$src" "$temporary" 1048576 \
+    2>/dev/null || return 1
+  identity="$(verdict_audit_path_identity "$temporary" 2>/dev/null)" || return 1
+  if ! verdict_audit_rename_exact "$temporary" "$dest" 2>/dev/null; then
+    verdict_audit_unlink_if_identity \
+      "$temporary" "$identity" 2>/dev/null || true
+    return 1
+  fi
 }
 branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || echo '?')"
 head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo '?')"
 max_age_seconds=600
-
-file_mtime_epoch() {
-  local path="$1" mtime
-  if mtime="$(stat -c '%Y' "$path" 2>/dev/null)" && [[ "$mtime" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$mtime"
-    return
-  fi
-  if mtime="$(stat -f '%m' "$path" 2>/dev/null)" && [[ "$mtime" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$mtime"
-    return
-  fi
-  printf '0'
-}
+deny_max_bytes=8192
 
 hash_stdin() {
   shasum -a 256 | awk '{print $1}'
@@ -159,6 +153,44 @@ hook_session_scope=""
 hook_prompt_epoch=""
 handoff_owner_pid=""
 handoff_owner_start_token=""
+handoff_document=""
+handoff_mtime=""
+handoff_selection=""
+handoff_selected_identity=""
+handoff_load_attempted=0
+
+cleanup_handoff_selection() {
+  if [[ -n "$handoff_selection" && -n "$handoff_selected_identity" ]]; then
+    verdict_audit_unlink_if_identity \
+      "$handoff_selection" "$handoff_selected_identity" 2>/dev/null || true
+  fi
+  handoff_selection=""
+  handoff_selected_identity=""
+}
+trap cleanup_handoff_selection EXIT
+
+remove_matching_legacy() { # selected source, legacy destination
+  local source="$1" destination="$2" selection identity
+  local source_snapshot destination_snapshot source_body destination_body
+  selection="${destination}.inspect-$$-${RANDOM:-0}"
+  identity="$(verdict_audit_link_no_clobber_identity \
+    "$destination" "$selection" 2>/dev/null)" || return 0
+  source_snapshot="$(verdict_audit_read_regular_state \
+    "$source" 1048576 json 2>/dev/null)" || source_snapshot=""
+  destination_snapshot="$(verdict_audit_read_regular_state \
+    "$selection" 1048576 json 2>/dev/null)" || destination_snapshot=""
+  source_body=""
+  destination_body=""
+  [[ "$source_snapshot" == *$'\n'* ]] && source_body="${source_snapshot#*$'\n'}"
+  [[ "$destination_snapshot" == *$'\n'* ]] \
+    && destination_body="${destination_snapshot#*$'\n'}"
+  if [[ -n "$source_body" && "$destination_body" == "$source_body" ]]; then
+    verdict_audit_unlink_if_identity \
+      "$destination" "$identity" 2>/dev/null || true
+  fi
+  verdict_audit_unlink_if_identity \
+    "$selection" "$identity" 2>/dev/null || true
+}
 
 read_override_epoch() {  # session scope
   local epoch_path="$project_dir/.agents/state/verdict-prompt-epoch.$1" epoch
@@ -185,11 +217,78 @@ load_session_override() {
   override_active=true
 }
 
+load_handoff_document() {
+  local snapshot body
+  if (( handoff_load_attempted )); then
+    [[ -n "$handoff_document" ]]
+    return $?
+  fi
+  handoff_load_attempted=1
+  handoff_selection="${handoff_file}.inspect-$$-${RANDOM:-0}"
+  handoff_selected_identity="$(verdict_audit_link_no_clobber_identity \
+    "$handoff_file" "$handoff_selection" 2>/dev/null)" \
+    || handoff_selected_identity=""
+  if [[ -z "$handoff_selected_identity" ]]; then
+    handoff_selection=""
+    return 1
+  fi
+  snapshot="$(verdict_audit_read_regular_state \
+    "$handoff_selection" 65536 json 2>/dev/null)" || snapshot=""
+  body=""
+  if [[ "$snapshot" == *$'\n'* ]]; then
+    handoff_mtime="${snapshot%%$'\n'*}"
+    body="${snapshot#*$'\n'}"
+  fi
+  handoff_document="$(printf '%s' "$body" | jq -ecs '
+    def exact_keys($wanted): (keys | sort) == ($wanted | sort);
+    def bounded_line($bytes):
+      type == "string" and utf8bytelength <= $bytes
+      and (explode | all(. != 0 and . != 10 and . != 13));
+    def lifecycle:
+      . == null or (type == "object"
+        and exact_keys(["session_scope", "prompt_epoch"])
+        and (.session_scope | type == "string"
+             and test("^git-[0-9a-f]{40}([0-9a-f]{24})?$"))
+        and (.prompt_epoch | type == "string"
+             and test("^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$")));
+    def override:
+      . == null or (type == "object"
+        and exact_keys(["session_scope", "prompt_epoch", "nonce_hash"])
+        and (.session_scope | type == "string"
+             and test("^git-[0-9a-f]{40}([0-9a-f]{24})?$"))
+        and (.prompt_epoch | type == "string"
+             and test("^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$"))
+        and (.nonce_hash | type == "string" and test("^[0-9a-f]{64}$")));
+    if length == 1 and (.[0] | type) == "object"
+       and (.[0] | exact_keys(["branch", "head", "command_kind", "diff_hash",
+            "command_hash", "owner", "override", "lifecycle"]))
+       and (.[0].branch | bounded_line(4096))
+       and (.[0].head | type == "string"
+            and test("^[0-9a-f]{40}([0-9a-f]{24})?$|^\\?$"))
+       and (.[0].command_kind == "commit" or .[0].command_kind == "push")
+       and (.[0].diff_hash | type == "string" and test("^[0-9a-f]{64}$"))
+       and (.[0].command_hash | type == "string" and test("^[0-9a-f]{64}$"))
+       and (.[0].owner | type == "object"
+            and exact_keys(["pid", "start_token"])
+            and (.pid | type == "number" and . > 0 and floor == .)
+            and (.start_token | type == "string"
+                 and test("^cksum-[0-9]+-[0-9]+$")))
+       and (.[0].override | override)
+       and (.[0].lifecycle | lifecycle)
+    then .[0] else empty end
+  ' 2>/dev/null || true)"
+  if [[ -z "$handoff_document" || ! "$handoff_mtime" =~ ^[0-9]+$ ]]; then
+    handoff_document=""
+    cleanup_handoff_selection
+    return 1
+  fi
+}
+
 load_handoff_owner() {
   local owner_pid owner_token
-  [[ -r "$handoff_file" ]] || return 1
-  owner_pid="$(jq -r '.owner.pid // ""' "$handoff_file" 2>/dev/null)"
-  owner_token="$(jq -r '.owner.start_token // ""' "$handoff_file" 2>/dev/null)"
+  load_handoff_document || return 1
+  owner_pid="$(printf '%s' "$handoff_document" | jq -r '.owner.pid')"
+  owner_token="$(printf '%s' "$handoff_document" | jq -r '.owner.start_token')"
   verdict_audit_process_has_ancestor "$owner_pid" "$owner_token" || return 1
   handoff_owner_pid="$owner_pid"
   handoff_owner_start_token="$owner_token"
@@ -198,13 +297,12 @@ load_handoff_owner() {
 load_handoff_override() {
   local handoff_scope handoff_epoch handoff_nonce handoff_branch handoff_head handoff_kind
   load_handoff_owner || return 1
-  [[ -r "$handoff_file" ]] || return 1
-  handoff_scope="$(jq -r '.override.session_scope // ""' "$handoff_file" 2>/dev/null)"
-  handoff_epoch="$(jq -r '.override.prompt_epoch // ""' "$handoff_file" 2>/dev/null)"
-  handoff_nonce="$(jq -r '.override.nonce_hash // ""' "$handoff_file" 2>/dev/null)"
-  handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null)"
-  handoff_head="$(jq -r '.head // ""' "$handoff_file" 2>/dev/null)"
-  handoff_kind="$(jq -r '.command_kind // ""' "$handoff_file" 2>/dev/null)"
+  handoff_scope="$(printf '%s' "$handoff_document" | jq -r '.override.session_scope // ""')"
+  handoff_epoch="$(printf '%s' "$handoff_document" | jq -r '.override.prompt_epoch // ""')"
+  handoff_nonce="$(printf '%s' "$handoff_document" | jq -r '.override.nonce_hash // ""')"
+  handoff_branch="$(printf '%s' "$handoff_document" | jq -r '.branch')"
+  handoff_head="$(printf '%s' "$handoff_document" | jq -r '.head')"
+  handoff_kind="$(printf '%s' "$handoff_document" | jq -r '.command_kind')"
   [[ "$handoff_branch" == "$branch" && "$handoff_head" == "$head" \
      && "$handoff_kind" == "$kind" && "$handoff_nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
   auditor_override_load_valid_grant \
@@ -218,12 +316,11 @@ load_handoff_override() {
 load_handoff_lifecycle() {
   local handoff_scope handoff_epoch handoff_branch handoff_head handoff_kind current_epoch
   load_handoff_owner || return 1
-  [[ -r "$handoff_file" ]] || return 1
-  handoff_scope="$(jq -r '.lifecycle.session_scope // ""' "$handoff_file" 2>/dev/null)"
-  handoff_epoch="$(jq -r '.lifecycle.prompt_epoch // ""' "$handoff_file" 2>/dev/null)"
-  handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null)"
-  handoff_head="$(jq -r '.head // ""' "$handoff_file" 2>/dev/null)"
-  handoff_kind="$(jq -r '.command_kind // ""' "$handoff_file" 2>/dev/null)"
+  handoff_scope="$(printf '%s' "$handoff_document" | jq -r '.lifecycle.session_scope // ""')"
+  handoff_epoch="$(printf '%s' "$handoff_document" | jq -r '.lifecycle.prompt_epoch // ""')"
+  handoff_branch="$(printf '%s' "$handoff_document" | jq -r '.branch')"
+  handoff_head="$(printf '%s' "$handoff_document" | jq -r '.head')"
+  handoff_kind="$(printf '%s' "$handoff_document" | jq -r '.command_kind')"
   [[ "$handoff_scope" =~ ^git-[0-9a-f]{40}([0-9a-f]{24})?$ \
      && "$handoff_epoch" =~ ^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$ \
      && "$handoff_branch" == "$branch" && "$handoff_head" == "$head" \
@@ -261,7 +358,14 @@ if [[ -z "$hook_session_scope" && -z "${GITHOOK_DELEGATED:-}" ]]; then
 fi
 
 deny() {
-  jq -nc --arg r "$1" '{
+  local reason="$1" reason_bytes
+  reason_bytes="$(LC_ALL=C printf '%s' "$reason" | wc -c | tr -d ' ')"
+  if (( reason_bytes > deny_max_bytes )); then
+    # The exact command and dossier findings are caller-controlled. Keep the model
+    # response bounded without opening the gate or silently dropping the recovery path.
+    reason="Commit/push gate remains blocked: the rendered audit instruction exceeded the 8192-byte safety limit. The target command did not run. For a long commit message, store it in a file and retry with git commit -F <path>; otherwise shorten the equivalent Git invocation. Inspect .agents/state/last-audit.json locally if present, then rerun commit-push-auditor with the shortened command. Never paste the oversized command or dossier into chat."
+  fi
+  jq -nc --arg r "$reason" '{
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
@@ -302,7 +406,7 @@ write_command_handoff() {
       command_hash:$command_hash,
       owner:{pid:$owner_pid,start_token:$owner_start_token},
       override:$override, lifecycle:$lifecycle}' \
-    > "$handoff_file"
+    | verdict_audit_write_atomic "$handoff_file"
   # `|| true` is load-bearing: this is the last command in the function, and the
   # defer path calls the function unguarded under `set -e`. Without it a mirror
   # that cannot be written makes the whole hook exit 1 instead of 0. The mirror
@@ -323,16 +427,14 @@ allow_override() {
 }
 
 valid_handoff_command_hash() {
-  [[ -r "$handoff_file" ]] || return 1
   load_handoff_owner || return 1
 
-  local handoff_branch handoff_head handoff_kind handoff_diff_hash handoff_command_hash handoff_mtime now_epoch handoff_age
-  handoff_branch="$(jq -r '.branch // ""' "$handoff_file" 2>/dev/null || echo '')"
-  handoff_head="$(jq -r '.head // ""' "$handoff_file" 2>/dev/null || echo '')"
-  handoff_kind="$(jq -r '.command_kind // ""' "$handoff_file" 2>/dev/null || echo '')"
-  handoff_diff_hash="$(jq -r '.diff_hash // ""' "$handoff_file" 2>/dev/null || echo '')"
-  handoff_command_hash="$(jq -r '.command_hash // ""' "$handoff_file" 2>/dev/null || echo '')"
-  handoff_mtime="$(file_mtime_epoch "$handoff_file")"
+  local handoff_branch handoff_head handoff_kind handoff_diff_hash handoff_command_hash now_epoch handoff_age
+  handoff_branch="$(printf '%s' "$handoff_document" | jq -r '.branch')"
+  handoff_head="$(printf '%s' "$handoff_document" | jq -r '.head')"
+  handoff_kind="$(printf '%s' "$handoff_document" | jq -r '.command_kind')"
+  handoff_diff_hash="$(printf '%s' "$handoff_document" | jq -r '.diff_hash')"
+  handoff_command_hash="$(printf '%s' "$handoff_document" | jq -r '.command_hash')"
   now_epoch="$(date +%s)"
   handoff_age=$(( now_epoch - handoff_mtime ))
 
@@ -341,7 +443,7 @@ valid_handoff_command_hash() {
      [[ "$handoff_kind" == "$kind" ]] && \
      [[ "$handoff_diff_hash" == "$diff_hash" ]] && \
      [[ -n "$handoff_command_hash" ]] && \
-     (( handoff_age <= max_age_seconds )); then
+     (( handoff_age >= 0 && handoff_age <= max_age_seconds )); then
     printf '%s' "$handoff_command_hash"
     return 0
   fi
@@ -368,14 +470,29 @@ source "$subagent_lib"
 # One instruction, naming every route. Nothing here inspects the environment to choose
 # between hosts: capability is something the agent knows about itself, while an
 # environment variable can be set by whatever launched the hook.
+task_input_json="$(jq -nc \
+  --arg operation_kind "$kind" \
+  --arg repo_root "$repo_root" \
+  --arg expected_branch "$branch" \
+  --arg expected_head "$head" \
+  --arg dossier_path "$audit_file" \
+  --arg target_command "$command" \
+  '{operation_kind:$operation_kind, repo_root:$repo_root,
+    expected_branch:$expected_branch, expected_head:$expected_head,
+    dossier_path:$dossier_path, target_command:$target_command}')"
+printf -v headless_command \
+  'AUDITOR_SESSION_SCOPE=%q AUDITOR_PROMPT_EPOCH=%q CODEX_COMMIT_PUSH_AUDIT_MODE=agentic bash %q %q %q' \
+  "$hook_session_scope" "$hook_prompt_epoch" \
+  "$tooling_root/.agents/hooks/run-commit-push-audit.sh" "$kind" '<target command>'
+headless_command+=$'\n    (set CODEX_BIN if the default codex command is not usable)'
 invoke_instruction="$(subagent_instruction \
   --agent commit-push-auditor \
   --root "$tooling_root" \
   --description 'CLAUDE.md audit' \
-  --artifact '.agents/state/last-audit.json' \
-  --task "$(subagent_prompt commit-push-task "$tooling_root" "kind=${kind}" "branch=${branch}")" \
-  --headless "AUDITOR_SESSION_SCOPE='${hook_session_scope}' AUDITOR_PROMPT_EPOCH='${hook_prompt_epoch}' CODEX_COMMIT_PUSH_AUDIT_MODE=agentic bash '${tooling_root}/.agents/hooks/run-commit-push-audit.sh' ${kind} '<target command>'
-    (set CODEX_BIN if the default codex command is not usable)")
+  --artifact "$audit_file" \
+  --task "$(subagent_prompt commit-push-task "$tooling_root" \
+    "task_input_json=${task_input_json}")" \
+  --headless "$headless_command")
 
 Retry the same git command after the verdict reports PASS."
 
@@ -388,22 +505,80 @@ validate_audit() {
 ${invoke_instruction}"
   fi
 
-  local audit_branch audit_head audit_kind audit_diff_hash audit_command_hash audit_commit_subject_hash audit_verdict audit_mtime now_epoch age advisories
-  audit_branch="$(jq -r '.branch // ""' "$audit_file" 2>/dev/null || echo '')"
-  audit_head="$(jq -r '.head // ""' "$audit_file" 2>/dev/null || echo '')"
-  audit_kind="$(jq -r '.command_kind // ""' "$audit_file" 2>/dev/null || echo '')"
-  audit_diff_hash="$(jq -r '.diff_hash // ""' "$audit_file" 2>/dev/null || echo '')"
-  audit_command_hash="$(jq -r '.command_hash // ""' "$audit_file" 2>/dev/null || echo '')"
-  audit_commit_subject_hash="$(jq -r '.commit_subject_hash // ""' "$audit_file" 2>/dev/null || echo '')"
-  audit_verdict="$(jq -r '.verdict // ""' "$audit_file" 2>/dev/null || echo '')"
+  local audit_branch audit_head audit_kind audit_diff_hash audit_command_hash
+  local audit_commit_subject_hash audit_verdict audit_mtime now_epoch age advisories findings
+  local additional_context additional_context_bytes audit_snapshot audit_json audit_document
+  local audit_selection selected_identity consume_status=0 handoff_consume_status=0
+  audit_selection="${audit_file}.inspect-$$-${RANDOM:-0}"
+  selected_identity="$(verdict_audit_link_no_clobber_identity \
+    "$audit_file" "$audit_selection" 2>/dev/null)" || selected_identity=""
+  if [[ -z "$selected_identity" ]]; then
+    deny "Existing audit is not a stable regular file; re-audit is required.
+
+${invoke_instruction}"
+  fi
+  audit_snapshot="$(verdict_audit_read_json_snapshot \
+    "$audit_selection" 2>/dev/null)" || audit_snapshot=""
+  audit_json=""
+  if [[ "$audit_snapshot" == *$'\n'* ]]; then
+    audit_mtime="${audit_snapshot%%$'\n'*}"
+    audit_json="${audit_snapshot#*$'\n'}"
+  fi
+  audit_document="$(printf '%s' "$audit_json" | jq -ecs '
+    def exact_keys($wanted): (keys | sort) == ($wanted | sort);
+    def bounded_line($bytes):
+      type == "string" and length > 0 and utf8bytelength <= $bytes
+      and (explode | all(. != 0 and . != 10 and . != 13));
+    def base_keys: ["branch", "head", "command_kind", "diff_hash",
+      "command_hash", "commit_subject_hash", "verdict", "findings"];
+    if length == 1 and (.[0] | type) == "object"
+       and ((.[0] | exact_keys(base_keys))
+            or (.[0] | exact_keys(base_keys + ["advisories"])))
+       and (.[0].branch | type) == "string"
+       and (.[0].branch | utf8bytelength) <= 256
+       and (.[0].branch | explode | all(. != 0 and . != 10 and . != 13))
+       and (.[0].head | type) == "string"
+       and (.[0].head | test("^[0-9a-f]{40}([0-9a-f]{24})?$|^\\?$"))
+       and (.[0].command_kind == "commit" or .[0].command_kind == "push")
+       and (.[0].diff_hash | type) == "string"
+       and (.[0].diff_hash | test("^[0-9a-f]{64}$"))
+       and (.[0].command_hash | type) == "string"
+       and (.[0].command_hash | test("^[0-9a-f]{64}$"))
+       and (.[0].commit_subject_hash | type) == "string"
+       and (.[0].commit_subject_hash | test("^[0-9a-f]{64}$|^$"))
+       and (.[0].verdict == "PASS" or .[0].verdict == "FAIL")
+       and (.[0].findings | type) == "array" and (.[0].findings | length) <= 32
+       and all(.[0].findings[]; bounded_line(1024))
+       and ((.[0] | has("advisories") | not)
+            or ((.[0].advisories | type) == "array"
+                and (.[0].advisories | length) <= 32
+                and all(.[0].advisories[]; bounded_line(1024))))
+       and (if .[0].verdict == "PASS"
+            then (.[0].findings | length) == 0
+            else (.[0].findings | length) > 0 end)
+    then .[0] + {advisories:(.[0].advisories // [])}
+    else empty end
+  ' 2>/dev/null || true)"
+  if [[ -z "$audit_document" || ! "$audit_mtime" =~ ^[0-9]+$ ]]; then
+    rm -f "$audit_selection"
+    deny "Existing audit is malformed or exceeds its safety limits; re-audit is required.
+
+${invoke_instruction}"
+  fi
+  audit_branch="$(printf '%s' "$audit_document" | jq -r '.branch')"
+  audit_head="$(printf '%s' "$audit_document" | jq -r '.head')"
+  audit_kind="$(printf '%s' "$audit_document" | jq -r '.command_kind')"
+  audit_diff_hash="$(printf '%s' "$audit_document" | jq -r '.diff_hash')"
+  audit_command_hash="$(printf '%s' "$audit_document" | jq -r '.command_hash')"
+  audit_commit_subject_hash="$(printf '%s' "$audit_document" | jq -r '.commit_subject_hash')"
+  audit_verdict="$(printf '%s' "$audit_document" | jq -r '.verdict')"
   if [[ "$kind" == "push" && ! "$push_diff_hash_from_command" =~ ^[0-9a-f]{64}$ ]]; then
+    rm -f "$audit_selection"
     deny "Push audits must be bound to git pre-push ref-update stdin via pushed_diff_sha256.
 
 Retry the push through the git-level pre-push gate so it can produce the exact ref-update audit command."
   fi
 
-  # Keep failed platform probes from contaminating the successful command's output.
-  audit_mtime="$(file_mtime_epoch "$audit_file")"
   now_epoch="$(date +%s)"
   age=$(( now_epoch - audit_mtime ))
 
@@ -429,7 +604,8 @@ Retry the push through the git-level pre-push gate so it can produce the exact r
      [[ "$audit_kind" != "$kind" ]] || \
      [[ "$audit_diff_hash" != "$diff_hash" ]] || \
      [[ "$command_bound" != 1 ]] || \
-     (( age > max_age_seconds )); then
+     (( age < 0 || age > max_age_seconds )); then
+    rm -f "$audit_selection"
     deny "Existing audit does not match current state:
   audit.branch=${audit_branch}  current=${branch}
   audit.head=${audit_head}      current=${head}
@@ -449,10 +625,13 @@ ${invoke_instruction}"
   # downgrades real findings. Same effect as eslint's two counters (lib/cli.js ~496-521,
   # where errorCount drives the exit code and warningCount only does under
   # --max-warnings), reached without a defaulting rule.
-  advisories="$(jq -r '.advisories[]? | "  ~ " + .' "$audit_file" 2>/dev/null || echo '')"
+  advisories="$(printf '%s' "$audit_document" \
+    | jq -r '.advisories[]? | "  ~ " + .' 2>/dev/null || echo '')"
 
   if [[ "$audit_verdict" != "PASS" ]]; then
-    findings="$(jq -r '.findings[]? | "  - " + .' "$audit_file" 2>/dev/null || echo '')"
+    findings="$(printf '%s' "$audit_document" \
+      | jq -r '.findings[]? | "  - " + .' 2>/dev/null || echo '')"
+    rm -f "$audit_selection"
     deny "CLAUDE.md audit FAILED on branch '${branch}':
 
 ${findings}
@@ -463,12 +642,44 @@ ${advisories}
 Address each finding, then re-run the audit producer before retrying git ${kind}."
   fi
 
-  # Surface without touching the permission decision, as post-remote-write-watch.sh
-  # does. Deliberately NOT permissionDecision:"allow", which would auto-approve a
-  # command the user might otherwise be asked about.
+  if [[ "$consume_on_pass" == "consume" ]]; then
+    verdict_audit_unlink_if_identity \
+      "$audit_file" "$selected_identity" 2>/dev/null || consume_status=$?
+    if (( consume_status != 0 )); then
+      rm -f "$audit_selection"
+      deny "The matching audit could not be consumed safely; git ${kind} remains gated."
+    fi
+    if [[ -n "$handoff_selected_identity" ]]; then
+      handoff_consume_status=0
+      verdict_audit_unlink_if_identity \
+        "$handoff_file" "$handoff_selected_identity" 2>/dev/null \
+        || handoff_consume_status=$?
+      if (( handoff_consume_status != 0 )); then
+        rm -f "$audit_selection"
+        deny "The matching command handoff could not be consumed safely; git ${kind} remains gated."
+      fi
+      remove_matching_legacy "$handoff_selection" "$legacy_handoff_file"
+      cleanup_handoff_selection
+    fi
+    remove_matching_legacy "$audit_selection" "$legacy_audit_file"
+    rm -f "$audit_selection"
+  else
+    # Mirror the selected inode, not a pathname that an overlapping audit may replace.
+    mirror_to_legacy "$audit_selection" "$legacy_audit_file" || true
+    rm -f "$audit_selection"
+  fi
+
+  # Surface without touching the permission decision. Deliberately NOT
+  # permissionDecision:"allow", which would auto-approve a command the user might
+  # otherwise be asked about.
   if [[ -n "$advisories" ]]; then
-    jq -nc --arg c "Audit PASSED with advisories (non-blocking, no re-audit needed):
-${advisories}" '{
+    additional_context="Audit PASSED with advisories (non-blocking, no re-audit needed):
+${advisories}"
+    additional_context_bytes="$(LC_ALL=C printf '%s' "$additional_context" | wc -c | tr -d ' ')"
+    if (( additional_context_bytes > deny_max_bytes )); then
+      additional_context="Audit PASSED with advisories, but their details exceeded the 8192-byte safety limit and were omitted. They remain non-blocking; no re-audit needed."
+    fi
+    jq -nc --arg c "$additional_context" '{
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         additionalContext: $c
@@ -476,23 +687,6 @@ ${advisories}" '{
     }'
   fi
 
-  if [[ "$consume_on_pass" == "consume" ]]; then
-    rm -f "$audit_file" "$handoff_file" "$legacy_audit_file" "$legacy_handoff_file"
-  else
-    # Kept for a later stage to consume — possibly a commit-msg from before the
-    # move, which reads only the legacy path. Copy rather than hand over: more
-    # than one stage takes the keep path (the Codex PreToolUse route validates
-    # and keeps before git's pre-commit does), and moving would leave the second
-    # one with nothing.
-    #
-    # Residual, deliberate: a pre-move commit-msg consumes only the legacy copy,
-    # so this location survives that commit and stays valid for the rest of the
-    # 600s TTL. It cannot land unaudited content — the audit is still bound to
-    # branch, HEAD, diff and subject, so any of those changing rejects it — but
-    # it does relax one-shot consumption to that one hook/tree combination.
-    # It disappears with the mirrors once every checkout is past the move.
-    mirror_to_legacy "$audit_file" "$legacy_audit_file" || true
-  fi
 }
 
 # This gate never produces the audit itself. It denies, names every way to spawn an

@@ -15,11 +15,12 @@
   ],
   "properties": {
     "branch": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 256
     },
     "head": {
       "type": "string",
-      "pattern": "^[0-9a-f]{40}$|^\\?$"
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$|^\\?$"
     },
     "command_kind": {
       "type": "string",
@@ -49,16 +50,20 @@
     },
     "findings": {
       "type": "array",
+      "maxItems": 32,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 1024
       }
     },
     "advisories": {
       "type": "array",
+      "maxItems": 32,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 1024
       }
     }
   }

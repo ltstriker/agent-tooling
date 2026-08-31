@@ -21,12 +21,13 @@ verdict_audit_epoch_is_bounded() {
 # choose what gets parsed. `record` mode validates the bytes before command substitution
 # can erase trailing LFs. `json` mode prefixes the selected inode's mtime, keeping
 # freshness and content in one snapshot. Raw NUL cannot be transported through Bash.
-verdict_audit_read_regular_state() {  # path max-bytes record|json
+verdict_audit_read_regular_state() {  # path max-bytes record|json [device:inode]
   command -v perl >/dev/null 2>&1 || return 1
   perl -MFcntl=:DEFAULT -e '
-    my ($path, $max, $mode) = @ARGV;
+    my ($path, $max, $mode, $expected) = @ARGV;
     exit 1 unless $max =~ /^[1-9][0-9]*$/
       && ($mode eq "record" || $mode eq "record_snapshot" || $mode eq "json");
+    exit 1 unless $expected eq "" || $expected =~ /\A[0-9]+:[0-9]+\z/;
     $SIG{ALRM} = sub { exit 1 };
     alarm 1;
     exit 1 if lstat($path) && -l _;
@@ -37,6 +38,8 @@ verdict_audit_read_regular_state() {  # path max-bytes record|json
     my @named = lstat($path);
     exit 1 unless @opened && @named && -f $fh
       && $opened[0] == $named[0] && $opened[1] == $named[1];
+    exit 1 if $expected ne ""
+      && ($opened[0] . ":" . $opened[1]) ne $expected;
     my $body = "";
     while (length($body) <= $max) {
       my $chunk = "";
@@ -60,7 +63,7 @@ verdict_audit_read_regular_state() {  # path max-bytes record|json
     } else {
       print $opened[9], "\n", $body;
     }
-  ' "$1" "$2" "$3"
+  ' "$1" "$2" "$3" "${4:-}"
 }
 
 # Writers use one final LF; legacy records without it remain readable, while CR, an
@@ -77,6 +80,663 @@ verdict_audit_read_single_record_snapshot() {  # record-path
 # "mtime LF body" snapshot from memory and never opens the shared pathname with jq.
 verdict_audit_read_json_snapshot() {  # dossier-path
   verdict_audit_read_regular_state "$1" 1048576 json
+}
+
+# Copy one exact regular source inode into a new private regular file. This is the
+# binary-safe companion to verdict_audit_read_regular_state: large diffs stay out of
+# shell variables, FIFOs/symlinks fail without blocking, and a source changed in place
+# or replaced during either verification pass is rejected. The destination must not
+# already exist; an incomplete file is removed only while it is still the inode created
+# by this call.
+verdict_audit_copy_regular_state() {  # source destination max-bytes
+  command -v perl >/dev/null 2>&1 || return 1
+  perl -MFcntl=:DEFAULT -MDigest::SHA -e '
+    my ($source, $destination, $max) = @ARGV;
+    exit 1 unless $max =~ /^[1-9][0-9]*$/;
+    $SIG{ALRM} = sub { exit 1 };
+    alarm 15;
+
+    exit 1 if lstat($source) && -l _;
+    my $read_flags = O_RDONLY | O_NONBLOCK;
+    $read_flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $input, $source, $read_flags) or exit 1;
+    my @source_before = stat($input);
+    my @source_named = lstat($source);
+    exit 1 unless @source_before && @source_named && -f $input
+      && $source_before[0] == $source_named[0]
+      && $source_before[1] == $source_named[1]
+      && $source_before[7] <= $max;
+    my $source_identity = join(":", @source_before[0,1,7,9,10]);
+
+    my $write_flags = O_WRONLY | O_CREAT | O_EXCL | O_NONBLOCK;
+    $write_flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $output, $destination, $write_flags, 0600) or exit 1;
+    my @destination_opened = stat($output);
+    my @destination_named = lstat($destination);
+    my $destination_owned = @destination_opened && @destination_named
+      && -f $output
+      && $destination_opened[0] == $destination_named[0]
+      && $destination_opened[1] == $destination_named[1];
+    my $complete = 0;
+    END {
+      if (!$complete && $destination_owned) {
+        my @current = lstat($destination);
+        unlink($destination) if @current
+          && $current[0] == $destination_opened[0]
+          && $current[1] == $destination_opened[1];
+      }
+    }
+    exit 1 unless $destination_owned;
+    binmode($input);
+    binmode($output);
+
+    my $first_digest = Digest::SHA->new(256);
+    my $total = 0;
+    while (1) {
+      my $chunk = "";
+      my $count = sysread($input, $chunk, 65536);
+      exit 1 unless defined $count;
+      last if $count == 0;
+      $total += $count;
+      exit 1 if $total > $max;
+      $first_digest->add($chunk);
+      my $offset = 0;
+      while ($offset < $count) {
+        my $written = syswrite($output, $chunk, $count - $offset, $offset);
+        exit 1 unless defined $written && $written > 0;
+        $offset += $written;
+      }
+    }
+    my $first_hash = $first_digest->hexdigest;
+    my @source_after = stat($input);
+    my @source_named_after = lstat($source);
+    exit 1 unless @source_after && @source_named_after
+      && join(":", @source_after[0,1,7,9,10]) eq $source_identity
+      && $source_after[0] == $source_named_after[0]
+      && $source_after[1] == $source_named_after[1]
+      && $total == $source_before[7];
+
+    sysseek($input, 0, 0) or exit 1;
+    my $verify_digest = Digest::SHA->new(256);
+    my $verify_total = 0;
+    while (1) {
+      my $chunk = "";
+      my $count = sysread($input, $chunk, 65536);
+      exit 1 unless defined $count;
+      last if $count == 0;
+      $verify_total += $count;
+      exit 1 if $verify_total > $max;
+      $verify_digest->add($chunk);
+    }
+    @source_after = stat($input);
+    @source_named_after = lstat($source);
+    exit 1 unless @source_after && @source_named_after
+      && join(":", @source_after[0,1,7,9,10]) eq $source_identity
+      && $source_after[0] == $source_named_after[0]
+      && $source_after[1] == $source_named_after[1]
+      && $verify_total == $total
+      && $verify_digest->hexdigest eq $first_hash;
+
+    close($input) or exit 1;
+    close($output) or exit 1;
+    @destination_named = lstat($destination);
+    exit 1 unless @destination_named
+      && $destination_opened[0] == $destination_named[0]
+      && $destination_opened[1] == $destination_named[1]
+      && $destination_named[7] == $total;
+    $complete = 1;
+    alarm 0;
+  ' "$1" "$2" "$3"
+}
+
+# Stream one selected JSONL transcript inode and retain only records after the last real
+# user message. Historical turns and harness envelopes never enter the model-visible
+# snapshot. Assistant claims stay whole; large tool events become bounded previews plus
+# size/hash metadata. Claim truncation is fail-closed. Summarized evidence remains usable
+# only when the auditor can independently reproduce what a claim depends on.
+_verdict_audit_snapshot_final_turn() {  # source destination source-max snapshot-max emit-identity
+  local source="$1" destination="$2" max_source_bytes="$3" max_snapshot_bytes="$4"
+  local emit_identity="$5" source_identity snapshot_identity="" snapshot_bytes
+  [[ "$max_source_bytes" =~ ^[1-9][0-9]*$ \
+     && "$max_snapshot_bytes" =~ ^[1-9][0-9]*$ \
+     && ( "$emit_identity" == 0 || "$emit_identity" == 1 ) ]] || return 1
+  source_identity="$(perl -MFcntl=:DEFAULT -e '
+    my ($path, $max) = @ARGV;
+    exit 1 if lstat($path) && -l _;
+    my $flags = O_RDONLY | O_NONBLOCK;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $fh, $path, $flags) or exit 1;
+    my @opened = stat($fh);
+    my @named = lstat($path);
+    exit 1 unless @opened && @named && -f $fh
+      && $opened[0] == $named[0] && $opened[1] == $named[1]
+      && $opened[7] <= $max;
+    print join(":", @opened[0,1,7,9,10]);
+  ' "$source" "$max_source_bytes" 2>/dev/null)" || return 1
+
+  if ! snapshot_identity="$(
+    (
+    set -o pipefail
+    perl -MFcntl=:DEFAULT -MJSON::PP -MDigest::SHA -MEncode=encode_utf8 -MScalar::Util=refaddr -e '
+    my ($path, $max_source, $max_snapshot, $expected) = @ARGV;
+    $SIG{ALRM} = sub { exit 1 };
+    alarm 15;
+    exit 1 if lstat($path) && -l _;
+    my $flags = O_RDONLY | O_NONBLOCK;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $fh, $path, $flags) or exit 1;
+    my @before = stat($fh);
+    my @named = lstat($path);
+    exit 1 unless @before && @named && -f $fh
+      && join(":", @before[0,1,7,9,10]) eq $expected
+      && $before[0] == $named[0] && $before[1] == $named[1]
+      && $before[7] <= $max_source;
+    binmode($fh);
+    my $decoder = JSON::PP->new->utf8->allow_nonref;
+    my $encoder = JSON::PP->new->canonical->allow_nonref;
+    my @assistant_records;
+    my @tool_entries;
+    my $claim_bytes = 0;
+    my $final_turn_bytes = 0;
+    my %omitted = (system => 0, progress => 0, metadata => 0, other => 0);
+    my %omitted_bytes = (system => 0, progress => 0, metadata => 0, other => 0);
+    my $sequence = 0;
+    my $source_digest = Digest::SHA->new(256);
+
+    sub direct_text_content {
+      my ($content) = @_;
+      return 1 if defined($content) && !ref($content);
+      return 0 unless ref($content) eq "ARRAY";
+      for my $block (@$content) {
+        return 1 if ref($block) eq "HASH"
+          && (($block->{type} // "") =~ /text/i);
+      }
+      return 0;
+    }
+    sub is_tool_type {
+      my ($type) = @_;
+      return $type =~ /^(?:tool_(?:use|result)|function_call(?:_output)?|custom_tool_(?:call|call_output)|mcp_.*(?:call|result))$/i;
+    }
+    sub recognized_role_objects {
+      my ($record) = @_;
+      return () unless ref($record) eq "HASH";
+      return () if is_tool_type($record->{type} // "");
+      my (@objects, %seen);
+      my $push = sub {
+        my ($object) = @_;
+        return unless ref($object) eq "HASH";
+        return if is_tool_type($object->{type} // "");
+        my $address = refaddr($object);
+        push @objects, $object unless $seen{$address}++;
+      };
+      $push->($record);
+      $push->($record->{message});
+      if (ref($record->{payload}) eq "HASH"
+          && !is_tool_type($record->{payload}->{type} // "")) {
+        $push->($record->{payload});
+        $push->($record->{payload}->{message});
+      }
+      $push->($record->{actor});
+      return @objects;
+    }
+    sub role_object_content {
+      my ($record, $object) = @_;
+      return $object->{content} if exists($object->{content});
+      if (refaddr($object) == refaddr($record)
+          && ref($record->{message}) eq "HASH") {
+        return $record->{message}->{content};
+      }
+      if (ref($record->{actor}) eq "HASH"
+          && refaddr($object) == refaddr($record->{actor})
+          && ref($record->{output}) eq "HASH") {
+        return $record->{output}->{parts} // $record->{output}->{content};
+      }
+      return undef;
+    }
+    sub is_real_user {
+      my ($record) = @_;
+      for my $object (recognized_role_objects($record)) {
+        next unless (($object->{type} // "") eq "user"
+          || ($object->{role} // "") eq "user");
+        return 1 if direct_text_content(role_object_content($record, $object));
+      }
+      return 0;
+    }
+    sub tool_objects {
+      my ($record) = @_;
+      my @tools;
+      my %seen;
+      my $collect;
+      $collect = sub {
+        my ($value) = @_;
+        if (ref($value) eq "HASH") {
+          my $type = $value->{type} // "";
+          if (is_tool_type($type)) {
+            my $address = refaddr($value);
+            push @tools, $value unless $seen{$address}++;
+            return;
+          }
+          for my $key (keys %$value) {
+            next if $key =~ /^(?:toolUseResult|thinking|signature|encrypted_content)$/;
+            $collect->($value->{$key});
+          }
+        } elsif (ref($value) eq "ARRAY") {
+          $collect->($_) for @$value;
+        }
+      };
+      $collect->($record);
+      return @tools;
+    }
+    sub assistant_texts {
+      my ($record) = @_;
+      my (@targets, @texts);
+      my (%seen_target, %seen_text);
+      for my $object (recognized_role_objects($record)) {
+        next unless (($object->{role} // "") eq "assistant"
+          || ($object->{type} // "") eq "assistant");
+        my $target = $object;
+        if (ref($record->{actor}) eq "HASH"
+            && refaddr($object) == refaddr($record->{actor})
+            && ref($record->{output}) eq "HASH") {
+          $target = $record->{output};
+        }
+        my $address = refaddr($target);
+        push @targets, $target unless $seen_target{$address}++;
+      }
+      return () unless @targets;
+      my $collect;
+      $collect = sub {
+        my ($value) = @_;
+        if (ref($value) eq "HASH") {
+          my $type = $value->{type} // "";
+          return if is_tool_type($type)
+            || $type =~ /^(?:thinking|redacted_thinking|signature)$/i;
+          if ($type =~ /text/i && exists($value->{text})
+              && defined($value->{text}) && !ref($value->{text})) {
+            my $address = refaddr($value);
+            push @texts, $value->{text} unless $seen_text{$address}++;
+            return;
+          }
+          for my $key (keys %$value) {
+            next if $key =~ /^(?:toolUseResult|thinking|signature|encrypted_content)$/;
+            $collect->($value->{$key});
+          }
+        } elsif (ref($value) eq "ARRAY") {
+          $collect->($_) for @$value;
+        }
+      };
+      $collect->($_) for @targets;
+      # Future harnesses sometimes put role metadata and output in sibling fields.
+      # Use that record-level fallback only when the assistant object itself had no text.
+      $collect->($record) unless @texts;
+      return @texts;
+    }
+    sub bounded_scalar {
+      my ($value, $limit) = @_;
+      return "" if !defined($value) || ref($value);
+      return length($value) <= $limit ? $value : substr($value, 0, $limit);
+    }
+    sub tool_entry {
+      my ($tool, $record_sequence, $event_index) = @_;
+      my $text = $encoder->encode($tool);
+      my $bytes = encode_utf8($text);
+      my $type = $tool->{type} // "unknown";
+      my $raw_name = $tool->{name} // $tool->{tool_name} // "";
+      my $raw_id = $tool->{id} // $tool->{tool_use_id}
+        // $tool->{call_id} // $tool->{tool_call_id} // "";
+      my $raw_error = $tool->{error} // $tool->{is_error} // "";
+      return {
+        sequence => $record_sequence, event_index => $event_index,
+        event_kind => ($type =~ /result|output/i ? "result" : "call"),
+        type => bounded_scalar($type, 128),
+        name => bounded_scalar($raw_name, 256),
+        id => bounded_scalar($raw_id, 256),
+        error => bounded_scalar($raw_error, 512),
+        metadata_truncated => (length("$type") > 128 || length("$raw_name") > 256
+          || length("$raw_id") > 256 || length("$raw_error") > 512)
+          ? JSON::PP::true : JSON::PP::false,
+        text => $text, bytes => length($bytes),
+        sha256 => Digest::SHA::sha256_hex($bytes),
+      };
+    }
+    sub public_tool {
+      my ($entry, $result_preview, $call_preview) = @_;
+      my $summary = {
+        event_kind => $entry->{event_kind}, type => $entry->{type},
+        name => $entry->{name}, id => $entry->{id}, error => $entry->{error},
+        metadata_truncated => $entry->{metadata_truncated},
+        payload_bytes => $entry->{bytes}, payload_sha256 => $entry->{sha256},
+      };
+      if ($entry->{bytes} <= 2048) {
+        $summary->{content_truncated} = JSON::PP::false;
+        $summary->{content} = $entry->{text};
+      } else {
+        my $limit = $entry->{event_kind} eq "result" ? $result_preview : $call_preview;
+        $summary->{content_truncated} = JSON::PP::true;
+        $summary->{head} = substr($entry->{text}, 0, $limit);
+        $summary->{tail} = substr($entry->{text}, -$limit);
+      }
+      return $summary;
+    }
+    sub omitted_kind {
+      my ($record) = @_;
+      my $kind = "other";
+      if (ref($record) eq "HASH") {
+        $kind = $record->{type} // $record->{kind}
+          // (ref($record->{payload}) eq "HASH" ? $record->{payload}->{type} : undef)
+          // "other";
+      }
+      return "progress" if $kind =~ /progress|status/i;
+      return "system" if $kind =~ /system/i;
+      return "metadata" if $kind =~ /metadata|snapshot|queue|history/i;
+      return "other";
+    }
+    sub reset_turn {
+      @assistant_records = ();
+      @tool_entries = ();
+      $claim_bytes = 0;
+      $final_turn_bytes = 0;
+      %omitted = (system => 0, progress => 0, metadata => 0, other => 0);
+      %omitted_bytes = (system => 0, progress => 0, metadata => 0, other => 0);
+      $sequence = 0;
+    }
+
+    my $total = 0;
+    while (defined(my $line = <$fh>)) {
+      $total += length($line);
+      exit 1 if $total > $max_source || index($line, "\0") >= 0;
+      $source_digest->add($line);
+      next if $line =~ /^\s*$/;
+      my $record = eval { $decoder->decode($line) };
+      exit 1 if $@;
+      # A pre-normalized snapshot is accepted only by the bounded schema path.
+      # path. Never reinterpret an oversized or malformed snapshot as raw history.
+      exit 1 if ref($record) eq "HASH"
+        && ($record->{type} // "") eq "verdict_final_turn_snapshot";
+      if (is_real_user($record)) {
+        reset_turn();
+        next;
+      }
+      $sequence++;
+      my @tools = tool_objects($record);
+      my @texts = assistant_texts($record);
+      my $record_bytes = length(encode_utf8($encoder->encode($record))) + 1;
+      if (@texts || @tools) {
+        $final_turn_bytes += $record_bytes;
+        if (@texts) {
+          $claim_bytes += length(encode_utf8($_)) for @texts;
+          push @assistant_records, {
+            kind => "assistant", sequence => $sequence, texts => \@texts,
+          };
+        }
+        my $event_index = 0;
+        push @tool_entries, tool_entry($_, $sequence, ++$event_index) for @tools;
+      } else {
+        my $kind = omitted_kind($record);
+        $omitted{$kind}++;
+        $omitted_bytes{$kind} += $record_bytes;
+      }
+    }
+    my $first_digest = $source_digest->hexdigest;
+    my @after = stat($fh);
+    my @named_after = lstat($path);
+    exit 1 unless @after && @named_after
+      && join(":", @after[0,1,7,9,10]) eq $expected
+      && $after[0] == $named_after[0] && $after[1] == $named_after[1];
+    sysseek($fh, 0, 0) or exit 1;
+    my $verify_digest = Digest::SHA->new(256);
+    my $verified_bytes = 0;
+    while (1) {
+      my $chunk = "";
+      my $count = sysread($fh, $chunk, 65536);
+      exit 1 unless defined $count;
+      last if $count == 0;
+      $verified_bytes += $count;
+      exit 1 if $verified_bytes > $max_source;
+      $verify_digest->add($chunk);
+    }
+    my @verified = stat($fh);
+    my @verified_named = lstat($path);
+    exit 1 unless @verified && @verified_named
+      && join(":", @verified[0,1,7,9,10]) eq $expected
+      && $verified_bytes == $before[7]
+      && $verify_digest->hexdigest eq $first_digest
+      && $verified[0] == $verified_named[0] && $verified[1] == $verified_named[1];
+
+    my $build_manifest = sub {
+      my ($claims_truncated, $keep_tools, $result_preview, $call_preview) = @_;
+      my @records = $claims_truncated ? () : @assistant_records;
+      my ($previewed, $previewed_bytes, $omitted_count, $omitted_evidence_bytes) = (0, 0, 0, 0);
+      if (!$claims_truncated) {
+        for my $index (0 .. $#tool_entries) {
+          my $entry = $tool_entries[$index];
+          if ($index < $keep_tools) {
+            my $summary = public_tool($entry, $result_preview, $call_preview);
+            if ($summary->{content_truncated}) {
+              $previewed++;
+              my $preview_bytes = length(encode_utf8($summary->{head}))
+                + length(encode_utf8($summary->{tail}));
+              $previewed_bytes += $entry->{bytes} - $preview_bytes
+                if $entry->{bytes} > $preview_bytes;
+            }
+            push @records, {
+              kind => "tool", sequence => $entry->{sequence},
+              event_index => $entry->{event_index}, tools => [$summary],
+            };
+          } else {
+            $omitted_count++;
+            $omitted_evidence_bytes += $entry->{bytes};
+          }
+        }
+        @records = sort {
+          $a->{sequence} <=> $b->{sequence}
+            || (($a->{kind} eq "assistant" ? 0 : 1)
+                <=> ($b->{kind} eq "assistant" ? 0 : 1))
+            || (($a->{event_index} // 0) <=> ($b->{event_index} // 0))
+        } @records;
+      } else {
+        $omitted_count = scalar @tool_entries;
+        $omitted_evidence_bytes += $_->{bytes} for @tool_entries;
+      }
+      my $retained_bytes = length(encode_utf8($encoder->encode(\@records)));
+      return {
+        type => "verdict_final_turn_snapshot", version => 1,
+        truncated => $claims_truncated ? JSON::PP::true : JSON::PP::false,
+        evidence_truncated => ($previewed || $omitted_count)
+          ? JSON::PP::true : JSON::PP::false,
+        source_bytes => $before[7], source_sha256 => $first_digest,
+        final_turn_bytes => $final_turn_bytes, claim_bytes => $claim_bytes,
+        max_snapshot_bytes => 0 + $max_snapshot, retained_bytes => $retained_bytes,
+        omitted_kind_counts => \%omitted, omitted_kind_bytes => \%omitted_bytes,
+        evidence_summary => {
+          seen => scalar @tool_entries, retained => $keep_tools,
+          previewed => $previewed, previewed_bytes => $previewed_bytes,
+          omitted => $omitted_count, omitted_bytes => $omitted_evidence_bytes,
+        },
+        records => \@records,
+      };
+    };
+    my $keep_tools = scalar @tool_entries;
+    my ($result_preview, $call_preview) = (768, 768);
+    my $manifest = $build_manifest->(0, $keep_tools, $result_preview, $call_preview);
+    my $output = encode_utf8($encoder->encode($manifest));
+    if (length($output) + 1 > $max_snapshot) {
+      $result_preview = 512;
+      $manifest = $build_manifest->(0, $keep_tools, $result_preview, $call_preview);
+      $output = encode_utf8($encoder->encode($manifest));
+    }
+    if (length($output) + 1 > $max_snapshot) {
+      $call_preview = 256;
+      $manifest = $build_manifest->(0, $keep_tools, $result_preview, $call_preview);
+      $output = encode_utf8($encoder->encode($manifest));
+    }
+    while (length($output) + 1 > $max_snapshot && $keep_tools > 0) {
+      $keep_tools--;
+      $manifest = $build_manifest->(0, $keep_tools, $result_preview, $call_preview);
+      $output = encode_utf8($encoder->encode($manifest));
+    }
+    if (length($output) + 1 > $max_snapshot) {
+      $manifest = $build_manifest->(1, 0, $result_preview, $call_preview);
+      $output = encode_utf8($encoder->encode($manifest));
+    }
+    exit 1 if length($output) + 1 > $max_snapshot;
+    alarm 0;
+    print STDOUT $output, "\n" or exit 1;
+    ' "$source" "$max_source_bytes" "$max_snapshot_bytes" "$source_identity" \
+      | verdict_audit_write_exclusive_regular_identity "$destination"
+    )
+  )"; then
+    [[ "$snapshot_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+      && verdict_audit_unlink_if_identity \
+          "$destination" "$snapshot_identity" 2>/dev/null || true
+    return 1
+  fi
+  if [[ ! "$snapshot_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+     || ! snapshot_bytes="$(verdict_audit_regular_size_if_identity \
+          "$destination" "$snapshot_identity" 2>/dev/null)" \
+     || [[ ! "$snapshot_bytes" =~ ^[0-9]+$ \
+     || "$snapshot_bytes" -gt "$max_snapshot_bytes" ]]; then
+    [[ "$snapshot_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+      && verdict_audit_unlink_if_identity \
+          "$destination" "$snapshot_identity" 2>/dev/null || true
+    return 1
+  fi
+  if [[ "$emit_identity" == 1 ]] \
+     && ! perl -e '
+          $SIG{PIPE} = "IGNORE";
+          print STDOUT $ARGV[0] or exit 1;
+          close(STDOUT) or exit 1;
+        ' "$snapshot_identity"; then
+    verdict_audit_unlink_if_identity \
+      "$destination" "$snapshot_identity" 2>/dev/null || true
+    return 1
+  fi
+}
+
+verdict_audit_snapshot_final_turn() {  # source destination max-source-bytes max-snapshot-bytes
+  _verdict_audit_snapshot_final_turn "$1" "$2" "$3" "$4" 0
+}
+
+verdict_audit_snapshot_final_turn_identity() {  # source destination source-max snapshot-max -> device:inode
+  _verdict_audit_snapshot_final_turn "$1" "$2" "$3" "$4" 1
+}
+
+# Build the same wire record when Codex supplies Stop.last_assistant_message instead of
+# a transcript path. The message crosses stdin once; no caller hand-assembles a sibling
+# schema that the headless route would later reinterpret as raw transcript JSONL.
+verdict_audit_message_snapshot() {  # max-snapshot-bytes; message on stdin
+  local max_snapshot_bytes="$1"
+  [[ "$max_snapshot_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  perl -MJSON::PP -MDigest::SHA=sha256_hex -MEncode=encode_utf8,decode_utf8 -e '
+    my $max = shift;
+    binmode(STDIN);
+    local $/;
+    my $raw_text = <STDIN> // "";
+    my $text = decode_utf8($raw_text, 1);
+    my $encoder = JSON::PP->new->canonical->allow_nonref;
+    my $bytes = $raw_text;
+    my $record = {kind => "assistant", sequence => 1, texts => [$text]};
+    my $records = [$record];
+    my $manifest = {
+      type => "verdict_final_turn_snapshot", version => 1,
+      truncated => JSON::PP::false, evidence_truncated => JSON::PP::false,
+      source_bytes => length($bytes), source_sha256 => sha256_hex($bytes),
+      final_turn_bytes => length($bytes), claim_bytes => length($bytes),
+      max_snapshot_bytes => 0 + $max,
+      retained_bytes => length(encode_utf8($encoder->encode($records))),
+      omitted_kind_counts => {system => 0, progress => 0, metadata => 0, other => 0},
+      omitted_kind_bytes => {system => 0, progress => 0, metadata => 0, other => 0},
+      evidence_summary => {seen => 0, retained => 0, previewed => 0,
+        previewed_bytes => 0, omitted => 0, omitted_bytes => 0},
+      records => $records,
+    };
+    my $output = encode_utf8($encoder->encode($manifest));
+    if (length($output) + 1 > $max) {
+      $manifest->{truncated} = JSON::PP::true;
+      $manifest->{retained_bytes} = 2;
+      $manifest->{records} = [];
+      $output = encode_utf8($encoder->encode($manifest));
+    }
+    exit 1 if length($output) + 1 > $max;
+    print STDOUT $output, "\n" or exit 1;
+  ' "$max_snapshot_bytes"
+}
+
+verdict_audit_failed_turn_snapshot() {  # max-snapshot-bytes
+  local max_snapshot_bytes="$1"
+  [[ "$max_snapshot_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  jq -nc --argjson max "$max_snapshot_bytes" '
+    {type:"verdict_final_turn_snapshot",version:1,truncated:true,
+     evidence_truncated:true,source_bytes:0,
+     source_sha256:"0000000000000000000000000000000000000000000000000000000000000000",
+     final_turn_bytes:0,claim_bytes:0,max_snapshot_bytes:$max,retained_bytes:2,
+     omitted_kind_counts:{system:0,progress:0,metadata:0,other:0},
+     omitted_kind_bytes:{system:0,progress:0,metadata:0,other:0},
+     evidence_summary:{seen:0,retained:0,previewed:0,previewed_bytes:0,
+                       omitted:0,omitted_bytes:0},records:[]}
+  '
+}
+
+verdict_audit_failed_prior_snapshot() {
+  jq -nc '
+    {type:"verdict_prior_dossier_snapshot",version:1,truncated:true,
+     reason:"prior dossier was unreadable, malformed, or exceeded 65536 bytes"}
+  '
+}
+
+verdict_audit_absent_prior_snapshot() {
+  jq -nc '
+    {type:"verdict_prior_dossier_snapshot",version:1,truncated:false,absent:true}
+  '
+}
+
+verdict_audit_normalize_turn_snapshot() {  # max-allowed-bytes; snapshot JSON on stdin
+  local max_allowed_bytes="${1:-262144}"
+  [[ "$max_allowed_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  jq -ecs --argjson max_allowed "$max_allowed_bytes" '
+    def exact_keys($wanted): (keys | sort) == ($wanted | sort);
+    def count: type == "number" and . >= 0 and floor == .;
+    if length == 1
+       and (.[0] | type) == "object"
+       and (.[0] | exact_keys([
+         "type", "version", "truncated", "evidence_truncated", "source_bytes",
+         "source_sha256", "final_turn_bytes", "claim_bytes", "max_snapshot_bytes",
+         "retained_bytes", "omitted_kind_counts", "omitted_kind_bytes",
+         "evidence_summary", "records"
+       ]))
+       and .[0].type == "verdict_final_turn_snapshot"
+       and .[0].version == 1
+       and (.[0].truncated | type) == "boolean"
+       and (.[0].evidence_truncated | type) == "boolean"
+       and (.[0].source_bytes | count)
+       and (.[0].source_sha256 | type) == "string"
+       and (.[0].source_sha256 | test("^[0-9a-f]{64}$"))
+       and (.[0].final_turn_bytes | count)
+       and (.[0].claim_bytes | count)
+       and (.[0].max_snapshot_bytes | count)
+       and .[0].max_snapshot_bytes > 0
+       and .[0].max_snapshot_bytes <= $max_allowed
+       and (.[0].retained_bytes | count)
+       and .[0].retained_bytes <= .[0].max_snapshot_bytes
+       and .[0].retained_bytes == (.[0].records | tojson | utf8bytelength)
+       and (.[0].omitted_kind_counts | type) == "object"
+       and (.[0].omitted_kind_counts
+            | exact_keys(["system", "progress", "metadata", "other"]))
+       and all(.[0].omitted_kind_counts[]; count)
+       and (.[0].omitted_kind_bytes | type) == "object"
+       and (.[0].omitted_kind_bytes
+            | exact_keys(["system", "progress", "metadata", "other"]))
+       and all(.[0].omitted_kind_bytes[]; count)
+       and (.[0].evidence_summary | type) == "object"
+       and (.[0].evidence_summary
+            | exact_keys(["seen", "retained", "previewed", "previewed_bytes", "omitted", "omitted_bytes"]))
+       and all(.[0].evidence_summary[]; count)
+       and .[0].evidence_summary.retained <= .[0].evidence_summary.seen
+       and .[0].evidence_summary.previewed <= .[0].evidence_summary.retained
+       and .[0].evidence_summary.omitted == (.[0].evidence_summary.seen - .[0].evidence_summary.retained)
+       and (.[0].records | type) == "array"
+    then .[0] else empty end
+  '
 }
 
 # Normalize exactly one verdict dossier only when it matches the published wire contract.
@@ -137,12 +797,69 @@ verdict_audit_rename_exact() {  # source destination
   perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$1" "$2"
 }
 
+# Move one pathname without ever replacing a destination entry. Darwin and Linux
+# expose this as different syscalls; keeping the small portability table here avoids
+# `mv -n` implementations that emulate no-clobber with a check/rename race. Unsupported
+# architectures fail closed rather than silently falling back to overwriting rename(2).
+verdict_audit_rename_no_clobber_exact() {  # source destination
+  perl -MConfig -e '
+    my ($source, $destination) = @ARGV;
+    my $os = $Config{osname} // "";
+    my $arch = $Config{archname} // "";
+    my ($call, $cwd, $flag);
+    if ($os eq "darwin") {
+      # renameatx_np(2): SYS_renameatx_np=488, AT_FDCWD=-2, RENAME_EXCL=4.
+      ($call, $cwd, $flag) = (488, -2, 4);
+    } elsif ($os eq "linux") {
+      # renameat2(2): AT_FDCWD=-100, RENAME_NOREPLACE=1.
+      $cwd = -100;
+      $flag = 1;
+      if ($arch =~ /\A(?:x86_64|amd64)/) { $call = 316 }
+      elsif ($arch =~ /\A(?:aarch64|arm64|riscv64|loongarch64)/) { $call = 276 }
+      elsif ($arch =~ /\Ai[3-6]86/) { $call = 353 }
+      elsif ($arch =~ /\Aarm/) { $call = 382 }
+      elsif ($arch =~ /\Appc64/) { $call = 357 }
+      elsif ($arch =~ /\As390x/) { $call = 347 }
+      else { exit 1 }
+    } else {
+      exit 1;
+    }
+    exit(syscall($call, $cwd, $source, $cwd, $destination, $flag) == 0 ? 0 : 1);
+  ' "$1" "$2"
+}
+
+# Atomically swap two existing pathnames without losing either object. Atomic state
+# replacement uses this only after binding both names to expected regular-file identities;
+# unsupported kernels fail closed instead of falling back to two lossy renames.
+verdict_audit_exchange_exact() {  # first-path second-path
+  perl -MConfig -e '
+    my ($first, $second) = @ARGV;
+    my $os = $Config{osname} // "";
+    my $arch = $Config{archname} // "";
+    my ($call, $cwd, $flag);
+    if ($os eq "darwin") {
+      # renameatx_np(2): SYS_renameatx_np=488, AT_FDCWD=-2, RENAME_SWAP=2.
+      ($call, $cwd, $flag) = (488, -2, 2);
+    } elsif ($os eq "linux") {
+      # renameat2(2): AT_FDCWD=-100, RENAME_EXCHANGE=2.
+      $cwd = -100;
+      $flag = 2;
+      if ($arch =~ /\A(?:x86_64|amd64)/) { $call = 316 }
+      elsif ($arch =~ /\A(?:aarch64|arm64|riscv64|loongarch64)/) { $call = 276 }
+      elsif ($arch =~ /\Ai[3-6]86/) { $call = 353 }
+      elsif ($arch =~ /\Aarm/) { $call = 382 }
+      elsif ($arch =~ /\Appc64/) { $call = 357 }
+      elsif ($arch =~ /\As390x/) { $call = 347 }
+      else { exit 1 }
+    } else {
+      exit 1;
+    }
+    exit(syscall($call, $cwd, $first, $cwd, $second, $flag) == 0 ? 0 : 1);
+  ' "$1" "$2"
+}
+
 verdict_audit_restore_no_clobber() {  # quarantined-path stable-path
-  if perl -e 'link($ARGV[0], $ARGV[1]) or exit 1' "$1" "$2"; then
-    rm -f "$1"
-    return 0
-  fi
-  return 1
+  verdict_audit_rename_no_clobber_exact "$1" "$2"
 }
 
 # Two-phase restore for callers that must revalidate external authority after publishing
@@ -178,18 +895,83 @@ verdict_audit_link_no_clobber() {  # quarantined-path stable-path
   verdict_audit_link_no_clobber_identity "$1" "$2" >/dev/null
 }
 
-verdict_audit_unlink_if_identity() {  # stable-path expected-device:inode
-  local stable_path="$1" expected_identity="$2"
-  local selected_path="${1}.unlink-$$-${RANDOM:-0}"
-  verdict_audit_rename_exact "$stable_path" "$selected_path" 2>/dev/null || return 1
-  if verdict_audit_selected_identity_matches \
-      "$selected_path" "$expected_identity" 2>/dev/null; then
-    rm -f "$selected_path"
+verdict_audit_unlink_selected_identity() {  # selected-path expected-device:inode
+  local selected_path="$1" expected_identity="$2"
+  local retirement_path="${1}.retire-$$-${RANDOM:-0}" retirement_status
+  # A second no-clobber rename is the deletion selection edge. If the checked name was
+  # replaced after its preceding validation, that replacement is moved—not removed—
+  # and the descriptor-bound check below rejects it. Restore keeps every object type.
+  verdict_audit_rename_no_clobber_exact \
+    "$selected_path" "$retirement_path" 2>/dev/null || return 2
+  perl -MConfig -MFcntl=:DEFAULT -MFile::Basename=dirname,basename -e '
+    my ($path, $expected) = @ARGV;
+    exit 1 unless $expected =~ /\A[0-9]+:[0-9]+\z/;
+    my $parent = dirname($path);
+    my $leaf = basename($path);
+    exit 1 if $leaf eq "" || $leaf eq "." || $leaf eq "..";
+    my $directory_flags = O_RDONLY | O_NONBLOCK;
+    $directory_flags |= Fcntl::O_DIRECTORY() if defined &Fcntl::O_DIRECTORY;
+    $directory_flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $directory, $parent, $directory_flags) or exit 1;
+    chdir($directory) or exit 1;
+    my $file_flags = O_RDONLY | O_NONBLOCK;
+    $file_flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $owned, $leaf, $file_flags) or exit 1;
+    my @opened = stat($owned);
+    my @named = lstat($leaf);
+    exit 1 unless @opened && @named && (-f $owned || -p $owned)
+      && ($opened[0] . ":" . $opened[1]) eq $expected
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    my $os = $Config{osname} // "";
+    my $arch = $Config{archname} // "";
+    my $unlinkat_call;
+    if ($os eq "darwin") { $unlinkat_call = 472 }
+    elsif ($os eq "linux") {
+      if ($arch =~ /\A(?:x86_64|amd64)/) { $unlinkat_call = 263 }
+      elsif ($arch =~ /\A(?:aarch64|arm64|riscv64|loongarch64)/) { $unlinkat_call = 35 }
+      elsif ($arch =~ /\Ai[3-6]86/) { $unlinkat_call = 301 }
+      elsif ($arch =~ /\Aarm/) { $unlinkat_call = 328 }
+      elsif ($arch =~ /\Appc64/) { $unlinkat_call = 292 }
+      elsif ($arch =~ /\As390x/) { $unlinkat_call = 294 }
+      else { exit 1 }
+    } else { exit 1 }
+    my $links_before = $opened[3];
+    syscall($unlinkat_call, fileno($directory), $leaf, 0) == 0 or exit 1;
+    my @after = stat($owned);
+    exit 1 unless @after && $links_before > 0 && $after[3] + 1 == $links_before;
+  ' "$retirement_path" "$expected_identity" 2>/dev/null
+  retirement_status=$?
+  if (( retirement_status == 0 )); then
     return 0
   fi
   verdict_audit_restore_no_clobber \
-    "$selected_path" "$stable_path" 2>/dev/null || return 2
+    "$retirement_path" "$selected_path" 2>/dev/null || return 3
   return 1
+}
+
+verdict_audit_unlink_if_identity() {  # stable-path expected-device:inode
+  local stable_path="$1" expected_identity="$2"
+  local selected_path="${1}.unlink-$$-${RANDOM:-0}" retirement_status
+  [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  # Selection itself is atomic and no-clobber. A replacement already at the stable
+  # name is moved to quarantine, identified as foreign, and restored unchanged.
+  verdict_audit_rename_no_clobber_exact \
+    "$stable_path" "$selected_path" 2>/dev/null || return 2
+  if ! verdict_audit_selected_identity_matches \
+      "$selected_path" "$expected_identity" 2>/dev/null; then
+    verdict_audit_restore_no_clobber \
+      "$selected_path" "$stable_path" 2>/dev/null || return 3
+    return 1
+  fi
+  verdict_audit_unlink_selected_identity \
+    "$selected_path" "$expected_identity" 2>/dev/null
+  retirement_status=$?
+  if (( retirement_status == 0 )); then
+    return 0
+  fi
+  verdict_audit_restore_no_clobber \
+    "$selected_path" "$stable_path" 2>/dev/null || true
+  return "$retirement_status"
 }
 
 verdict_audit_unlink_if_same_inode() {  # stable-path quarantined-path
@@ -216,6 +998,26 @@ verdict_audit_selected_identity_matches() {  # selected-path device:inode
     my @selected = lstat($path);
     exit 1 unless @selected;
     exit(($selected[0] . ":" . $selected[1]) eq $expected ? 0 : 1);
+  ' "$1" "$2"
+}
+
+# Read metadata only through the exact regular inode a caller already owns. This is
+# the bounded post-write check used before publishing or retiring private snapshots;
+# a pathname replacement can neither supply the size nor authorize cleanup.
+verdict_audit_regular_size_if_identity() {  # selected-path device:inode
+  perl -MFcntl=:DEFAULT -e '
+    my ($path, $expected) = @ARGV;
+    exit 1 unless $expected =~ /\A[0-9]+:[0-9]+\z/;
+    exit 1 if lstat($path) && -l _;
+    my $flags = O_RDONLY | O_NONBLOCK;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $fh, $path, $flags) or exit 1;
+    my @opened = stat($fh);
+    my @named = lstat($path);
+    exit 1 unless @opened && @named && -f $fh
+      && ($opened[0] . ":" . $opened[1]) eq $expected
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    print $opened[7];
   ' "$1" "$2"
 }
 
@@ -259,22 +1061,44 @@ verdict_audit_process_has_ancestor() {  # ancestor-pid ancestor-start-token [sta
 # Write stdin only when the exact destination path does not already exist. O_EXCL and
 # O_NONBLOCK make a pre-created FIFO/symlink/directory a fast error; inode checks prove
 # the opened descriptor is the regular file now named at that path.
-verdict_audit_write_exclusive_regular() {  # destination-path
-  perl -MFcntl=:DEFAULT -e '
-    my $path = shift;
+_verdict_audit_write_exclusive_regular() {  # destination-path emit-identity
+  perl -MConfig -MFcntl=:DEFAULT -e '
+    my ($path, $emit_identity) = @ARGV;
+    exit 1 unless $emit_identity eq "0" || $emit_identity eq "1";
     my $flags = O_WRONLY | O_CREAT | O_EXCL | O_NONBLOCK;
     $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
     sysopen(my $fh, $path, $flags, 0600) or exit 1;
     my @opened = stat($fh);
     my @named = lstat($path);
-    my $remove_owned = sub {
+    my $retire_owned = sub {
       my @current = lstat($path);
-      unlink($path) if @current
+      return unless @current
         && $opened[0] == $current[0] && $opened[1] == $current[1];
+      my $retired = $path . ".failed-" . $$ . "-" . int(rand(2_147_483_647));
+      my $os = $Config{osname} // "";
+      my $arch = $Config{archname} // "";
+      my ($call, $cwd, $flag);
+      if ($os eq "darwin") { ($call, $cwd, $flag) = (488, -2, 4) }
+      elsif ($os eq "linux") {
+        $cwd = -100;
+        $flag = 1;
+        if ($arch =~ /\A(?:x86_64|amd64)/) { $call = 316 }
+        elsif ($arch =~ /\A(?:aarch64|arm64|riscv64|loongarch64)/) { $call = 276 }
+        elsif ($arch =~ /\Ai[3-6]86/) { $call = 353 }
+        elsif ($arch =~ /\Aarm/) { $call = 382 }
+        elsif ($arch =~ /\Appc64/) { $call = 357 }
+        elsif ($arch =~ /\As390x/) { $call = 347 }
+        else { return }
+      } else { return }
+      return unless syscall($call, $cwd, $path, $cwd, $retired, $flag) == 0;
+      my @selected = lstat($retired);
+      return if @selected
+        && $opened[0] == $selected[0] && $opened[1] == $selected[1];
+      syscall($call, $cwd, $retired, $cwd, $path, $flag);
     };
     if (!@opened || !@named || !-f $fh
         || $opened[0] != $named[0] || $opened[1] != $named[1]) {
-      $remove_owned->() if @opened;
+      $retire_owned->() if @opened;
       exit 1;
     }
     binmode(STDIN);
@@ -282,30 +1106,157 @@ verdict_audit_write_exclusive_regular() {  # destination-path
     while (1) {
       my $chunk = "";
       my $read = sysread(STDIN, $chunk, 65536);
-      if (!defined $read) { $remove_owned->(); exit 1 }
+      if (!defined $read) { $retire_owned->(); exit 1 }
       last if $read == 0;
       my $offset = 0;
       while ($offset < length($chunk)) {
         my $written = syswrite($fh, $chunk, length($chunk) - $offset, $offset);
-        if (!defined $written || $written == 0) { $remove_owned->(); exit 1 }
+        if (!defined $written || $written == 0) { $retire_owned->(); exit 1 }
         $offset += $written;
       }
     }
-    close($fh) or do { $remove_owned->(); exit 1 };
-  ' "$1"
+    close($fh) or do { $retire_owned->(); exit 1 };
+    if ($emit_identity eq "1") {
+      my @current = lstat($path);
+      exit 1 unless @current
+        && $opened[0] == $current[0] && $opened[1] == $current[1];
+      $SIG{PIPE} = "IGNORE";
+      if (!print(STDOUT $opened[0], ":", $opened[1]) || !close(STDOUT)) {
+        $retire_owned->();
+        exit 1;
+      }
+    }
+  ' "$1" "$2"
 }
 
-# Atomic replacement for small state records. The caller supplies bytes on stdin.
-verdict_audit_write_atomic() {  # destination-path
+verdict_audit_write_exclusive_regular() {  # destination-path
+  _verdict_audit_write_exclusive_regular "$1" 0
+}
+
+# The identity-returning form lets a caller later retire only the inode selected by
+# this exact O_EXCL write. A pathname replacement after close is never authorized.
+verdict_audit_write_exclusive_regular_identity() {  # destination-path -> device:inode
+  _verdict_audit_write_exclusive_regular "$1" 1
+}
+
+# Atomic replacement for small state records. The identity-returning form lets a
+# producer later retract only its own publication without deleting a newer writer's
+# replacement. The caller supplies bytes on stdin.
+_verdict_audit_write_atomic_identity_locked() {  # destination-path -> device:inode
   local destination="$1" temporary="${1}.tmp.$$-${RANDOM:-0}"
-  if ! verdict_audit_write_exclusive_regular "$temporary"; then
-    rm -f "$temporary" 2>/dev/null || true
+  local identity prior_identity=""
+  identity="$(verdict_audit_write_exclusive_regular_identity "$temporary")" || {
+    return 1
+  }
+  # The identity comes from the writer's open descriptor, before close. A later
+  # pathname replacement is foreign and is preserved rather than authenticated.
+  if ! verdict_audit_selected_identity_matches \
+      "$temporary" "$identity" 2>/dev/null; then
+    verdict_audit_unlink_if_identity \
+      "$temporary" "$identity" 2>/dev/null || true
     return 1
   fi
-  if ! verdict_audit_rename_exact "$temporary" "$destination"; then
-    rm -f "$temporary" 2>/dev/null || true
+
+  # Identity delivery precedes the publication commit. If the caller cannot receive
+  # it, no stable pathname has changed and the prior record remains authoritative.
+  # Ignore SIGPIPE only in this emission subshell. A closed pipeline reader then makes
+  # printf report EPIPE as a normal nonzero status, while the caller's signal behavior
+  # remains untouched and this function retains control of exact temp retirement.
+  if ! ( trap '' PIPE; printf '%s' "$identity" ) 2>/dev/null; then
+    verdict_audit_unlink_if_identity \
+      "$temporary" "$identity" 2>/dev/null || true
     return 1
   fi
+
+  if prior_identity="$(verdict_audit_path_identity \
+      "$destination" 2>/dev/null)"; then
+    # The exchange is the single irreversible commit point. The per-destination flock
+    # excludes another helper writer until every validation and private cleanup ends.
+    if [[ -d "$destination" && ! -L "$destination" ]] \
+       || ! verdict_audit_exchange_exact \
+        "$temporary" "$destination" 2>/dev/null; then
+      verdict_audit_unlink_if_identity \
+        "$temporary" "$identity" 2>/dev/null || true
+      return 1
+    fi
+    if ! verdict_audit_selected_identity_matches \
+        "$destination" "$identity" 2>/dev/null \
+       || ! verdict_audit_selected_identity_matches \
+        "$temporary" "$prior_identity" 2>/dev/null; then
+      # Never roll back a stable pathname after commit. An unexpected external swap is
+      # preserved for the next exact reader; private ambiguous state is left in place.
+      return 1
+    fi
+    # Retirement is private bookkeeping after commit. A collision leaks at most this
+    # invocation's bounded temp record and cannot revoke the stable publication.
+    verdict_audit_unlink_if_identity \
+      "$temporary" "$prior_identity" 2>/dev/null || true
+  else
+    # No-clobber publication preserves a destination that appears after the absence
+    # check. Post-publication validation catches a temp-name swap at the syscall edge.
+    if [[ -e "$destination" || -L "$destination" ]] \
+       || ! verdict_audit_rename_no_clobber_exact \
+        "$temporary" "$destination" 2>/dev/null; then
+      verdict_audit_unlink_if_identity \
+        "$temporary" "$identity" 2>/dev/null || true
+      return 1
+    fi
+    if ! verdict_audit_selected_identity_matches \
+        "$destination" "$identity" 2>/dev/null; then
+      # Publication already committed. Preserve the stable object even when an
+      # uncoordinated actor changed it at the syscall edge.
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Serialize the entire state transition on the destination directory vnode. A separate
+# lock pathname can be renamed after validation and replaced with a second flock inode;
+# the already-open parent directory is the stable kernel anchor shared by every writer
+# that can publish a name there. Perl retains that flock across the inner Bash exec, so
+# macOS Bash 3 needs no flock utility or dynamic descriptor support. The kernel releases
+# the inherited descriptor on every normal, error, or signal exit.
+verdict_audit_write_atomic_identity() {  # destination-path -> device:inode
+  local destination="$1" state_lib_dir state_lib
+  state_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 1
+  state_lib="$state_lib_dir/$(basename "${BASH_SOURCE[0]}")"
+  perl -MFcntl=:DEFAULT,:flock -MFile::Basename=dirname -e '
+    my ($state_lib, $destination) = @ARGV;
+    my $anchor_path = dirname($destination);
+    $SIG{ALRM} = sub {
+      print STDERR "verdict-audit-state: timed out acquiring atomic state anchor\n";
+      exit 1;
+    };
+    alarm 10;
+    $^F = 255;
+    my $flags = O_RDONLY | O_NONBLOCK;
+    $flags |= Fcntl::O_DIRECTORY() if defined &Fcntl::O_DIRECTORY;
+    $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+    sysopen(my $anchor, $anchor_path, $flags) or do {
+      print STDERR "verdict-audit-state: atomic state directory is unavailable\n";
+      exit 1;
+    };
+    my @opened = stat($anchor);
+    my @named = lstat($anchor_path);
+    exit 1 unless @opened && @named && -d $anchor
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    flock($anchor, LOCK_EX) or exit 1;
+    @opened = stat($anchor);
+    @named = lstat($anchor_path);
+    exit 1 unless @opened && @named && -d $anchor
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+    alarm 0;
+    exec "/bin/bash", "-c",
+      q{source "$1"; _verdict_audit_write_atomic_identity_locked "$2"},
+      "verdict-atomic-writer", $state_lib, $destination;
+    print STDERR "verdict-audit-state: could not launch atomic state writer\n";
+    exit 1;
+  ' "$state_lib" "$destination"
+}
+
+verdict_audit_write_atomic() {  # destination-path
+  verdict_audit_write_atomic_identity "$1" >/dev/null
 }
 
 # Remove only the exact record body the caller previously authorized. Renaming first
@@ -313,12 +1264,22 @@ verdict_audit_write_atomic() {  # destination-path
 # afterward remains untouched at the stable path.
 verdict_audit_remove_record_if_matches() {  # record-path expected-body
   local record_path="$1" expected_body="$2"
-  local quarantine="${1}.retire.$$-${RANDOM:-0}" actual_body
-  verdict_audit_rename_exact "$record_path" "$quarantine" 2>/dev/null || return 1
+  local quarantine="${1}.retire.$$-${RANDOM:-0}" actual_body record_identity
+  record_identity="$(verdict_audit_path_identity "$record_path" 2>/dev/null)" \
+    || return 1
+  verdict_audit_rename_no_clobber_exact \
+    "$record_path" "$quarantine" 2>/dev/null || return 1
+  if ! verdict_audit_selected_identity_matches \
+      "$quarantine" "$record_identity" 2>/dev/null; then
+    verdict_audit_restore_no_clobber \
+      "$quarantine" "$record_path" 2>/dev/null || return 2
+    return 1
+  fi
   if actual_body="$(verdict_audit_read_single_record "$quarantine" 2>/dev/null)" \
      && [[ "$actual_body" == "$expected_body" ]]; then
-    rm -f "$quarantine"
-    return 0
+    verdict_audit_unlink_if_identity \
+      "$quarantine" "$record_identity" 2>/dev/null
+    return $?
   fi
   verdict_audit_restore_no_clobber "$quarantine" "$record_path" 2>/dev/null || return 2
   return 1
