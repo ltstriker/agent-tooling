@@ -627,7 +627,7 @@ printf '%s\n' "$late_dossier" > "$dossier_path"
 printf '%s\n' "$late_dossier" > "$R/.agents/state/last-verdict.json"
 late_out="$(jq -nc --arg p "$R/transcript.jsonl" --arg s session-a \
     '{transcript_path:$p,hook_event_name:"Stop",session_id:$s}' \
-  | ( cd "$R" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$R" \
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_AUDITOR_CMD='exit 2' \
       CODEX_BIN=/nonexistent PATH=/opt/homebrew/bin:/usr/bin:/bin \
       VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='cat >/dev/null; echo YES' \
       bash "$PREFLIGHT" ) 2>/dev/null)"

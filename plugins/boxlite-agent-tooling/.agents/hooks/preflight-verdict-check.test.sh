@@ -551,20 +551,29 @@ for (( poll_index=0; poll_index<300; poll_index++ )); do
   sleep 0.01
 done
 prompt_hook "$R" session-a turn-b >/dev/null 2>&1
+( sleep 8
+  touch "$R/reentry-gap-watchdog-hit"
+  kill_test_pids KILL "$reentry_gap_job"
+) & reentry_gap_watchdog=$!
 touch "$R/.agents/state/reentry-gap-release"
 wait "$reentry_gap_job" 2>/dev/null; reentry_gap_rc=$?
+kill "$reentry_gap_watchdog" 2>/dev/null || true
+wait "$reentry_gap_watchdog" 2>/dev/null || true
 reentry_gap_runs="$(wc -l < "$R/.agents/state/SYNC_AUDIT_RUNS" 2>/dev/null | tr -d ' ')"
 reentry_gap_out="$(cat "$R/reentry-gap.out" 2>/dev/null || true)"
 if [[ -e "$R/.agents/state/reentry-gap-ready" \
    && "$reentry_gap_rc" == 0 \
    && "$reentry_gap_runs" == 1 \
+   && ! -e "$R/reentry-gap-watchdog-hit" \
    && -z "$reentry_gap_out" ]]; then
   pass=$((pass+1)); printf '  PASS  %s\n' "post-audit prompt releases validator re-entry without a second audit"
 else
-  fail=$((fail+1)); printf '  FAIL  %s  (ready=%s rc=%s runs=%s out=%s)\n' \
+  fail=$((fail+1)); printf '  FAIL  %s  (ready=%s rc=%s runs=%s watchdog=%s out=%s)\n' \
     "validator re-entry adopted a newer prompt epoch" \
     "$([[ -e "$R/.agents/state/reentry-gap-ready" ]] && echo yes || echo no)" \
-    "$reentry_gap_rc" "${reentry_gap_runs:-0}" "${reentry_gap_out:-EMPTY}"
+    "$reentry_gap_rc" "${reentry_gap_runs:-0}" \
+    "$([[ -e "$R/reentry-gap-watchdog-hit" ]] && echo hit || echo quiet)" \
+    "${reentry_gap_out:-EMPTY}"
 fi
 rm -rf "$R"
 

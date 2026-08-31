@@ -16,7 +16,9 @@
 #      must leave a dossier behind. Per-harness config, tests stub it.
 #   2. claude CLI — headless with the auditor spec as system prompt, tools
 #      whitelisted, hooks disabled (no nested gates), 10-minute cap.
-#   3. Codex CLI — workspace-write, hooks disabled, ephemeral, same timeout.
+#   3. Codex CLI — read-only, hooks disabled, ephemeral, same timeout. Codex writes
+#      only its final response through the host-owned --output-last-message channel;
+#      the parent runner validates and publishes those bytes.
 #   4. Neither → exit 2 with instructions (the caller sees why).
 #
 # Exit codes: 0 dossier written · 1 audit ran but no dossier · 2 no runner available ·
@@ -759,6 +761,24 @@ find_codex_bin() {
   return 1
 }
 
+# Codex's read-only sandbox deliberately cannot create the throwaway Git index used by
+# the auditor procedure. Capture that one write-requiring value in the parent, before
+# launch, so the auditor can keep the whole workspace read-only without guessing the
+# dossier binding.
+compute_audit_tree_hash() {
+  local index_file tree_hash="" command_status=0
+  index_file="$(mktemp)" || return 1
+  GIT_INDEX_FILE="$index_file" git -C "$project_dir" read-tree HEAD >/dev/null 2>&1 \
+    && GIT_INDEX_FILE="$index_file" git -C "$project_dir" add -A >/dev/null 2>&1 \
+    && tree_hash="$(GIT_INDEX_FILE="$index_file" \
+         git -C "$project_dir" write-tree 2>/dev/null)" \
+    || command_status=$?
+  rm -f "$index_file"
+  (( command_status == 0 )) && [[ "$tree_hash" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] \
+    || return 1
+  printf '%s\n' "$tree_hash"
+}
+
 # The prompt is a document, not a string literal: .agents/prompts/verdict-runner.md.
 # Loaded through the shared library so this runner and the Stop gate that offers the
 # in-agent route cannot drift apart on what "proven" means.
@@ -1019,18 +1039,38 @@ elif codex_bin="$(find_codex_bin)" && [[ -r "$spec_file" ]]; then
   remove_owned_verdict
   rm -f "$audit_output_file"
   spec_body="$(strip_frontmatter "$spec_file")"
+  if ! codex_tree_hash="$(compute_audit_tree_hash)"; then
+    remove_owned_verdict while-current
+    printf 'run-verdict-audit.sh: could not capture the working-tree hash for the read-only Codex auditor.\n' >&2
+    exit 1
+  fi
   codex_prompt="${spec_body}
 
-${audit_prompt}"
+${audit_prompt}
+
+READ-ONLY DELIVERY OVERRIDE FOR THIS CODEX INVOCATION:
+- Do not write or modify any file, including verdict_file.
+- In procedure step 2, run the two read-only branch and HEAD commands, but do not
+  create the temporary Git index. Use this parent-captured tree_hash exactly:
+  ${codex_tree_hash}
+- For Tier-2, inspect any existing isolated red-to-green evidence in the transcript;
+  do not create another worktree. If required evidence is absent, use step 5's
+  blocked-proof form and state that residual risk.
+- Replace procedure steps 6 and 7 with: return ONLY the dossier JSON object as your
+  final response, with no Markdown fence or commentary.
+- The Codex host captures that final response into a generation-owned staging file.
+  The parent runner alone validates and publishes the authoritative dossier."
   if ! run_in_audit_group \
       "$codex_prompt" \
       perl -e 'alarm shift; exec @ARGV' "$audit_timeout_seconds" \
         "$codex_bin" --ask-for-approval never \
           exec \
           --disable hooks \
-          --sandbox workspace-write \
+          --ignore-user-config \
+          --sandbox read-only \
           --cd "$project_dir" \
           --ephemeral \
+          --output-last-message "$audit_output_file" \
           - >/dev/null 2>&1; then
     rm -f "$audit_output_file"
     remove_owned_verdict while-current
