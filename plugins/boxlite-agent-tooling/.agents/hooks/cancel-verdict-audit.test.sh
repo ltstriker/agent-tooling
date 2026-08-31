@@ -611,7 +611,7 @@ check_eq "new input revokes the completed generation before it can authorize new
 rm -rf "$R"
 
 echo
-echo "## A native auditor writing after cancellation has no authority"
+echo "## An abandoned auditor writing after cancellation has no authority"
 R="$(setup)"; generation="711-712-4"
 request_path="$(session_state_path "$R" verdict-request session-a)"
 dossier_path="$(session_state_path "$R" last-verdict.json session-a)"
@@ -627,8 +627,10 @@ printf '%s\n' "$late_dossier" > "$dossier_path"
 printf '%s\n' "$late_dossier" > "$R/.agents/state/last-verdict.json"
 late_out="$(jq -nc --arg p "$R/transcript.jsonl" --arg s session-a \
     '{transcript_path:$p,hook_event_name:"Stop",session_id:$s}' \
-  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
-      VERDICT_CLASSIFIER_CMD='cat >/dev/null; echo YES' bash "$PREFLIGHT" ) 2>/dev/null)"
+  | ( cd "$R" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$R" \
+      CODEX_BIN=/nonexistent PATH=/opt/homebrew/bin:/usr/bin:/bin \
+      VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='cat >/dev/null; echo YES' \
+      bash "$PREFLIGHT" ) 2>/dev/null)"
 late_state="decision=$(printf '%s' "$late_out" | jq -r '.decision // "allow"')"
 late_state="$late_state dossier=$([[ -e "$dossier_path" ]] && echo present || echo gone)"
 new_generation="$(awk '{print $1}' "$request_path" 2>/dev/null || echo MISSING)"
@@ -640,7 +642,7 @@ else
   generation_state=fresh
 fi
 late_state="$late_state request=$generation_state"
-check_eq "a late native PASS is rejected after its generation was revoked" \
+check_eq "a late abandoned PASS is rejected after its generation was revoked" \
   "$late_state" "decision=block dossier=gone request=fresh"
 rm -rf "$R"
 

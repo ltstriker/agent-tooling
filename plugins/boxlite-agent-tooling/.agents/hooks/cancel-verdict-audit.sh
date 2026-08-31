@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # shellcheck source-path=SCRIPTDIR
-# UserPromptSubmit hook: revoke a headless verdict audit owned by this same session.
+# UserPromptSubmit hook: revoke a verdict audit owned by this same session.
 #
-# Native Task/collaboration auditors are harness-owned and are canceled by the parent
-# agent per preflight-verdict-check.sh's instruction. This hook handles only the shell
-# fallback in run-verdict-audit.sh. It never signals a PID selected from workspace state:
-# revoking the session's request makes the runner cancel its own process group and discard
-# any dossier produced for the abandoned turn.
+# The Stop hook launches run-verdict-audit.sh synchronously. This hook never signals a PID
+# selected from workspace state: revoking the session's request makes the runner cancel
+# its own process group and discard any dossier produced for the abandoned turn.
 #
 # Current Codex dispatches UserPromptSubmit at its external UserInput edge and records a
 # Stop continuation internally without re-dispatching it. Claude documents this event as
@@ -163,8 +161,8 @@ rm -f "$audit_request_file" "$previous_verdict_file" "$last_uuid_file" \
 
 # The short decision mutex orders UserPromptSubmit against a Stop gate that has hidden a
 # dossier under a quarantine pathname. Once held, revoke first so the live runner wakes;
-# then wait on its publication lease and clean again so neither a headless promotion nor
-# a native late write can resurrect the abandoned generation. The entire operation lives
+# then wait on its publication lease and clean again so neither a runner promotion nor
+# a late out-of-band write can resurrect the abandoned generation. The entire operation lives
 # in one Perl process so the decision lock remains held through both cleanup passes.
 perl -MFcntl=:DEFAULT,:flock -e '
   my ($decision_path, $publish_path, $request, $previous, $last_uuid,

@@ -3,9 +3,8 @@ name: verdict-runner
 used-by: .agents/hooks/run-verdict-audit.sh
 placeholders: verdict_file, previous_verdict_file, audit_generation, transcript_path
 description: >
-  Fed on stdin to the headless verdict auditor — the runner used when no agent
-  runtime is present to spawn a subagent. Same standard of proof as verdict-task.md,
-  plus the write target, because nothing else tells a bare CLI where the dossier goes.
+  Fed on stdin to the synchronous verdict auditor owned by the Stop hook. It carries
+  the proof standard and explicit generation-scoped dossier path needed by a bare CLI.
 ---
 
 Audit the final turn in the session transcript — every assistant message since the

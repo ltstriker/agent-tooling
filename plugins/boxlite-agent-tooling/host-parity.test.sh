@@ -256,6 +256,20 @@ codex_normalized="$(jq -Sc . "$CODEX_HOOKS")"
 [ "$claude_normalized" = "$codex_normalized" ] \
   && ok "hook manifests normalize to the same behavior" \
   || bad "hook manifests normalize to the same behavior"
+# The Stop hook now owns the synchronous audit. Its host timeout must outlive the
+# runner's entire lease ceiling, not merely its default model timeout.
+# shellcheck source=.agents/lib/verdict-audit-state.sh
+source "$PLUGIN/.agents/lib/verdict-audit-state.sh"
+verdict_audit_lock_max_seconds="${verdict_audit_lock_max_seconds:?audit lease missing}"
+claude_stop_timeout="$(jq -r '.hooks.Stop[].hooks[].timeout' "$CLAUDE_HOOKS")"
+codex_stop_timeout="$(jq -r '.hooks.Stop[].hooks[].timeout' "$CODEX_HOOKS")"
+if [[ "$claude_stop_timeout" =~ ^[0-9]+$ \
+   && "$codex_stop_timeout" == "$claude_stop_timeout" \
+   && "$claude_stop_timeout" -gt "$verdict_audit_lock_max_seconds" ]]; then
+  ok "Stop timeout outlives the synchronous auditor lease"
+else
+  bad "Stop timeout outlives the synchronous auditor lease (claude=$claude_stop_timeout codex=$codex_stop_timeout lease=$verdict_audit_lock_max_seconds)"
+fi
 jq -e '.hooks.SubagentStart[].hooks[] | .asyncRewake == true and has("async") == false' \
   "$CLAUDE_HOOKS" >/dev/null 2>&1 \
   && ok "claude SubagentStart uses asyncRewake" \

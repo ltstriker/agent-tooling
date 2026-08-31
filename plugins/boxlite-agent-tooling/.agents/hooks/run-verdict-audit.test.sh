@@ -2023,5 +2023,46 @@ check_eq "...while the procedure body survives"              "$body_ok" "yes"
 rm -rf "$R" "$BIN"
 
 echo
+echo "## Codex CLI fallback: a Codex-only host still has an independent runner"
+R="$(setup)"
+BIN="$(mktemp -d)"; CAP="$R/captured-codex-prompt.txt"; ARGS="$R/codex-args.txt"
+cat > "$BIN/codex" <<'FAKE_CODEX'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'codex-cli test\n'
+  exit 0
+fi
+printf '%s\n' "$@" > "$CODEX_ARGS_CAPTURE"
+cat > "$CODEX_PROMPT_CAPTURE"
+mkdir -p "$CLAUDE_PROJECT_DIR/.agents/state"
+printf '{"branch":"main","head":"h","tree_hash":"t","generation":"%s","verdict":"PASS","proof":[],"findings":[]}' \
+  "$VERDICT_AUDITOR_GENERATION" > "$VERDICT_AUDITOR_OUTPUT_FILE"
+FAKE_CODEX
+chmod +x "$BIN/codex"
+( cd "$R" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$R" \
+    CODEX_BIN="$BIN/codex" CODEX_ARGS_CAPTURE="$ARGS" CODEX_PROMPT_CAPTURE="$CAP" \
+    PATH="/opt/homebrew/bin:/usr/bin:/bin" bash "$RUNNER" "$R/transcript.jsonl" \
+      >/dev/null 2>&1 )
+codex_fallback_rc=$?
+codex_fallback_contract="rc=$codex_fallback_rc hooks=no sandbox=no ephemeral=no approval=no body=no frontmatter=no"
+grep -qx -- '--disable' "$ARGS" 2>/dev/null && grep -qx -- 'hooks' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/hooks=no/hooks=yes}"
+grep -qx -- 'workspace-write' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/sandbox=no/sandbox=yes}"
+grep -qx -- '--ephemeral' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/ephemeral=no/ephemeral=yes}"
+grep -qx -- 'never' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/approval=no/approval=yes}"
+grep -q '^## Procedure' "$CAP" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/body=no/body=yes}"
+if ! grep -qE '^(name|description|tools|model|effort):' "$CAP" 2>/dev/null; then
+  codex_fallback_contract="${codex_fallback_contract/frontmatter=no/frontmatter=yes}"
+fi
+check_eq "Codex-only fallback is hooks-disabled, bounded, writable, and fully instructed" \
+  "$codex_fallback_contract" \
+  "rc=0 hooks=yes sandbox=yes ephemeral=yes approval=yes body=yes frontmatter=yes"
+rm -rf "$R" "$BIN"
+
+echo
 echo "RESULT: $pass passed, $fail failed"
 exit $(( fail > 0 ? 1 : 0 ))

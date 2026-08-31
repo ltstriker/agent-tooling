@@ -3,7 +3,8 @@
 #
 # The hook is DETECTION-TRIGGERED, with finding-driven loops only:
 #   - no dossier + the turn asserts a verdict ("root cause is X",
-#     "tests pass", "prod looks healthy", "done")      -> block: audit it
+#     "tests pass", "prod looks healthy", "done")      -> audit synchronously;
+#                                                         PASS is silent, FAIL blocks
 #   - no dossier + chat / question / no transcript     -> allow
 #   - present PASS/IN_PROGRESS, fresh + matching       -> allow (consumed)
 #   - present FAIL, fresh + matching                   -> block with findings
@@ -167,6 +168,42 @@ write_verdict() {
     '{branch:$b, head:$h, tree_hash:$t, verdict:$v, proof:[], findings:$f}' \
     > "$repo/.agents/state/last-verdict.json"
 }
+
+# A real runner seam, not a prebuilt dossier: the Stop hook must invoke this command,
+# wait for the independently produced PASS, consume it, and return no host output.
+AUDITOR_STUB='audit_prompt="$(cat)"
+mkdir -p "$CLAUDE_PROJECT_DIR/.agents/state"
+printf "%s" "$audit_prompt" > "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_PROMPT"
+previous_path=""
+while IFS= read -r prompt_line; do
+  case "$prompt_line" in
+    previous_verdict_file:*) previous_path="${prompt_line#previous_verdict_file: }" ;;
+  esac
+done <<< "$audit_prompt"
+if [[ -n "$previous_path" && -r "$previous_path" ]]; then
+  cp "$previous_path" "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_PREVIOUS"
+fi
+touch "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_RAN"
+printf "run\\n" >> "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_RUNS"
+idx="$(mktemp)"
+GIT_INDEX_FILE="$idx" git -C "$CLAUDE_PROJECT_DIR" read-tree HEAD >/dev/null 2>&1
+GIT_INDEX_FILE="$idx" git -C "$CLAUDE_PROJECT_DIR" add -A >/dev/null 2>&1
+tree="$(GIT_INDEX_FILE="$idx" git -C "$CLAUDE_PROJECT_DIR" write-tree 2>/dev/null)"
+rm -f "$idx"
+verdict="${TEST_AUDIT_VERDICT:-FAIL}"
+findings='\''["independent audit finding"]'\''
+[[ "$verdict" == PASS ]] && findings='\''[]'\''
+jq -nc \
+  --arg branch "$(git -C "$CLAUDE_PROJECT_DIR" branch --show-current)" \
+  --arg head "$(git -C "$CLAUDE_PROJECT_DIR" rev-parse HEAD)" \
+  --arg tree "$tree" \
+  --arg generation "$VERDICT_AUDITOR_GENERATION" \
+  --arg verdict "$verdict" \
+  --argjson findings "$findings" \
+  '\''{branch:$branch,head:$head,tree_hash:$tree,generation:$generation,
+     verdict:$verdict,proof:[],findings:$findings}'\'' > "$VERDICT_AUDITOR_OUTPUT_FILE"'
+export VERDICT_AUDITOR_CMD="$AUDITOR_STUB"
+export TEST_AUDIT_VERDICT=FAIL
 
 # Run the hook inside repo for an exact Stop payload.
 run_payload_hook() {
@@ -396,89 +433,179 @@ echo "## Detection: no dossier → the turn text decides"
 R="$(setup)"; write_transcript "$R" "The root cause is a race between gvproxy startup and the socket bind."
 check "'root cause is X' → block (verdict asserted, unaudited)"   "$R" "block"; rm -rf "$R"
 
-# Native Task/spawn-agent audits have no headless request monitor. The parent that owns
-# their handle must cancel them when a REAL user steers the turn, then reject any artifact
-# the abandoned auditor managed to publish.
+R="$(setup)"; write_transcript "$R" "The root cause is the stale socket path."
+payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", session_id:"session-a", turn_id:"turn-a"}')"
+silent_pass_out="$(export TEST_AUDIT_VERDICT=PASS; run_payload_hook "$R" "$payload")"
+if [[ -z "$silent_pass_out" \
+   && -e "$R/.agents/state/SYNC_AUDIT_RAN" \
+   && ! -e "$(session_state_path "$R" last-verdict.json session-a)" \
+   && ! -e "$(session_state_path "$R" verdict-request session-a)" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "successful synchronous audit is silent and consumed"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (out=%s ran=%s)\n' \
+    "successful audit still exposes Stop feedback" "${silent_pass_out:-EMPTY}" \
+    "$([[ -e "$R/.agents/state/SYNC_AUDIT_RAN" ]] && echo yes || echo no)"
+fi
+rm -rf "$R"
+
+# Runner absence fails closed with one concise recovery message, not the routing prompt
+# the old model-driven flow exposed. CODEX_BIN pins an invalid explicit candidate so an
+# installed desktop app cannot make this hermetic no-runner case launch a real model.
+R="$(setup)"; write_transcript "$R" "The root cause is the stale socket path."
+payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", session_id:"session-a", turn_id:"turn-a"}')"
+no_runner_out="$(printf '%s' "$payload" \
+  | ( cd "$R" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$R" \
+      CODEX_BIN=/nonexistent PATH=/opt/homebrew/bin:/usr/bin:/bin \
+      VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD=false bash "$HOOK" ) 2>/dev/null)"
+no_runner_reason="$(printf '%s' "$no_runner_out" | jq -r '.reason // ""')"
+no_runner_retry_out="$(printf '%s' "$payload" \
+  | ( cd "$R" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$R" \
+      CODEX_BIN=/nonexistent PATH=/opt/homebrew/bin:/usr/bin:/bin \
+      VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD=false bash "$HOOK" ) 2>/dev/null)"
+if [[ "$(decision_from_output "$no_runner_out")" == block \
+   && "$(decision_from_output "$no_runner_retry_out")" == block \
+   && "$no_runner_reason" == *"no independent auditor runner is available"* \
+   && "$no_runner_reason" != *"collaboration.spawn_agent"* \
+   && "$no_runner_reason" != *"Task("* \
+   && ! -e "$(session_state_path "$R" verdict-last-uuid session-a)" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "unavailable synchronous auditor fails closed on every retry"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (first=%s retry=%s reason=%s)\n' \
+    "unavailable auditor exposed or bypassed control" \
+    "$(decision_from_output "$no_runner_out")" \
+    "$(decision_from_output "$no_runner_retry_out")" "$no_runner_reason"
+fi
+rm -rf "$R"
+
+# A real user steer revokes the generation while Stop is synchronously waiting. The
+# old Stop must return silently after the runner cancels, never block the new prompt.
+R="$(setup)"; write_transcript "$R" "The root cause is the stale socket path."
+payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", session_id:"session-a", turn_id:"turn-a"}')"
+SLOW_AUDITOR_STUB='cat >/dev/null
+mkdir -p "$CLAUDE_PROJECT_DIR/.agents/state"
+touch "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_WAITING"
+sleep 300'
+( printf '%s' "$payload" \
+    | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_CLASSIFIER_CMD=false VERDICT_AUDITOR_CMD="$SLOW_AUDITOR_STUB" bash "$HOOK" ) \
+        >"$R/steered-stop.out" 2>"$R/steered-stop.err" ) & steered_stop_job=$!
+for (( poll_index=0; poll_index<300; poll_index++ )); do
+  [[ -e "$R/.agents/state/SYNC_AUDIT_WAITING" ]] && break
+  sleep 0.01
+done
+prompt_hook "$R" session-a turn-b >/dev/null 2>&1
+for (( poll_index=0; poll_index<500; poll_index++ )); do
+  kill -0 "$steered_stop_job" 2>/dev/null || break
+  sleep 0.01
+done
+steered_bounded=yes
+if kill -0 "$steered_stop_job" 2>/dev/null; then
+  steered_bounded=no
+  kill -TERM "$steered_stop_job" 2>/dev/null || true
+fi
+wait "$steered_stop_job" 2>/dev/null; steered_stop_rc=$?
+steered_stop_out="$(cat "$R/steered-stop.out" 2>/dev/null || true)"
+if [[ "$steered_bounded" == yes && "$steered_stop_rc" == 0 && -z "$steered_stop_out" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "user steer cancels synchronous audit and releases the old Stop silently"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (bounded=%s rc=%s out=%s)\n' \
+    "steered prompt remained blocked behind its old audit" "$steered_bounded" \
+    "$steered_stop_rc" "${steered_stop_out:-EMPTY}"
+fi
+rm -rf "$R"
+
+# A prompt can land after the runner commits PASS but before the parent starts its
+# validator re-entry. The child must remain bound to the old epoch; otherwise it adopts
+# the new prompt epoch and audits the abandoned answer a second time.
+R="$(setup)"; write_transcript "$R" "The root cause is the stale socket path."
+payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop", session_id:"session-a", turn_id:"turn-a"}')"
+cat > "$R/reentry-gap-env.sh" <<'REENTRY_GAP_ENV'
+if [[ -z "${VERDICT_REENTRY_GAP_OWNER_PID:-}" ]]; then
+  export VERDICT_REENTRY_GAP_OWNER_PID="$$"
+  verdict_reentry_gap_debug() {
+    [[ "$$" == "$VERDICT_REENTRY_GAP_OWNER_PID" ]] || return 0
+    [[ "$BASH_COMMAND" == 'printf '\''%s'\'' "$raw_payload"' \
+       && -e "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_RAN" \
+       && ! -e "$CLAUDE_PROJECT_DIR/.agents/state/reentry-gap-ready" ]] || return 0
+    trap - DEBUG
+    touch "$CLAUDE_PROJECT_DIR/.agents/state/reentry-gap-ready"
+    while [[ ! -e "$CLAUDE_PROJECT_DIR/.agents/state/reentry-gap-release" ]]; do
+      sleep 0.01
+    done
+  }
+  set -T
+  trap verdict_reentry_gap_debug DEBUG
+fi
+REENTRY_GAP_ENV
+( printf '%s' "$payload" \
+    | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+        TEST_AUDIT_VERDICT=PASS VERDICT_CLASSIFIER_CMD=false \
+        BASH_ENV="$R/reentry-gap-env.sh" bash "$HOOK" ) \
+        >"$R/reentry-gap.out" 2>"$R/reentry-gap.err" ) & reentry_gap_job=$!
+for (( poll_index=0; poll_index<300; poll_index++ )); do
+  [[ -e "$R/.agents/state/reentry-gap-ready" ]] && break
+  sleep 0.01
+done
+prompt_hook "$R" session-a turn-b >/dev/null 2>&1
+touch "$R/.agents/state/reentry-gap-release"
+wait "$reentry_gap_job" 2>/dev/null; reentry_gap_rc=$?
+reentry_gap_runs="$(wc -l < "$R/.agents/state/SYNC_AUDIT_RUNS" 2>/dev/null | tr -d ' ')"
+reentry_gap_out="$(cat "$R/reentry-gap.out" 2>/dev/null || true)"
+if [[ -e "$R/.agents/state/reentry-gap-ready" \
+   && "$reentry_gap_rc" == 0 \
+   && "$reentry_gap_runs" == 1 \
+   && -z "$reentry_gap_out" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "post-audit prompt releases validator re-entry without a second audit"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (ready=%s rc=%s runs=%s out=%s)\n' \
+    "validator re-entry adopted a newer prompt epoch" \
+    "$([[ -e "$R/.agents/state/reentry-gap-ready" ]] && echo yes || echo no)" \
+    "$reentry_gap_rc" "${reentry_gap_runs:-0}" "${reentry_gap_out:-EMPTY}"
+fi
+rm -rf "$R"
+
+# A failed synchronous audit may block, but its host-visible reason contains only the
+# findings and the next action — never the auditor routing/control document.
 R="$(setup)"; write_transcript "$R" "The root cause is the stale socket path."
 payload="$(jq -nc --arg p "$R/transcript.jsonl" \
   '{transcript_path:$p, hook_event_name:"Stop", session_id:"session-a", turn_id:"turn-a"}')"
 out="$(run_payload_hook "$R" "$payload")"
-native_cancel_contract=no
-native_reason="$(printf '%s' "$out" | jq -r '.reason // ""')"
-native_request_path="$(session_state_path "$R" verdict-request session-a)"
-native_generation="$(awk '{print $1}' "$native_request_path" 2>/dev/null || echo MISSING)"
-# The hook canonicalizes the repository root with pwd -P; macOS exposes /var as a
-# symlink to /private/var, so compare against the same physical path it emits.
-native_physical_root="$(cd "$R" && pwd -P)"
-native_output_path="$(session_state_path "$native_physical_root" last-verdict.json session-a).audit-${native_generation}"
-native_task_name="$(printf '%s' "$native_reason" \
-  | sed -nE 's/.*task_name="(verdict_auditor_[0-9]+_[0-9]+_[0-9]+)".*/\1/p' \
-  | head -n1)"
-if [[ "$(decision_from_output "$out")" == "block" \
-   && -n "$native_task_name" \
-   && "$native_reason" == *"REAL user message"* \
-   && "$native_reason" == *"collaboration.interrupt_agent(target='$native_task_name')"* \
-   && "$native_reason" == *"verdict_file: ${native_output_path}"* \
-   && "$native_reason" == *"discard"*"dossier"* ]]; then
-  native_cancel_contract=yes
-fi
-if [[ "$native_cancel_contract" == "yes" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "native verdict instruction owns a fresh cancelable handle"
+fail_reason="$(printf '%s' "$out" | jq -r '.reason // ""')"
+fail_runs="$(wc -l < "$R/.agents/state/SYNC_AUDIT_RUNS" 2>/dev/null | tr -d ' ')"
+if [[ "$(decision_from_output "$out")" == block \
+   && "$fail_reason" == *"independent audit finding"* \
+   && "$fail_reason" == *"re-audit the revised answer automatically"* \
+   && "$fail_reason" != *"collaboration.spawn_agent"* \
+   && "$fail_reason" != *"Task("* \
+   && "$fail_reason" != *"run-verdict-audit.sh"* \
+   && "$fail_runs" == 1 ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "failed synchronous audit exposes only concise findings"
 else
-  fail=$((fail+1)); printf '  FAIL  %s\n' "native verdict instruction lacks a fresh cancelable handle"
+  fail=$((fail+1)); printf '  FAIL  %s  (reason=%s runs=%s)\n' \
+    "failed audit still exposes its control prompt" "$fail_reason" "${fail_runs:-0}"
 fi
 
-if printf '%s' "$out" \
-    | jq -e '.decision == "block" and .suppressOutput == true' >/dev/null 2>&1; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "hard Stop feedback stays out of the main transcript"
+# The same blocked message reuses its retained FAIL; a revised message receives one
+# new audit. This is the finding-driven loop without paying repeatedly for unchanged text.
+unchanged_out="$(run_payload_hook "$R" "$payload")"
+unchanged_runs="$(wc -l < "$R/.agents/state/SYNC_AUDIT_RUNS" 2>/dev/null | tr -d ' ')"
+append_assistant "$R" "The corrected conclusion addresses the independent audit finding."
+revised_out="$(run_payload_hook "$R" "$payload")"
+revised_runs="$(wc -l < "$R/.agents/state/SYNC_AUDIT_RUNS" 2>/dev/null | tr -d ' ')"
+if [[ "$(decision_from_output "$unchanged_out")" == block \
+   && "$(decision_from_output "$revised_out")" == block \
+   && "$unchanged_runs" == 1 \
+   && "$revised_runs" == 2 ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "unchanged FAIL is retained; revised answer is re-audited once"
 else
-  fail=$((fail+1)); printf '  FAIL  %s\n' "hard Stop feedback is exposed in the main transcript"
-fi
-
-# Codex retries the model with the Stop reason even when suppressOutput keeps that
-# control prompt out of the main transcript. The retry must still deliver the answer
-# the user asked for; audit status or dossier paths are workflow metadata, not answers.
-if [[ "$native_reason" == *"If the audit PASSes, repeat the blocked answer verbatim"* \
-   && "$native_reason" == *"If it FAILs, revise the answer"* \
-   && "$native_reason" == *"Do not substitute audit status or dossier metadata"* ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "verdict instruction preserves the blocked user-facing answer"
-else
-  fail=$((fail+1)); printf '  FAIL  %s\n' "verdict instruction lets audit feedback replace the user-facing answer"
-fi
-rm -rf "$R"
-
-# Native auditors publish to generation-owned paths. Even if canceled generation A
-# finishes after generation B has already written PASS, A cannot overwrite B's proof.
-R="$(setup)"; claim="The root cause is the stale socket path."; write_transcript "$R" "$claim"
-payload="$(jq -nc --arg p "$R/transcript.jsonl" \
-  '{transcript_path:$p,hook_event_name:"Stop",session_id:"session-a",turn_id:"turn-a"}')"
-first_native_out="$(run_payload_hook "$R" "$payload")"
-request_path="$(session_state_path "$R" verdict-request session-a)"
-first_generation="$(awk '{print $1}' "$request_path" 2>/dev/null || echo MISSING)"
-prompt_hook "$R" session-a turn-b >/dev/null 2>&1
-second_native_out="$(run_payload_hook "$R" "$payload")"
-second_generation="$(awk '{print $1}' "$request_path" 2>/dev/null || echo MISSING)"
-first_output="$(session_state_path "$R" last-verdict.json session-a).audit-${first_generation}"
-second_output="$(session_state_path "$R" last-verdict.json session-a).audit-${second_generation}"
-branch="$(git -C "$R" branch --show-current)"; head="$(git -C "$R" rev-parse HEAD)"
-tree="$(tree_hash_of "$R")"
-jq -nc --arg b "$branch" --arg h "$head" --arg t "$tree" --arg g "$second_generation" \
-  '{branch:$b,head:$h,tree_hash:$t,generation:$g,verdict:"PASS",proof:[],findings:[]}' \
-  > "$second_output"
-jq -nc --arg b "$branch" --arg h "$head" --arg t "$tree" --arg g "$first_generation" \
-  '{branch:$b,head:$h,tree_hash:$t,generation:$g,verdict:"FAIL",proof:[],findings:["late old finding"]}' \
-  > "$first_output"
-late_native_result="$(run_session_hook "$R" session-a YES)"
-late_native_state="first=$first_generation second=$second_generation decision=$(decision_from_output "$late_native_result")"
-late_native_state="$late_native_state current=$([[ -e "$second_output" ]] && echo present || echo consumed) old=$([[ -e "$first_output" ]] && echo isolated || echo gone)"
-if [[ "$first_generation" != MISSING && "$second_generation" != MISSING \
-   && "$first_generation" != "$second_generation" \
-   && "$late_native_state" == *"decision=allow current=consumed old=isolated" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "late canceled native output cannot overwrite the current generation"
-else
-  fail=$((fail+1)); printf '  FAIL  %s  (got=%s first_decision=%s second_decision=%s)\n' \
-    "native generations still share a clobberable dossier" "$late_native_state" \
-    "$(decision_from_output "$first_native_out")" "$(decision_from_output "$second_native_out")"
+  fail=$((fail+1)); printf '  FAIL  %s  (unchanged=%s/%s revised=%s/%s)\n' \
+    "finding-driven retry miscounts synchronous audits" \
+    "$(decision_from_output "$unchanged_out")" "${unchanged_runs:-0}" \
+    "$(decision_from_output "$revised_out")" "${revised_runs:-0}"
 fi
 rm -rf "$R"
 
@@ -511,43 +638,6 @@ for malformed_payload_kind in numeric-session multiple-documents; do
   fi
   rm -rf "$R"
 done
-
-# A native auditor can return or error without writing a dossier. The current request
-# remains generation G, so the next Stop must reuse G's retained handle instead of
-# attempting a second spawn under an already-occupied name (or inventing a concurrent
-# sibling that can race the same authoritative output path).
-R="$(setup)"; claim="The root cause is the stale socket path."; write_transcript "$R" "$claim"
-generation="301-302-4"
-write_session_request "$R" session-a "$generation" "$(cksum_of "$claim")"
-write_verdict "$R" FAIL '["proof missing"]'
-session_dossier="$(session_state_path "$R" last-verdict.json session-a)"
-jq --arg g "$generation" '.generation=$g' "$R/.agents/state/last-verdict.json" \
-  > "$session_dossier"
-rm -f "$R/.agents/state/last-verdict.json"
-retry_out_one="$(run_session_hook "$R" session-a YES)"
-retry_out_two="$(run_session_hook "$R" session-a YES)"
-retry_reason_one="$(printf '%s' "$retry_out_one" | jq -r '.reason // ""')"
-retry_reason_two="$(printf '%s' "$retry_out_two" | jq -r '.reason // ""')"
-retry_name_one="$(printf '%s' "$retry_reason_one" \
-  | sed -nE 's/.*task_name="(verdict_auditor_[0-9]+_[0-9]+_[0-9]+)".*/\1/p' \
-  | head -n1)"
-retry_name_two="$(printf '%s' "$retry_reason_two" \
-  | sed -nE 's/.*task_name="(verdict_auditor_[0-9]+_[0-9]+_[0-9]+)".*/\1/p' \
-  | head -n1)"
-retry_contract="decisions=$(decision_from_output "$retry_out_one"),$(decision_from_output "$retry_out_two")"
-retry_contract="$retry_contract names=$retry_name_one,$retry_name_two"
-if [[ "$retry_contract" == \
-      "decisions=block,block names=verdict_auditor_301_302_4,verdict_auditor_301_302_4" \
-   && "$retry_reason_two" == *"collaboration.followup_task("* \
-   && "$retry_reason_two" == *"target='verdict_auditor_301_302_4'"* \
-   && "$retry_reason_two" == *"already running"* \
-   && "$retry_reason_two" == *"Do not create a sibling task name"* ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "native retry reuses or waits on the exact generation handle"
-else
-  fail=$((fail+1)); printf '  FAIL  %s  (got=%s)\n' \
-    "native retry can collide with its retained Codex handle" "$retry_contract"
-fi
-rm -rf "$R"
 
 # A cancellation marker cannot be consumed before its exact request is retired. Force the
 # first request rename to fail: the marker must remain visible, and ensure() must reject the
@@ -733,15 +823,16 @@ recorded_id="$(cat "$R/.agents/state/verdict-last-uuid" 2>/dev/null || echo MISS
 fallback_transcript="$R/.agents/state/verdict-stop-message.jsonl"
 fallback_transcript="$(cd "$R" && pwd -P)/.agents/state/verdict-stop-message.jsonl"
 fallback_text="$(jq -r '.message.content[0].text // ""' "$fallback_transcript" 2>/dev/null || echo MISSING)"
+runner_prompt="$(cat "$R/.agents/state/SYNC_AUDIT_PROMPT" 2>/dev/null || echo MISSING)"
 if [[ "$got" == "block" && "$recorded_id" == "$expected_id" \
    && "$fallback_text" == "All tests pass." \
-   && "$out" == *"transcript_path: ${fallback_transcript}"* ]]; then
+   && "$runner_prompt" == *"transcript_path: ${fallback_transcript}"* ]]; then
   pass=$((pass+1)); printf '  PASS  %s\n' \
     "null transcript + Stop message → block with content identity and auditable handoff"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (got=%s id=%s expected=%s fallback=%s handed-off=%s)\n' \
     "null transcript fallback" "$got" "$recorded_id" "$expected_id" "$fallback_text" \
-    "$([[ "$out" == *"transcript_path: ${fallback_transcript}"* ]] && echo yes || echo no)"
+    "$([[ "$runner_prompt" == *"transcript_path: ${fallback_transcript}"* ]] && echo yes || echo no)"
 fi
 
 # A recursive Stop for the message just judged is stale, but only when Codex marks
@@ -892,23 +983,22 @@ R="$(setup)"; write_transcript "$R" "The fix works."; write_verdict "$R" "FAIL" 
 check "FAIL → block (finding-driven loop)"                        "$R" "block"
 check "FAIL again (unaddressed) → still block"                    "$R" "block"; rm -rf "$R"
 
-# A carried FAIL is handled before normal message extraction. Its retry instruction
-# still needs an auditable source when Codex supplies only the stable Stop message.
+# A carried legacy FAIL is handled before message extraction and blocks once with only
+# its findings. With no session/message binding it must not launch or retain an audit.
 R="$(setup)"; write_verdict "$R" "FAIL" '["Test: re-run the focused reproducer"]'
 payload="$(jq -nc '{transcript_path:null, hook_event_name:"Stop", stop_hook_active:false,
   last_assistant_message:"The focused fix is ready."}')"
 out="$(run_payload_hook "$R" "$payload")"
-fallback_transcript="$R/.agents/state/verdict-stop-message.jsonl"
-fallback_transcript="$(cd "$R" && pwd -P)/.agents/state/verdict-stop-message.jsonl"
-fallback_text="$(jq -r '.message.content[0].text // ""' "$fallback_transcript" 2>/dev/null || echo MISSING)"
 if [[ "$(decision_from_output "$out")" == "block" \
-   && "$fallback_text" == "The focused fix is ready." \
-   && "$out" == *"transcript_path: ${fallback_transcript}"* ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "FAIL retry with null transcript keeps an auditable handoff"
+   && "$out" == *"Test: re-run the focused reproducer"* \
+   && ! -e "$R/.agents/state/SYNC_AUDIT_RAN" \
+   && ! -e "$R/.agents/state/last-verdict.json" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "legacy FAIL blocks once without poisoning later turns"
 else
-  fail=$((fail+1)); printf '  FAIL  %s  (fallback=%s handed-off=%s)\n' \
-    "FAIL retry payload handoff" "$fallback_text" \
-    "$([[ "$out" == *"transcript_path: ${fallback_transcript}"* ]] && echo yes || echo no)"
+  fail=$((fail+1)); printf '  FAIL  %s  (out=%s ran=%s retained=%s)\n' \
+    "legacy FAIL retained unaffiliated authority" "$out" \
+    "$([[ -e "$R/.agents/state/SYNC_AUDIT_RAN" ]] && echo yes || echo no)" \
+    "$([[ -e "$R/.agents/state/last-verdict.json" ]] && echo yes || echo no)"
 fi; rm -rf "$R"
 
 echo
@@ -963,10 +1053,10 @@ R="$(setup)"; write_transcript "$R" "Root cause is the stale socket path; 12/12 
 take_lock "$R" "$LIVE_PID"
 hold_lock_mutex "$(lock_path "$R")"
 out="$(run_hook "$R" YES)"
-if printf '%s' "$out" | jq -e '(.decision // "") != "block"' >/dev/null 2>&1 \
+if [[ -z "$out" ]] \
    && grep -q ' audit inflight-allow$' "$R/.agents/state/verdict-decisions.log" 2>/dev/null \
    && [[ ! -e "$R/CLASSIFIER_RAN" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "audit running, no verdict yet → allow (classifier skipped)"
+  pass=$((pass+1)); printf '  PASS  %s\n' "audit running → silent allow (classifier skipped)"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (out=%s ran=%s log=%s)\n' "in-flight rung" "$out" \
     "$(classifier_ran "$R")" "$(cat "$R/.agents/state/verdict-decisions.log" 2>/dev/null || echo MISSING)"
@@ -1111,8 +1201,8 @@ take_lock "$R" "$LIVE_PID $(( $(now_epoch) + 800 )) 123 cksum-session owner-toke
 hold_lock_mutex "$(lock_path "$R")"
 backdate "$(lock_path "$R")" 700
 out="$(run_hook "$R" YES)"
-if printf '%s' "$out" | jq -e '(.decision // "") != "block"' >/dev/null 2>&1; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "deadline beyond max_age_seconds → still allow (long audits covered)"
+if [[ -z "$out" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "deadline beyond max_age_seconds → still silent allow (long audits covered)"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "lock expired mid-run despite its deadline" "$out"
 fi; rm -rf "$R"
@@ -1205,9 +1295,9 @@ printf 'moved\n' >> "$R/src/lib.rs"            # invalidates the binding
 take_lock "$R" "$LIVE_PID $(( $(now_epoch) + 800 ))"
 hold_lock_mutex "$(lock_path "$R")"
 out="$(run_hook "$R" YES)"
-if printf '%s' "$out" | jq -e '(.decision // "") != "block"' >/dev/null 2>&1 \
+if [[ -z "$out" ]] \
    && [[ ! -e "$R/.agents/state/last-verdict.json" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "stale dossier discarded + audit in flight → allow"
+  pass=$((pass+1)); printf '  PASS  %s\n' "stale dossier discarded + audit in flight → silent allow"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (out=%s dossier=%s)\n' "discard→in-flight composition" "$out" \
     "$([[ -e "$R/.agents/state/last-verdict.json" ]] && echo present || echo gone)"
@@ -1228,13 +1318,13 @@ hold_lock_mutex "$(session_state_path "$R" verdict-audit.lock session-a)"
 out_a="$(run_session_hook "$R" session-a YES)"
 out_b="$(run_session_hook "$R" session-b YES)"
 pair="a=$(decision_from_output "$out_a") b=$(decision_from_output "$out_b")"
-if [[ "$pair" == "a=allow b=block" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "in-flight allowance is owned by one session"
+if [[ "$pair" == "a=allow b=block" && -z "$out_a" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "silent in-flight allowance is owned by one session"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (got=%s)\n' "another session used the live-audit bypass" "$pair"
 fi; rm -rf "$R"
 
-# A canceled native auditor can finish its write after the next generation is already
+# A canceled auditor can finish its write after the next generation is already
 # running. Its stable-path dossier is garbage, but the CURRENT request and lock are not:
 # deleting all three together turns a harmless late write into a needless third audit.
 R="$(setup)"; claim="Root cause is the stale socket path; 12/12 tests pass."
@@ -1254,8 +1344,9 @@ out="$(run_session_hook "$R" session-a YES)"
 request_generation="$(awk '{print $1}' "$request_path" 2>/dev/null || echo MISSING)"
 late_dossier_gone=no; [[ ! -e "$dossier_path" ]] && late_dossier_gone=yes
 late_pair="decision=$(decision_from_output "$out") request=$request_generation dossier_gone=$late_dossier_gone"
-if [[ "$late_pair" == "decision=allow request=$current_generation dossier_gone=yes" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "late generation cannot revoke the current in-flight audit"
+if [[ "$late_pair" == "decision=allow request=$current_generation dossier_gone=yes" \
+   && -z "$out" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "late generation cannot expose the current in-flight audit"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (got=%s)\n' "late dossier displaced the current generation" "$late_pair"
 fi; rm -rf "$R"
@@ -1760,7 +1851,7 @@ dossier_select_state="barrier=$([[ -e "$R/.agents/state/epoch-barrier-ready" ]] 
 dossier_select_state="$dossier_select_state prompt_rc=$dossier_select_prompt_rc gate_rc=$dossier_select_gate_rc"
 dossier_select_state="$dossier_select_state decision=$(decision_from_output "$dossier_select_out") generation=$dossier_select_generation"
 if [[ "$dossier_select_state" == "barrier=hit prompt_rc=0 gate_rc=0 decision=allow generation=$new_generation" ]]; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "dossier selection preserves a post-timeout native replacement"
+  pass=$((pass+1)); printf '  PASS  %s\n' "dossier selection preserves a post-timeout replacement"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (got=%s)\n' \
     "old dossier inspection deleted a new generation" "$dossier_select_state"
@@ -2359,10 +2450,12 @@ mkdir -p "$R/.agents/state"
 printf '{"verdict":"FAIL","findings":["tests-pass: no command named"]}' > "$R/.agents/state/last-verdict.prev.json"
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
   | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 bash "$HOOK" ) 2>/dev/null)"
-if printf '%s' "$out" | jq -e '.reason | test("A PRIOR audit")' >/dev/null 2>&1; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "block instruction hands the prior findings to the auditor"
+prior_seen="$(cat "$R/.agents/state/SYNC_AUDIT_PREVIOUS" 2>/dev/null || echo MISSING)"
+if [[ "$prior_seen" == *"tests-pass: no command named"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "synchronous auditor receives the prior findings file"
 else
-  fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "prior findings reach the auditor" "$out"
+  fail=$((fail+1)); printf '  FAIL  %s  (prior=%s out=%s)\n' \
+    "prior findings reach the auditor" "$prior_seen" "$out"
 fi; rm -rf "$R"
 
 # An UNCLAIMED park expires too. Age-gating only the write bounds staleness at park time,
@@ -2411,10 +2504,12 @@ decide "$R" >/dev/null                       # parks it
 write_transcript "$R" "Reworked the index guard; the root cause is addressed."
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
   | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 bash "$HOOK" ) 2>/dev/null)"
-if printf '%s' "$out" | jq -e '.reason | test("A PRIOR audit")' >/dev/null 2>&1; then
-  pass=$((pass+1)); printf '  PASS  %s\n' "a just-parked FAIL still reaches the next audit"
+prior_seen="$(cat "$R/.agents/state/SYNC_AUDIT_PREVIOUS" 2>/dev/null || echo MISSING)"
+if [[ "$prior_seen" == *"tests-pass: no re-runnable command named"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "a just-parked FAIL reaches the next synchronous audit"
 else
-  fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "fresh park survives expiry" "$out"
+  fail=$((fail+1)); printf '  FAIL  %s  (prior=%s out=%s)\n' \
+    "fresh park survives expiry" "$prior_seen" "$out"
 fi; rm -rf "$R"
 
 # The cycle ended clean: a surviving prev would aim the next audit at resolved findings.
