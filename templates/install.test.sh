@@ -327,14 +327,16 @@ echo "## Lifecycle sync spawns the refresh, throttled"
 SYNC="$(installed_plugin "$(record)")/scripts/sync-installation.sh"
 TIP_FIVE="$(advance_remote)"
 touch "$CACHE/last-check"
-(cd "$CONSUMER" && bash "$SYNC") 2>/dev/null
-sleep 0.3
+(cd "$CONSUMER" && AGENT_TOOLING_REFRESH_WAIT=1 bash "$SYNC") 2>/dev/null
 check_eq "a fresh last-check suppresses the refresh" "$(record)" "$TIP_FOUR"
-(cd "$CONSUMER" && AGENT_TOOLING_REFRESH=0 AGENT_TOOLING_REFRESH_MINUTES=0 bash "$SYNC") 2>/dev/null
-sleep 0.3
+(cd "$CONSUMER" && AGENT_TOOLING_REFRESH=0 AGENT_TOOLING_REFRESH_MINUTES=0 \
+  AGENT_TOOLING_REFRESH_WAIT=1 bash "$SYNC") 2>/dev/null
 check_eq "AGENT_TOOLING_REFRESH=0 disables the refresh" "$(record)" "$TIP_FOUR"
-(cd "$CONSUMER" && AGENT_TOOLING_REFRESH_MINUTES=0 bash "$SYNC") 2>/dev/null
-for _ in $(seq 1 100); do [[ "$(record)" == "$TIP_FIVE" ]] && break; sleep 0.1; done
+# A zero interval means "always due," even if clock skew leaves the throttle stamp
+# in the future. This also makes the boundary deterministic across find variants.
+touch -t 209901010000 "$CACHE/last-check"
+(cd "$CONSUMER" && AGENT_TOOLING_REFRESH_MINUTES=0 \
+  AGENT_TOOLING_REFRESH_WAIT=1 bash "$SYNC") 2>/dev/null
 check_eq "a due sync adopts the moved tip in the background" "$(record)" "$TIP_FIVE"
 grep -q '^<!-- agent-tooling:guidance:begin ' "$CONSUMER/AGENTS.md" \
   && ok "background adoption left the committed block alone" \

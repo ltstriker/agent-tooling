@@ -13,6 +13,16 @@ is_agent=0
 
 repo_root="$(git rev-parse --show-toplevel)"
 tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+verdict_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+watch_binding_command_hash=""
+watch_binding_session_scope=""
+watch_binding_prompt_epoch=""
+watch_binding_owner_pid=""
+watch_binding_owner_token=""
+push_context_meta_identity=""
+push_context_diff_identity=""
+ref_updates_max_bytes=262144
+expanded_push_max_bytes=16777216
 
 verify_installation="$tooling_root/scripts/verify-installation.sh"
 [[ -x "$verify_installation" ]] || {
@@ -48,14 +58,79 @@ resolve_gate() {
   return 1
 }
 
-stdin_file="$(mktemp)"
-pushed_diff_file="$(mktemp)"
+stdin_file="$(mktemp)" || {
+  printf 'agent-tooling: could not allocate pre-push ref-update state\n' >&2
+  exit 1
+}
+pushed_diff_file="$(mktemp)" || {
+  rm -f "$stdin_file"
+  printf 'agent-tooling: could not allocate pre-push diff state\n' >&2
+  exit 1
+}
+seen_ranges_file="$(mktemp)" || {
+  rm -f "$stdin_file" "$pushed_diff_file"
+  printf 'agent-tooling: could not allocate pre-push range state\n' >&2
+  exit 1
+}
 push_context_dir="$(git -C "$repo_root" rev-parse --git-path codex-audit)"
 [[ "$push_context_dir" != /* ]] && push_context_dir="$repo_root/$push_context_dir"
 push_context_meta_file="$push_context_dir/last-push-audit-context.json"
 push_context_diff_file="$push_context_dir/last-push-audit-context.diff"
-trap 'rm -f "$stdin_file" "$pushed_diff_file"' EXIT
-cat > "$stdin_file"
+trap 'rm -f "$stdin_file" "$pushed_diff_file" "$seen_ranges_file"' EXIT
+
+# Copy at most max bytes from stdin to one private temporary file. The extra
+# chunk is observed but never written, so neither a Git protocol stream nor a
+# generated diff can grow disk past its declared boundary before rejection.
+capture_bounded_stream() { # destination max-bytes
+  local destination="$1" max_bytes="$2"
+  perl -e '
+    use strict;
+    use warnings;
+    my $limit = shift;
+    my $total = 0;
+    sub write_all {
+      my ($bytes) = @_;
+      my $offset = 0;
+      while ($offset < length($bytes)) {
+        my $written = syswrite(STDOUT, $bytes, length($bytes) - $offset, $offset);
+        defined($written) && $written > 0 or exit 70;
+        $offset += $written;
+      }
+    }
+    while (1) {
+      my $read = sysread(STDIN, my $chunk, 65536);
+      defined($read) or exit 70;
+      last if $read == 0;
+      my $remaining = $limit - $total;
+      if ($read > $remaining) {
+        write_all(substr($chunk, 0, $remaining)) if $remaining > 0;
+        exit 65;
+      }
+      write_all($chunk);
+      $total += $read;
+    }
+  ' "$max_bytes" > "$destination"
+}
+
+capture_bounded_stream "$stdin_file" "$ref_updates_max_bytes"
+ref_capture_status=$?
+if (( ref_capture_status == 65 )); then
+  printf 'agent-tooling: ref-update input exceeds the %s-byte ingress limit; split the push\n' \
+    "$ref_updates_max_bytes" >&2
+  exit 1
+elif (( ref_capture_status != 0 )); then
+  printf 'agent-tooling: could not capture bounded pre-push ref updates\n' >&2
+  exit 1
+fi
+
+if [[ "$is_agent" == 1 ]]; then
+  [[ -r "$verdict_state_lib" ]] || {
+    printf 'agent-tooling: verdict state library is unavailable; refusing agent push\n' >&2
+    exit 1
+  }
+  # shellcheck source=../.agents/lib/verdict-audit-state.sh
+  source "$verdict_state_lib" || exit 1
+fi
 
 hash_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -80,8 +155,10 @@ new_ref_base_sha() {
   # merge-base still finds the real divergence point either way.
   for candidate in "refs/remotes/${remote_name}/HEAD" "refs/remotes/${remote_name}/main" \
                    "refs/remotes/${remote_name}/master"; do
-    candidate="$(git -C "$repo_root" rev-parse --verify "$candidate" 2>/dev/null)" || continue
-    merge_base="$(git -C "$repo_root" merge-base "$candidate" "$local_sha" 2>/dev/null)" || continue
+    candidate="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+      rev-parse --verify "$candidate" 2>/dev/null)" || continue
+    merge_base="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+      merge-base "$candidate" "$local_sha" 2>/dev/null)" || continue
     printf '%s\n' "$merge_base"
     return 0
   done
@@ -95,50 +172,115 @@ new_ref_base_sha() {
   # point.
   while IFS= read -r candidate; do
     [[ -n "$candidate" ]] || continue
-    merge_base="$(git -C "$repo_root" merge-base "$candidate" "$local_sha" 2>/dev/null)" || continue
-    distance="$(git -C "$repo_root" rev-list --count "${merge_base}..${local_sha}" 2>/dev/null)" || continue
+    merge_base="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+      merge-base "$candidate" "$local_sha" 2>/dev/null)" || continue
+    distance="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+      rev-list --count "${merge_base}..${local_sha}" 2>/dev/null)" || continue
     if [[ -z "$best_distance" || "$distance" -lt "$best_distance" ]]; then
       best_base="$merge_base"
       best_distance="$distance"
     fi
-  done < <(git -C "$repo_root" for-each-ref --format='%(objectname)' "refs/remotes/${remote_name}" 2>/dev/null)
+  done < <(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" for-each-ref \
+    --format='%(objectname)' "refs/remotes/${remote_name}" 2>/dev/null)
 
   [[ -n "$best_base" ]] || return 1
   printf '%s\n' "$best_base"
 }
 
 write_pushed_diff() {
-  local empty_tree local_ref local_sha remote_ref remote_sha base_sha
-  empty_tree="$(git -C "$repo_root" hash-object -t tree /dev/null)"
+  local empty_tree local_ref local_sha remote_ref remote_sha base_sha range_key
+  empty_tree="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+    hash-object -t tree /dev/null)" || {
+    printf 'agent-tooling: could not resolve the empty Git tree for push evidence\n' >&2
+    return 1
+  }
+  : > "$seen_ranges_file"
   while read -r local_ref local_sha remote_ref remote_sha; do
     [[ -n "${local_ref:-}" ]] || continue
     printf '## ref-update %s %s %s %s\n' "$local_ref" "$local_sha" "$remote_ref" "$remote_sha"
     if is_zero_sha "$local_sha"; then
+      if is_zero_sha "$remote_sha" \
+         || ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+           cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        printf 'agent-tooling: advertised old object %s is unavailable locally; fetch before pushing\n' \
+          "$remote_sha" >&2
+        return 1
+      fi
       printf 'deleted %s at %s\n' "$remote_ref" "$remote_sha"
-    elif is_zero_sha "$remote_sha"; then
+      continue
+    fi
+
+    if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+      cat-file -e "${local_sha}^{commit}" 2>/dev/null; then
+      printf 'agent-tooling: local push object %s is unavailable as a commit\n' \
+        "$local_sha" >&2
+      return 1
+    fi
+    if ! is_zero_sha "$remote_sha" \
+       && ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+         cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+      printf 'agent-tooling: advertised old object %s is unavailable locally; fetch before pushing\n' \
+        "$remote_sha" >&2
+      return 1
+    fi
+
+    # Multiple refs can point at the exact same before/after objects. Retain
+    # every ref-update header (the binding hashes the original stdin), but emit
+    # that immutable Git range's subjects and patch only once.
+    range_key="$remote_sha $local_sha"
+    if grep -Fqx "$range_key" "$seen_ranges_file" 2>/dev/null; then
+      printf 'duplicate-range %s..%s; subjects and diff emitted above\n' \
+        "$remote_sha" "$local_sha"
+      continue
+    fi
+    printf '%s\n' "$range_key" >> "$seen_ranges_file"
+
+    if is_zero_sha "$remote_sha"; then
       base_sha="$(new_ref_base_sha "$local_sha" || true)"
       if [[ -n "$base_sha" ]]; then
-        git -C "$repo_root" log --format='commit-subject %H %s' "$base_sha..$local_sha" 2>/dev/null || true
-        git -C "$repo_root" diff --no-ext-diff "$base_sha" "$local_sha" 2>/dev/null || true
+        if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+            log --format='commit-subject %H %s' \
+            "$base_sha..$local_sha" 2>/dev/null \
+           || ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" diff --no-ext-diff \
+            "$base_sha" "$local_sha" 2>/dev/null; then
+          printf 'agent-tooling: could not produce complete Git evidence for %s..%s\n' \
+            "$base_sha" "$local_sha" >&2
+          return 1
+        fi
       else
-        git -C "$repo_root" log --format='commit-subject %H %s' "$local_sha" || true
-        git -C "$repo_root" diff --no-ext-diff "$empty_tree" "$local_sha" || true
+        if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+            log --format='commit-subject %H %s' \
+            "$local_sha" 2>/dev/null \
+           || ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" diff --no-ext-diff \
+            "$empty_tree" "$local_sha" 2>/dev/null; then
+          printf 'agent-tooling: could not produce complete Git evidence for new object %s\n' \
+            "$local_sha" >&2
+          return 1
+        fi
       fi
     else
-      git -C "$repo_root" log --format='commit-subject %H %s' "$remote_sha..$local_sha" 2>/dev/null || true
-      git -C "$repo_root" diff --no-ext-diff "$remote_sha" "$local_sha" 2>/dev/null || true
+      if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" \
+          log --format='commit-subject %H %s' \
+          "$remote_sha..$local_sha" 2>/dev/null \
+         || ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" diff --no-ext-diff \
+          "$remote_sha" "$local_sha" 2>/dev/null; then
+        printf 'agent-tooling: could not produce complete Git evidence for %s..%s\n' \
+          "$remote_sha" "$local_sha" >&2
+        return 1
+      fi
     fi
   done < "$stdin_file"
 }
 
 write_push_audit_context() {
   local audit_command_hash="$1" ref_updates_hash="$2" pushed_diff_hash="$3" remote_name="$4" remote_url_hash="$5"
-  local branch head
+  local branch head diff_identity meta_identity
   branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || echo '?')"
   head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo '?')"
   mkdir -p "$push_context_dir"
-  cp "$pushed_diff_file" "$push_context_diff_file"
-  jq -nc \
+  diff_identity="$(verdict_audit_write_atomic_identity \
+    "$push_context_diff_file" < "$pushed_diff_file")" || return 1
+  meta_identity="$(jq -nc \
     --arg branch "$branch" \
     --arg head "$head" \
     --arg command_hash "$audit_command_hash" \
@@ -147,23 +289,91 @@ write_push_audit_context() {
     --arg remote_name "$remote_name" \
     --arg remote_url_hash "$remote_url_hash" \
     '{branch:$branch, head:$head, command_hash:$command_hash, ref_updates_hash:$ref_updates_hash, pushed_diff_hash:$pushed_diff_hash, remote_name:$remote_name, remote_url_hash:$remote_url_hash}' \
-    > "$push_context_meta_file"
+    | verdict_audit_write_atomic_identity "$push_context_meta_file")" || {
+      verdict_audit_unlink_if_identity \
+        "$push_context_diff_file" "$diff_identity" 2>/dev/null || true
+      return 1
+    }
+  push_context_diff_identity="$diff_identity"
+  push_context_meta_identity="$meta_identity"
 }
 
 cleanup_push_audit_context() {
-  rm -f "$push_context_meta_file" "$push_context_diff_file"
+  if [[ -n "$push_context_meta_identity" ]]; then
+    verdict_audit_unlink_if_identity \
+      "$push_context_meta_file" "$push_context_meta_identity" 2>/dev/null || true
+  fi
+  if [[ -n "$push_context_diff_identity" ]]; then
+    verdict_audit_unlink_if_identity \
+      "$push_context_diff_file" "$push_context_diff_identity" 2>/dev/null || true
+  fi
+  push_context_meta_identity=""
+  push_context_diff_identity=""
 }
+
+# Capture the original PreToolUse command binding before the delegated gate
+# consumes its handoff. This is best-effort state for the informational watcher;
+# audit behavior and push exit status never depend on it.
+capture_pr_watch_binding() {
+  local handoff="$repo_root/.agents/state/last-audit-handoff.json"
+  local state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
+  local snapshot body current_branch current_head owner_pid owner_token
+  [[ "$is_agent" == 1 && -r "$state_lib" && -r "$handoff" ]] || return 0
+  # shellcheck source=../.agents/lib/verdict-audit-state.sh
+  source "$state_lib" 2>/dev/null || return 0
+  snapshot="$(verdict_audit_read_json_snapshot "$handoff" 2>/dev/null)" || return 0
+  [[ "$snapshot" == *$'\n'* ]] || return 0
+  body="${snapshot#*$'\n'}"
+  current_branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || true)"
+  current_head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
+  printf '%s' "$body" | jq -e \
+    --arg branch "$current_branch" --arg head "$current_head" '
+      type == "object" and .command_kind == "push"
+      and .branch == $branch and .head == $head
+      and (.command_hash | type == "string" and test("^[0-9a-f]{64}$"))
+      and (.lifecycle.session_scope | type == "string"
+           and test("^git-[0-9a-f]{40}([0-9a-f]{24})?$"))
+      and (.lifecycle.prompt_epoch | type == "string"
+           and test("^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$"))
+      and (.owner.pid | type == "number" and . > 0 and floor == .)
+      and (.owner.start_token | type == "string"
+           and test("^cksum-[0-9]+-[0-9]+$"))' >/dev/null 2>&1 || return 0
+  owner_pid="$(printf '%s' "$body" | jq -r '.owner.pid')"
+  owner_token="$(printf '%s' "$body" | jq -r '.owner.start_token')"
+  verdict_audit_process_has_ancestor "$owner_pid" "$owner_token" || return 0
+  watch_binding_command_hash="$(printf '%s' "$body" | jq -r '.command_hash')"
+  watch_binding_session_scope="$(printf '%s' "$body" | jq -r '.lifecycle.session_scope')"
+  watch_binding_prompt_epoch="$(printf '%s' "$body" | jq -r '.lifecycle.prompt_epoch')"
+  watch_binding_owner_pid="$owner_pid"
+  watch_binding_owner_token="$owner_token"
+}
+
+capture_pr_watch_binding || true
 
 if [[ "$is_agent" == 1 ]]; then
   remote_name="${1:-?}"
   remote_url="${2:-}"
   remote_url_hash="$(printf '%s' "$remote_url" | shasum -a 256 | awk '{print $1}')"
   ref_updates_hash="$(hash_file "$stdin_file")"
-  write_pushed_diff > "$pushed_diff_file"
+  write_pushed_diff | capture_bounded_stream \
+    "$pushed_diff_file" "$expanded_push_max_bytes"
+  pushed_diff_status=("${PIPESTATUS[@]}")
+  if (( pushed_diff_status[1] == 65 )); then
+    printf 'agent-tooling: expanded push context exceeds the %s-byte ingress limit; split the push\n' \
+      "$expanded_push_max_bytes" >&2
+    exit 1
+  elif (( pushed_diff_status[0] != 0 || pushed_diff_status[1] != 0 )); then
+    printf 'agent-tooling: could not generate bounded pre-push audit context\n' >&2
+    exit 1
+  fi
   pushed_diff_hash="$(hash_file "$pushed_diff_file")"
   audit_command="git push --pre-push-hook remote=${remote_name} remote_url_sha256=${remote_url_hash} ref_updates_sha256=${ref_updates_hash} pushed_diff_sha256=${pushed_diff_hash}"
   audit_command_hash="$(printf '%s' "$audit_command" | hash_stdin)"
-  write_push_audit_context "$audit_command_hash" "$ref_updates_hash" "$pushed_diff_hash" "$remote_name" "$remote_url_hash"
+  if ! write_push_audit_context "$audit_command_hash" "$ref_updates_hash" \
+      "$pushed_diff_hash" "$remote_name" "$remote_url_hash"; then
+    printf 'agent-tooling: could not publish bounded pre-push audit context\n' >&2
+    exit 1
+  fi
   if ! out="$(jq -nc --arg command "$audit_command" '{tool_input:{command:$command}}' \
         | GITHOOK_DELEGATED=1 bash "$(resolve_gate || echo /nonexistent-gate)" 2>&1)"; then
     printf 'commit-push-auditor delegated preflight failed\n%s\n' "$out" >&2
@@ -207,12 +417,28 @@ fi
 # cannot start must never be the reason a push is rejected.
 arm_pr_watch() {
   local watcher="$tooling_root/.agents/watch/pr-watch.sh"
-  [[ -r "$watcher" ]] || return 0
+  local watch_helpers="$tooling_root/.agents/lib/pr-watch-state.sh"
+  [[ -r "$watcher" && -r "$watch_helpers" ]] || return 0
+  # shellcheck source=../.agents/lib/pr-watch-state.sh
+  source "$watch_helpers" 2>/dev/null || return 0
 
-  local log_dir
+  local log_dir log_dir_identity branch_key watch_id ready_watch_id event_log daemon_log
+  local ready_dir ready_fifo
+  local entries='[]' entry manifest_key manifest_path
+  local armed_refs=0 omitted_refs=0 omitted_refs_overflow=0
+  local max_attached_refs=4 max_omitted_refs=1000000
+  omit_ref() {
+    if (( omitted_refs < max_omitted_refs )); then
+      omitted_refs=$((omitted_refs + 1))
+    else
+      omitted_refs_overflow=1
+    fi
+  }
   log_dir="$(git -C "$repo_root" rev-parse --git-path pr-watch 2>/dev/null)" || return 0
   [[ "$log_dir" != /* ]] && log_dir="$repo_root/$log_dir"
   mkdir -p "$log_dir" 2>/dev/null || return 0
+  log_dir_identity="$(pr_watch_state_directory_identity "$log_dir" 2>/dev/null)" \
+    || return 0
 
   local local_ref local_sha remote_ref remote_sha branch
   while read -r local_ref local_sha remote_ref remote_sha; do
@@ -220,12 +446,86 @@ arm_pr_watch() {
     is_zero_sha "$local_sha" && continue           # branch deletion — nothing to watch
     branch="${remote_ref#refs/heads/}"
     [[ "$branch" != "$remote_ref" ]] || continue   # tag/note ref, not a branch
-    # nohup + disown, not setsid: macOS ships no setsid. Redirecting both streams
-    # to a file keeps git from waiting on an inherited pipe.
-    nohup bash "$watcher" --branch "$branch" --sha "$local_sha" \
-      >> "$log_dir/${branch//\//-}.daemon.log" 2>&1 &
+    if (( armed_refs >= max_attached_refs )); then
+      omit_ref
+      continue
+    fi
+    branch_key="$(pr_watch_branch_key "$branch" 2>/dev/null)" || {
+      omit_ref
+      continue
+    }
+    watch_id="$(pr_watch_new_id "$log_dir" "$branch_key" 2>/dev/null)" || {
+      omit_ref
+      continue
+    }
+    event_log="$log_dir/${branch_key}.jsonl"
+    daemon_log="$log_dir/${branch_key}.daemon.log"
+    ready_dir="$(mktemp -d "$log_dir/.watch-ready.XXXXXX" 2>/dev/null)" || {
+      omit_ref
+      continue
+    }
+    ready_fifo="$ready_dir/ready"
+    if ! mkfifo "$ready_fifo" 2>/dev/null || ! exec 9<> "$ready_fifo"; then
+      rm -f "$ready_fifo" 2>/dev/null || true
+      rmdir "$ready_dir" 2>/dev/null || true
+      omit_ref
+      continue
+    fi
+    rm -f "$ready_fifo" 2>/dev/null || true
+    rmdir "$ready_dir" 2>/dev/null || true
+    # nohup + disown, not setsid: macOS ships no setsid. The helper selects one
+    # nonblocking regular log descriptor before exec, so a FIFO/symlink cannot
+    # retain git's pipe or strand a child after the bounded readiness wait.
+    nohup bash -c '
+      source "$1" || exit 127
+      shift
+      pr_watch_exec_with_regular_log "$@"
+    ' -- "$watch_helpers" "$daemon_log" "$log_dir_identity" \
+      bash "$watcher" --branch "$branch" --sha "$local_sha" \
+      --watch-id "$watch_id" --ready-fd 9 >/dev/null 2>&1 &
     disown 2>/dev/null || true
+    if ! IFS= read -r -t 3 -u 9 ready_watch_id; then
+      ready_watch_id=""
+    fi
+    exec 9>&-
+    if ! pr_watch_id_is_valid "$ready_watch_id"; then
+      omit_ref
+      continue
+    fi
+    entry="$(jq -nc --arg remote_ref "$remote_ref" --arg branch "$branch" \
+      --arg watch_id "$ready_watch_id" --arg event_log "$event_log" \
+      '{remote_ref:$remote_ref,branch:$branch,watch_id:$watch_id,event_log:$event_log}')" \
+      || {
+        omit_ref
+        continue
+      }
+    entries="$(jq -nc --argjson entries "$entries" --argjson entry "$entry" \
+      '$entries + [$entry]')" || {
+        omit_ref
+        continue
+      }
+    armed_refs=$((armed_refs + 1))
   done < "$stdin_file"
+
+  [[ "$armed_refs" -gt 0 && "$omitted_refs_overflow" -eq 0 \
+     && -n "$watch_binding_command_hash" \
+     && -n "$watch_binding_session_scope" ]] || return 0
+  declare -F verdict_audit_write_atomic >/dev/null 2>&1 || return 0
+  manifest_key="$(pr_watch_attachment_key \
+    "$watch_binding_session_scope" "$watch_binding_command_hash" 2>/dev/null)" || return 0
+  manifest_path="$log_dir/${manifest_key}.json"
+  jq -nc --arg command_hash "$watch_binding_command_hash" \
+    --arg session_scope "$watch_binding_session_scope" \
+    --arg prompt_epoch "$watch_binding_prompt_epoch" \
+    --argjson owner_pid "$watch_binding_owner_pid" \
+    --arg owner_token "$watch_binding_owner_token" \
+    --argjson created_at "$(date +%s)" --argjson entries "$entries" \
+    --argjson omitted_refs "$omitted_refs" '
+      {schema:1,command_hash:$command_hash,session_scope:$session_scope,
+       prompt_epoch:$prompt_epoch,created_at:$created_at,
+       owner:{pid:$owner_pid,start_token:$owner_token},
+       entries:$entries,omitted_refs:$omitted_refs}' \
+    | verdict_audit_write_atomic "$manifest_path" 2>/dev/null || true
 }
 [[ "${BOXLITE_PR_WATCH:-1}" == "0" ]] || arm_pr_watch || true
 

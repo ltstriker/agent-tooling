@@ -44,6 +44,8 @@
 #           a model CLI). YES -> run the independent audit inside this Stop invocation;
 #           PASS emits nothing, FAIL blocks with concise findings. NO -> allow
 #           (announced to the human via systemMessage, invisible to the model).
+#           Turns over 12 KB skip this duplicate model input and block for the
+#           file-backed auditor instead.
 #      No transcript (absent / unreadable / zero bytes) -> allow; nothing to judge.
 #      A transcript WITH content but no assistant text is NOT that case — the hook
 #      could not SEE the turn (unflushed final message, or a torn write jq could not
@@ -195,6 +197,16 @@ verdict_request_file="$(verdict_audit_state_path "$state_dir/verdict-request" "$
 audit_decision_mutex_file="${verdict_request_file}.decision.mutex"
 decision_lease_pid=0
 decision_lease_status_file=""
+active_bounded_capture_pgid=0
+active_bounded_capture_group_owned=false
+active_bounded_capture_marker=""
+active_bounded_capture_marker_identity=""
+bounded_override_isolation_checked=false
+bounded_override_isolation_backend=""
+bounded_override_isolation_tool=""
+bounded_override_isolation_error_reported=false
+bounded_capture_destination_identity=""
+bounded_capture_pending_signal=""
 # A FAILed dossier is parked here when the agent's fix moves the tree and invalidates
 # the binding, so the next audit re-checks known findings instead of starting cold.
 prev_verdict_file="$(verdict_audit_state_path "$state_dir/last-verdict.prev.json" "$session_scope")"
@@ -217,6 +229,12 @@ audit_mutex_file="${audit_lock_file}.mutex"
 audit_lock_max_seconds="$verdict_audit_lock_max_seconds"
 max_age_seconds=600
 classifier_timeout_seconds=20
+classifier_max_bytes=12000
+classifier_output_max_bytes=4096
+verdict_output_max_bytes=8192
+transcript_source_max_bytes=67108864
+transcript_turn_max_bytes=262144
+transcript_snapshot_truncated=false
 
 # UserPromptSubmit atomically advances this session epoch before it waits for any gate
 # mutex. This Stop invocation may trust authority only while the entry snapshot remains
@@ -265,6 +283,289 @@ stop_decision_lease() {
   decision_lease_pid=0
   [[ -z "$decision_lease_status_file" ]] || rm -f "$decision_lease_status_file"
   decision_lease_status_file=""
+}
+
+bounded_capture_group_has_residual_members() {  # sentinel-pid / pgid
+  ps -axo pid=,pgid= 2>/dev/null \
+    | awk -v leader="$1" -v group="$1" '
+        $1 != leader && $2 == group { found = 1 }
+        END { exit(found ? 0 : 1) }
+      '
+}
+
+# Explicit command overrides are arbitrary shell and therefore a different trust
+# boundary from the fixed Claude classifier route. macOS can permit the configured
+# command while denying every fork; Linux can contain an ordinary helper tree inside a
+# PID namespace whose init is killed with its unshare parent. Unsupported/locked-down
+# hosts reject only the override and preserve the normal classifier fallback.
+bounded_capture_override_isolation_error() {  # detail
+  if [[ "$bounded_override_isolation_error_reported" != true ]]; then
+    printf 'preflight-verdict-check: explicit classifier/extractor override requires OS process containment; %s.\n' \
+      "$1" >&2
+    bounded_override_isolation_error_reported=true
+  fi
+  return 1
+}
+
+bounded_capture_prepare_override_isolation() {
+  local kernel
+  if [[ "$bounded_override_isolation_checked" == true ]]; then
+    [[ -n "$bounded_override_isolation_backend" ]] || return 1
+    return 0
+  fi
+  bounded_override_isolation_checked=true
+  bounded_override_isolation_backend=""
+  bounded_override_isolation_tool=""
+  kernel="$(uname -s 2>/dev/null)" || {
+    bounded_capture_override_isolation_error \
+      "the host kernel could not be identified"
+    return 1
+  }
+  case "$kernel" in
+    Darwin)
+      [[ -x /usr/bin/sandbox-exec && -x /usr/bin/perl ]] || {
+        bounded_capture_override_isolation_error \
+          "macOS sandbox-exec is unavailable"
+        return 1
+      }
+      /usr/bin/sandbox-exec -p \
+        '(version 1) (allow default) (deny process-fork)' \
+        /usr/bin/perl -e '
+          my $child = fork();
+          exit(defined($child) ? 1 : 0);
+        ' </dev/null >/dev/null 2>&1 \
+        || {
+          bounded_capture_override_isolation_error \
+            "macOS did not enforce the fork-denial sandbox profile"
+          return 1
+        }
+      bounded_override_isolation_backend=darwin-sandbox
+      bounded_override_isolation_tool=/usr/bin/sandbox-exec
+      ;;
+    Linux)
+      if [[ -x /usr/bin/unshare ]]; then
+        bounded_override_isolation_tool=/usr/bin/unshare
+      elif [[ -x /bin/unshare ]]; then
+        bounded_override_isolation_tool=/bin/unshare
+      else
+        bounded_capture_override_isolation_error \
+          "Linux user/PID namespace support is unavailable"
+        return 1
+      fi
+      "$bounded_override_isolation_tool" \
+        --user --map-root-user --pid --fork --kill-child=KILL \
+        /bin/sh -c 'exit 0' </dev/null >/dev/null 2>&1 \
+        || {
+          bounded_capture_override_isolation_error \
+            "Linux user/PID namespace creation was denied"
+          return 1
+        }
+      bounded_override_isolation_backend=linux-pid-namespace
+      ;;
+    *)
+      bounded_capture_override_isolation_error \
+        "kernel $kernel has no supported containment backend"
+      return 1
+      ;;
+  esac
+}
+
+# A configured command may call setsid(2), so process-group ownership alone is not a
+# complete lifetime boundary. Every command inherits an open descriptor for a private
+# marker inode. fuser/lsof are optional accelerators on macOS; Linux can inspect the
+# same descriptor identity through procfs. If none is available, the command is not
+# launched: losing descendants is less safe than degrading this optional classifier or
+# extractor to UNKNOWN/failed-snapshot behavior.
+bounded_capture_marker_backend_available() {
+  command -v fuser >/dev/null 2>&1 \
+    || command -v lsof >/dev/null 2>&1 \
+    || [[ -d /proc/$$/fd ]]
+}
+
+bounded_capture_marker_pids() {  # marker-path marker-device:inode
+  local marker_path="$1" marker_identity="$2" listed=""
+  verdict_audit_selected_identity_matches \
+    "$marker_path" "$marker_identity" 2>/dev/null || return 1
+  if command -v fuser >/dev/null 2>&1; then
+    listed="$(fuser "$marker_path" 2>/dev/null || true)"
+  fi
+  if [[ -z "$listed" ]] && command -v lsof >/dev/null 2>&1; then
+    listed="$(lsof -t -- "$marker_path" 2>/dev/null || true)"
+  fi
+  if [[ -z "$listed" && -d /proc/$$/fd ]]; then
+    listed="$(perl -e '
+      my ($device, $inode) = split(/:/, $ARGV[0], 2);
+      exit 1 unless defined($inode) && $device =~ /\A[0-9]+\z/
+        && $inode =~ /\A[0-9]+\z/;
+      my %seen;
+      for my $descriptor (glob("/proc/[1-9][0-9]*/fd/[0-9]*")) {
+        my @held = stat($descriptor);
+        next unless @held && $held[0] == $device && $held[1] == $inode;
+        next unless $descriptor =~ m{\A/proc/([1-9][0-9]*)/fd/};
+        print "$1\n" unless $seen{$1}++;
+      }
+    ' "$marker_identity" 2>/dev/null || true)"
+  fi
+  verdict_audit_selected_identity_matches \
+    "$marker_path" "$marker_identity" 2>/dev/null || return 1
+  printf '%s\n' "$listed" \
+    | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[1-9][0-9]*$/) print $i }' \
+    | awk '!seen[$0]++'
+}
+
+bounded_capture_owned_process_records() {  # -> pid SP start-token
+  local pid token holders
+  [[ -n "$active_bounded_capture_marker" ]] || return 0
+  holders="$(bounded_capture_marker_pids \
+    "$active_bounded_capture_marker" \
+    "$active_bounded_capture_marker_identity" 2>/dev/null)" || return 1
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != "$$" ]] || continue
+    token="$(verdict_audit_process_start_token "$pid" 2>/dev/null)" || continue
+    printf '%s %s\n' "$pid" "$token"
+  done <<< "$holders"
+}
+
+bounded_capture_merge_owned_process_records() {  # existing discovered -> union
+  local existing_records="$1" discovered_records="$2"
+  printf '%s\n%s\n' "$existing_records" "$discovered_records" \
+    | awk '
+        $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^cksum-[0-9]+-[0-9]+$/ && NF == 2 {
+          key = $1 " " $2
+          if (!seen[key]++) print key
+        }
+      '
+}
+
+bounded_capture_signal_owned_records() {  # TERM|STOP|KILL records
+  local signal_name="$1" records="$2" pid token extra current_token
+  while read -r pid token extra; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ \
+       && "$token" =~ ^cksum-[0-9]+-[0-9]+$ && -z "$extra" ]] || continue
+    current_token="$(verdict_audit_process_start_token "$pid" 2>/dev/null)" \
+      || continue
+    [[ "$current_token" == "$token" ]] || continue
+    current_token="$(verdict_audit_process_start_token "$pid" 2>/dev/null)" \
+      || continue
+    [[ "$current_token" == "$token" ]] || continue
+    kill -"$signal_name" "$pid" 2>/dev/null || true
+  done <<< "$records"
+}
+
+bounded_capture_records_have_live_identity() {  # records
+  local records="$1" pid token extra current_token
+  while read -r pid token extra; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ \
+       && "$token" =~ ^cksum-[0-9]+-[0-9]+$ && -z "$extra" ]] || continue
+    current_token="$(verdict_audit_process_start_token "$pid" 2>/dev/null)" \
+      || continue
+    [[ "$current_token" == "$token" ]] && return 0
+  done <<< "$records"
+  return 1
+}
+
+# Every small configurable subprocess below runs behind a deadline-bounded process-group
+# sentinel. Retaining the leader until this function executes makes negative-PGID
+# escalation safe even after the actual command has returned or closed stdout.
+stop_bounded_capture_group() {
+  local pgid="$active_bounded_capture_pgid" grace=2 reap_checks=100 freeze_round=0
+  local owned_records="" refreshed_records="" current_records=""
+  local cleanup_status=0 holders_clear=false holders_frozen=false
+  local marker_path="$active_bounded_capture_marker"
+  local marker_identity="$active_bounded_capture_marker_identity"
+  if [[ -z "$marker_path" && ! "$pgid" =~ ^[1-9][0-9]*$ ]]; then
+    active_bounded_capture_group_owned=false
+    return 0
+  fi
+  if ! owned_records="$(bounded_capture_owned_process_records 2>/dev/null)"; then
+    cleanup_status=1
+    owned_records=""
+  fi
+  if [[ "$active_bounded_capture_group_owned" == true \
+     && "$pgid" =~ ^[1-9][0-9]*$ && -z "$owned_records" ]]; then
+    cleanup_status=1
+  fi
+  active_bounded_capture_pgid=0
+  bounded_capture_signal_owned_records TERM "$owned_records"
+  if [[ "$pgid" =~ ^[1-9][0-9]*$ \
+     && "$active_bounded_capture_group_owned" == true ]]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    kill -TERM "$pgid" 2>/dev/null || true
+    while (( grace > 0 )) \
+       && bounded_capture_group_has_residual_members "$pgid"; do
+      perl -e 'select undef, undef, undef, 0.05'
+      grace=$((grace - 1))
+    done
+    # Freeze every known producer before the final marker rescan. Any child forked by
+    # a TERM handler before STOP inherits the descriptor and appears in that rescan;
+    # after STOP no producer can create another holder before KILL.
+    kill -STOP -- "-$pgid" 2>/dev/null || true
+    kill -STOP "$pgid" 2>/dev/null || true
+  elif [[ "$pgid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$pgid" 2>/dev/null || true
+    kill -STOP "$pgid" 2>/dev/null || true
+  fi
+  bounded_capture_signal_owned_records STOP "$owned_records"
+  while (( freeze_round < 4 )); do
+    if ! current_records="$(bounded_capture_owned_process_records 2>/dev/null)" \
+       || [[ -z "$current_records" ]] \
+       || ! refreshed_records="$(bounded_capture_merge_owned_process_records \
+            "$owned_records" "$current_records")"; then
+      cleanup_status=1
+      break
+    fi
+    if [[ "$refreshed_records" == "$owned_records" ]]; then
+      holders_frozen=true
+      break
+    fi
+    owned_records="$refreshed_records"
+    bounded_capture_signal_owned_records STOP "$owned_records"
+    freeze_round=$((freeze_round + 1))
+  done
+  [[ "$holders_frozen" == true ]] || cleanup_status=1
+  if [[ "$pgid" =~ ^[1-9][0-9]*$ \
+     && "$active_bounded_capture_group_owned" == true ]]; then
+    # The sentinel ignores TERM, preserving the owned PGID until escalation.
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    kill -KILL "$pgid" 2>/dev/null || true
+    wait "$pgid" 2>/dev/null || true
+  elif [[ "$pgid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -KILL "$pgid" 2>/dev/null || true
+    wait "$pgid" 2>/dev/null || true
+  fi
+  bounded_capture_signal_owned_records KILL "$owned_records"
+  while (( reap_checks > 0 )) \
+     && bounded_capture_records_have_live_identity "$owned_records"; do
+    perl -e 'select undef, undef, undef, 0.01'
+    reap_checks=$((reap_checks - 1))
+  done
+  if ! bounded_capture_records_have_live_identity "$owned_records"; then
+    holders_clear=true
+  fi
+  active_bounded_capture_group_owned=false
+  [[ "$holders_clear" == true ]] || cleanup_status=1
+  if (( cleanup_status == 0 )); then
+    if [[ -n "$marker_path" \
+       && "$marker_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+       && verdict_audit_unlink_if_identity \
+            "$marker_path" "$marker_identity" 2>/dev/null; then
+      active_bounded_capture_marker=""
+      active_bounded_capture_marker_identity=""
+    else
+      cleanup_status=1
+    fi
+  fi
+  return "$cleanup_status"
+}
+
+cleanup_bounded_capture_destination() {  # destination device:inode
+  [[ "$2" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  verdict_audit_unlink_if_identity "$1" "$2"
+}
+
+cleanup_stop_gate() {
+  stop_bounded_capture_group
+  stop_decision_lease
 }
 
 start_decision_lease() {
@@ -325,30 +626,45 @@ start_decision_lease() {
   return 1
 }
 
-trap stop_decision_lease EXIT
+trap cleanup_stop_gate EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 allow()           { exit 0; }                                              # let the turn end, silently
 # User-visible, model-invisible allow: a Stop hook systemMessage is shown to the
 # HUMAN in the terminal only — the model never sees it (documented hook contract).
 # Announcing triage results this way keeps the agent's context clean and the gate
 # loop-inert while the human still sees every decision live.
-allow_with_note() { jq -nc --arg m "$1" '{continue:true, systemMessage:$m}'; exit 0; }
+allow_with_note() {
+  local note="$1" note_bytes
+  note_bytes="$(LC_ALL=C printf '%s' "$note" | wc -c | tr -d ' ')"
+  if (( note_bytes > verdict_output_max_bytes )); then
+    note="Verdict: IN_PROGRESS — details omitted because the rendered note exceeded the 8192-byte safety limit. Proof remains deferred; inspect the session-scoped last-verdict dossier locally."
+  fi
+  jq -nc --arg m "$note" '{continue:true, systemMessage:$m}'
+  exit 0
+}
 # Hard mode (default, set in settings.json env): block conditions block. Soft mode
 # (VERDICT_GATE_HARD_BLOCK=0) demotes them to a user-visible nudge the MODEL never
 # sees — rollback/telemetry only, see design notes.
 block() {
+  local reason="$1" reason_bytes
   # A prompt can arrive while a classifier or instruction renderer is still running.
   # Revalidate at the final output boundary so a superseded Stop can never publish a
   # late block even when every earlier branch check observed the old epoch.
   prompt_epoch_is_current || allow
+  reason_bytes="$(LC_ALL=C printf '%s' "$reason" | wc -c | tr -d ' ')"
+  if (( reason_bytes > verdict_output_max_bytes )); then
+    reason="Verdict gate remains blocked: the rendered proof instruction exceeded the 8192-byte safety limit. Inspect the session-scoped .agents/state/last-verdict*.json dossier locally; do not paste its oversized findings or the transcript into chat. Run verdict-auditor synchronously against the current transcript (or use run-verdict-audit.sh headlessly), let the auditor write the dossier, then retry the ending. On PASS repeat the blocked answer; on FAIL revise it and re-audit."
+  fi
   # Default HARD, matching the two doc sites above. Defaulting to soft meant only
   # Claude Code was gated: it is the sole caller that sets this, via settings.json
   # env, so the Codex registration in .codex/hooks.json and any direct invocation
   # got a non-blocking note instead. Set VERDICT_GATE_HARD_BLOCK=0 to roll back.
   if [[ "${VERDICT_GATE_HARD_BLOCK:-1}" != "0" ]]; then
-    jq -nc --arg r "$1" '{decision:"block", reason:$r}'
+    jq -nc --arg r "$reason" '{decision:"block", reason:$r}'
   else
-    jq -nc --arg r "$1" '{continue:true, systemMessage:("[verdict-gate] " + $r)}'
+    jq -nc --arg r "$reason" '{continue:true, systemMessage:("[verdict-gate] " + $r)}'
   fi
   exit 0
 }
@@ -400,16 +716,13 @@ fi
 # judging only the trailing fragment let exactly that class slip (observed live
 # in a sibling session's decision log).
 #
-# HARNESS-AGNOSTIC by convention, not by schema list: an assistant record is one
-# where ANY object inside has role/type=="assistant"; a REAL user record (turn
-# boundary) is one with role/type=="user" carrying actual text — tool results
-# riding user-role records do not end a turn. Text is every string under a
-# `text` key inside blocks whose type mentions "text" (Claude Code `text`,
-# Codex `output_text`, any future agent following the conventions), falling
-# back to all `text`-key strings if that yields nothing. New coding agents need
-# ZERO code here — at most set VERDICT_EXTRACTOR_CMD in their own hook wiring
-# for a truly alien format (invoked with the transcript path as $1; stdout =
-# the turn text to judge).
+# HARNESS-AGNOSTIC across the supported top-level envelopes: assistant/user roles
+# may live on the record, its direct message or payload, or an actor with sibling
+# output. Role-shaped objects nested inside tool calls/results are evidence, never
+# conversation identities. Text comes from typed text blocks inside the recognized
+# assistant envelope (Claude `text`, Codex `output_text`, and the actor/output form).
+# A truly alien format may set VERDICT_EXTRACTOR_CMD in its own hook wiring (invoked
+# with the transcript path as $1; stdout = the turn text to judge).
 # Turn identity is a checksum of the joined text — content-derived, no
 # per-harness ids — used by the never-judge-twice race guard.
 # Empty transcript text is retried when the file has content: the hook can run before
@@ -419,6 +732,10 @@ fi
 FINAL_ID=""
 FINAL_TEXT=""
 FINAL_SOURCE=""
+PREEXTRACTED_FINAL_TEXT=""
+AUDIT_TRANSCRIPT_SOURCE_PATH=""
+AUDIT_TRANSCRIPT_REFRESHABLE=false
+AUDIT_TRANSCRIPT_SOURCE_KIND="transcript"
 identify_final_message() {
   FINAL_ID="cksum-$(printf '%s' "$FINAL_TEXT" | cksum | tr ' \t' '--')"
 }
@@ -426,7 +743,7 @@ extract_final_message() {
   FINAL_ID=""; FINAL_TEXT=""; FINAL_SOURCE=""
   if [[ -n "$transcript_path" && -r "$transcript_path" ]]; then
     if [[ -n "${VERDICT_EXTRACTOR_CMD:-}" ]]; then
-      FINAL_TEXT="$(bash -c "$VERDICT_EXTRACTOR_CMD \"\$1\"" _ "$transcript_path" 2>/dev/null || true)"
+      FINAL_TEXT="$PREEXTRACTED_FINAL_TEXT"
     else
       FINAL_TEXT="$(jq -rs '
       def is_assistant: [.. | objects | select((.role? == "assistant") or (.type? == "assistant"))] | length > 0;
@@ -442,7 +759,14 @@ extract_final_message() {
         or ([.. | objects | select((.role? // "") == "user")
              | [.content[]? | select((.type? // "" | tostring) | test("text"))] | length]
             | any(. > 0));
-      . as $r
+      if length == 1
+         and .[0].type? == "verdict_final_turn_snapshot"
+         and (.[0].records? | type) == "array"
+      then [.[0].records[]
+            | select(.kind? == "assistant")
+            | .texts[]? | strings]
+           | join("\n\n")
+      else . as $r
       | ([$r[] | is_real_user] | rindex(true)) as $lastu
       | $r[(if $lastu == null then 0 else $lastu + 1 end):]
       | [.[] | select(is_assistant) | (
@@ -450,11 +774,12 @@ extract_final_message() {
           | (if ($typed | length) > 0 then $typed
              else ([.. | objects | .text? // empty | strings] | join("\n")) end)
         ) | select(length > 0)]
-      | join("\n\n")' "$transcript_path" 2>/dev/null || true)"
+      | join("\n\n")
+      end' "$transcript_path" 2>/dev/null || true)"
     fi
   fi
   [[ -n "$FINAL_TEXT" ]] || return 0
-  FINAL_SOURCE="transcript"
+  FINAL_SOURCE="$AUDIT_TRANSCRIPT_SOURCE_KIND"
   identify_final_message
 }
 use_payload_message() {
@@ -472,9 +797,14 @@ resolve_final_message() {
   extract_final_message
   transcript_had_content=false
   [[ -n "$transcript_path" && -s "$transcript_path" ]] && transcript_had_content=true
-  if [[ -z "$FINAL_TEXT" && "$transcript_had_content" == true ]]; then
+  if [[ -z "$FINAL_TEXT" && "$transcript_had_content" == true \
+     && "$AUDIT_TRANSCRIPT_SOURCE_KIND" != failed ]]; then
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       sleep 0.2
+      if [[ "$AUDIT_TRANSCRIPT_REFRESHABLE" == true ]]; then
+        prepare_audit_transcript "$AUDIT_TRANSCRIPT_SOURCE_PATH" refresh \
+          >/dev/null 2>&1 || true
+      fi
       extract_final_message
       [[ -n "$FINAL_TEXT" ]] && break
     done
@@ -586,20 +916,12 @@ assertion_patterns+='|^[[:space:]]*(verified|confirmed)[[:space:]]+[a-z]'
 # Echoes YES / NO / UNKNOWN. UNKNOWN (no CLI, timeout, garbage) → regex fallback.
 # VERDICT_CLASSIFIER_CMD overrides the whole classifier invocation (stdin = turn
 # text, stdout = YES/NO); tests stub it, `false` forces UNKNOWN.
-triage_prompt='Reply with exactly one word: YES or NO. Do not explain.
+triage_prompt='Reply YES or NO only.
 
-Below is the assistant text of a just-ended turn. An independent audit costs minutes
-and blocks the author, so it should run only where it changes the odds that something
-wrong ships.
-
-NO: narration, plans, questions, corrections, status — or any claim whose evidence is
-in the text itself (quoted output, counts shown as produced, a cited file:line, a
-named commit).
-
-YES: a conclusion the reader must take on trust — a fix declared to work, a root
-cause, "no issues", a done/ready claim — with nothing shown that produced it.
-
-One word: YES or NO.'
+YES when the text declares a fix, root cause, no issues, done/ready/healthy state, or
+similar conclusion without showing what proved it. NO for questions, plans,
+narration, corrections, status, or claims supported inline by quoted output,
+produced counts, a file:line citation, or a named commit.'
 # The old parse was `tail -n1 | tr -dc 'A-Za-z'`, which turns any explanatory answer
 # into a nonsense token — silently UNKNOWN, silently the regex fallback. That fired on
 # real turns under the previous prompt too. Prefer the first token (a compliant model
@@ -620,18 +942,255 @@ classifier_answer() {  # stdin = raw model output; echoes YES/NO/UNKNOWN
   case "$whole" in YES|NO) printf '%s' "$whole"; return ;; esac
   printf 'UNKNOWN'
 }
-should_audit() {  # stdin-less; uses $1 as the stripped message; echoes YES/NO/UNKNOWN
-  local msg="$1" out=""
-  if [[ -n "${VERDICT_CLASSIFIER_CMD:-}" ]]; then
-    out="$(printf '%s' "$msg" | bash -c "$VERDICT_CLASSIFIER_CMD" 2>/dev/null | classifier_answer)"
-  elif command -v claude >/dev/null 2>&1; then
-    # perl alarm = portable timeout (macOS has no coreutils `timeout`).
-    # disableAllHooks guards nested-hook recursion from inside a hook.
-    out="$(printf '%s\n\n<message>\n%s\n</message>\n' "$triage_prompt" "$msg" \
-      | perl -e 'alarm shift; exec @ARGV' "$classifier_timeout_seconds" \
-          claude -p --model claude-haiku-4-5-20251001 --settings '{"disableAllHooks":true}' 2>/dev/null \
-      | classifier_answer)"
+
+# Capture one command behind a stable process-group sentinel. The wrapper retains the
+# FIFO writer until the command itself returns, so closing stdout early cannot disarm
+# the same absolute deadline that bounds bytes, completion, termination, and reap.
+capture_bounded_command() {  # stdin destination max-bytes timeout-seconds fixed|override command...
+  local input_path="$1" destination="$2" max_bytes="$3" timeout_seconds="$4"
+  local command_kind="$5"
+  shift 5
+  local channel_dir output_fifo status_file owner_marker owner_marker_identity
+  local destination_identity_file owner_token sentinel_deadline
+  local capture_status=0 command_status=125 destination_identity=""
+  local teardown_status=0
+  (( $# > 0 )) || return 1
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ \
+     && "$timeout_seconds" =~ ^[1-9][0-9]*$ \
+     && ( "$command_kind" == fixed || "$command_kind" == override ) ]] \
+    || return 1
+  bounded_capture_destination_identity=""
+  if [[ "$command_kind" == override ]]; then
+    bounded_capture_prepare_override_isolation || return 1
   fi
+  bounded_capture_marker_backend_available || return 1
+  sentinel_deadline="$(( $(date +%s) + timeout_seconds + 2 ))"
+  channel_dir="$(mktemp -d \
+    "${TMPDIR:-/tmp}/boxlite-verdict-capture.XXXXXX" 2>/dev/null)" || return 1
+  chmod 700 "$channel_dir" 2>/dev/null || {
+    rmdir "$channel_dir" 2>/dev/null || true
+    return 1
+  }
+  output_fifo="$channel_dir/stdout"
+  status_file="$channel_dir/status"
+  owner_marker="$channel_dir/owner"
+  destination_identity_file="$channel_dir/destination-identity"
+  if ! mkfifo "$output_fifo" 2>/dev/null; then
+    rmdir "$channel_dir" 2>/dev/null || true
+    return 1
+  fi
+  owner_marker_identity="$(verdict_audit_write_exclusive_regular_identity \
+    "$owner_marker" </dev/null 2>/dev/null)" || {
+    rm -f "$output_fifo" 2>/dev/null || true
+    rmdir "$channel_dir" 2>/dev/null || true
+    return 1
+  }
+  [[ "$owner_marker_identity" =~ ^[0-9]+:[0-9]+$ ]] || {
+    verdict_audit_unlink_if_identity \
+      "$owner_marker" "$owner_marker_identity" 2>/dev/null || true
+    rm -f "$output_fifo" 2>/dev/null || true
+    rmdir "$channel_dir" 2>/dev/null || true
+    return 1
+  }
+  owner_token="capture-${owner_marker_identity//:/-}-$$-${RANDOM:-0}"
+  active_bounded_capture_marker="$owner_marker"
+  active_bounded_capture_marker_identity="$owner_marker_identity"
+
+  # TERM/INT may arrive after fork but before $! is published. Defer only across that
+  # narrow ownership gap, then replay the normal exit after both PGID and marker state
+  # are visible to the EXIT cleanup trap.
+  bounded_capture_pending_signal=""
+  trap 'bounded_capture_pending_signal=TERM' TERM
+  trap 'bounded_capture_pending_signal=INT' INT
+  set -m
+  (
+    isolated_pid=0
+    isolated_pending_signal=""
+    kill_isolated_override() {
+      local job_pid live_jobs
+      live_jobs="$(jobs -p 2>/dev/null)"
+      while IFS= read -r job_pid; do
+        [[ "$job_pid" == "$isolated_pid" ]] || continue
+        kill -KILL -- "-$isolated_pid" 2>/dev/null || true
+        kill -KILL "$isolated_pid" 2>/dev/null || true
+        wait "$isolated_pid" 2>/dev/null || true
+        return 0
+      done <<< "$live_jobs"
+    }
+    trap - EXIT
+    trap ':' INT TERM
+    exec 9<"$owner_marker" || exit 125
+    export BOXLITE_VERDICT_CAPTURE_OWNER="$owner_token"
+    if [[ "$command_kind" == override ]]; then
+      # The nested job owns its own process group. On Darwin it is the group leader
+      # (so setsid fails) and cannot fork; on Linux the unshare parent is the exact
+      # kill-child authority for every process in the namespace.
+      trap 'isolated_pending_signal=TERM' TERM
+      trap 'isolated_pending_signal=INT' INT
+      set -m
+      if [[ "$bounded_override_isolation_backend" == darwin-sandbox ]]; then
+        "$bounded_override_isolation_tool" -p \
+          '(version 1) (allow default) (deny process-fork)' \
+          "$@" <"$input_path" &
+      else
+        "$bounded_override_isolation_tool" \
+          --user --map-root-user --pid --fork --kill-child=KILL -- \
+          "$@" <"$input_path" &
+      fi
+      isolated_pid=$!
+      set +m
+      trap 'kill_isolated_override; exit 143' TERM
+      trap 'kill_isolated_override; exit 130' INT
+      case "$isolated_pending_signal" in
+        TERM)
+          kill_isolated_override
+          exit 143
+          ;;
+        INT)
+          kill_isolated_override
+          exit 130
+          ;;
+      esac
+      wait "$isolated_pid"
+      command_status=$?
+      trap ':' INT TERM
+    else
+      "$@" <"$input_path"
+      command_status=$?
+    fi
+    # Publish status without using the output channel, then close the sentinel's
+    # writer before sleeping. Descendants that retained stdout keep the reader (and
+    # therefore its deadline) active until the entire group is quiescent.
+    perl -MFcntl=:DEFAULT -e '
+      my ($path, $status) = @ARGV;
+      exit 1 unless $status =~ /\A(?:0|[1-9][0-9]{0,2})\z/;
+      my $flags = O_WRONLY | O_CREAT | O_EXCL | O_NONBLOCK;
+      $flags |= Fcntl::O_NOFOLLOW() if defined &Fcntl::O_NOFOLLOW;
+      sysopen(my $fh, $path, $flags, 0600) or exit 1;
+      my @opened = stat($fh);
+      my @named = lstat($path);
+      exit 1 unless @opened && @named && -f $fh && $opened[3] == 1
+        && $opened[0] == $named[0] && $opened[1] == $named[1];
+      print {$fh} "$status\n" or exit 1;
+      close($fh) or exit 1;
+    ' "$status_file" "$command_status" 2>/dev/null || true
+    exec 1>&- 2>&-
+    exec perl -e '
+      my $deadline = shift;
+      exit 1 unless $deadline =~ /\A[1-9][0-9]*\z/;
+      $SIG{TERM} = sub {};
+      $SIG{INT} = sub {};
+      select(undef, undef, undef, 0.05) while time() <= $deadline;
+    ' "$sentinel_deadline"
+  ) >"$output_fifo" 2>/dev/null &
+  active_bounded_capture_pgid=$!
+  active_bounded_capture_group_owned=true
+  set +m
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  case "$bounded_capture_pending_signal" in
+    TERM) exit 143 ;;
+    INT)  exit 130 ;;
+  esac
+
+  perl -e '
+      my ($max, $timeout) = @ARGV;
+      exit 1 unless $max =~ /^[1-9][0-9]*$/ && $timeout =~ /^[1-9][0-9]*$/;
+      $SIG{ALRM} = sub { exit 1 };
+      alarm $timeout;
+      binmode(STDIN); binmode(STDOUT);
+      my $body = "";
+      while (length($body) <= $max) {
+        my $chunk = "";
+        my $count = sysread(STDIN, $chunk, $max + 1 - length($body));
+        next if !defined($count) && $!{EINTR};
+        exit 1 unless defined($count);
+        last if $count == 0;
+        $body .= $chunk;
+      }
+      exit 1 if length($body) > $max || index($body, "\0") >= 0;
+      alarm 0;
+      print STDOUT $body or exit 1;
+    ' "$max_bytes" "$timeout_seconds" <"$output_fifo" \
+      | verdict_audit_write_exclusive_regular_identity "$destination" \
+          >"$destination_identity_file"
+  capture_status=$?
+  destination_identity="$(verdict_audit_read_single_record \
+    "$destination_identity_file" 2>/dev/null)" || destination_identity=""
+  if [[ "$destination_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+     && verdict_audit_selected_identity_matches \
+          "$destination" "$destination_identity" 2>/dev/null; then
+    bounded_capture_destination_identity="$destination_identity"
+  else
+    capture_status=1
+  fi
+  command_status="$(verdict_audit_read_single_record \
+    "$status_file" 2>/dev/null)" || command_status=125
+
+  stop_bounded_capture_group || teardown_status=1
+  rm -f "$output_fifo" "$status_file" "$destination_identity_file" \
+    2>/dev/null || true
+  rmdir "$channel_dir" 2>/dev/null || true
+  if (( capture_status != 0 )) \
+     || (( teardown_status != 0 )) \
+     || [[ ! "$command_status" =~ ^[0-9]+$ ]] \
+     || (( command_status != 0 )); then
+    cleanup_bounded_capture_destination \
+      "$destination" "$bounded_capture_destination_identity" \
+      2>/dev/null || true
+    return 1
+  fi
+}
+
+should_audit() {  # stdin-less; uses $1 as the stripped message; echoes YES/NO/UNKNOWN
+  local msg="$1" out="" classifier_dir classifier_input classifier_output
+  local classifier_output_identity=""
+  # An exact `false` override is an explicit offline sentinel: its only possible result
+  # is UNKNOWN, so avoid a supervised process launch and its teardown entirely.
+  if [[ "${VERDICT_CLASSIFIER_CMD:-}" == false ]]; then
+    echo UNKNOWN
+    return 0
+  fi
+  classifier_dir="$(mktemp -d \
+    "${TMPDIR:-/tmp}/boxlite-verdict-classifier.XXXXXX" 2>/dev/null)" || {
+    echo UNKNOWN
+    return 0
+  }
+  chmod 700 "$classifier_dir" 2>/dev/null || {
+    rmdir "$classifier_dir" 2>/dev/null || true
+    echo UNKNOWN
+    return 0
+  }
+  classifier_input="$classifier_dir/input"
+  classifier_output="$classifier_dir/output"
+  bounded_capture_destination_identity=""
+  if [[ -n "${VERDICT_CLASSIFIER_CMD:-}" ]]; then
+    if printf '%s' "$msg" \
+        | verdict_audit_write_exclusive_regular "$classifier_input" \
+       && capture_bounded_command "$classifier_input" "$classifier_output" \
+          "$classifier_output_max_bytes" "$classifier_timeout_seconds" \
+          override bash -c "$VERDICT_CLASSIFIER_CMD"; then
+      out="$(classifier_answer <"$classifier_output")"
+    fi
+  elif command -v claude >/dev/null 2>&1; then
+    # Safe mode retains OAuth/keychain auth while dropping project/plugin/memory/hook
+    # context. The custom system prompt + empty tools keep this a binary classifier;
+    # --name also suppresses Claude Code's separate title-generation model request.
+    if printf '<message>\n%s\n</message>\n' "$msg" \
+        | verdict_audit_write_exclusive_regular "$classifier_input" \
+       && capture_bounded_command "$classifier_input" "$classifier_output" \
+          "$classifier_output_max_bytes" "$classifier_timeout_seconds" \
+          fixed claude -p --safe-mode --tools "" --system-prompt "$triage_prompt" \
+            --effort low --name verdict-classifier --no-session-persistence \
+            --model claude-haiku-4-5-20251001; then
+      out="$(classifier_answer <"$classifier_output")"
+    fi
+  fi
+  classifier_output_identity="$bounded_capture_destination_identity"
+  rm -f "$classifier_input" 2>/dev/null || true
+  cleanup_bounded_capture_destination \
+    "$classifier_output" "$classifier_output_identity" 2>/dev/null || true
+  rmdir "$classifier_dir" 2>/dev/null || true
   case "$out" in
     YES) echo YES ;;
     NO)  echo NO ;;
@@ -709,11 +1268,12 @@ load_verdict_request() {
 }
 
 consume_current_verdict_request() {
-  [[ "$session_scope" != "-" ]] || return 0
-  [[ -n "$verdict_request_body" ]] || return 1
-  prompt_epoch_is_current || return 1
-  verdict_audit_remove_record_if_matches \
-    "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || return 1
+  if [[ "$session_scope" != "-" ]]; then
+    [[ -n "$verdict_request_body" ]] || return 1
+    prompt_epoch_is_current || return 1
+    verdict_audit_remove_record_if_matches \
+      "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || return 1
+  fi
   prompt_epoch_is_current
 }
 
@@ -738,19 +1298,12 @@ discard_path_for_current_epoch() {  # stable-path
   local stable_path="$1"
   prompt_epoch_is_current || return 1
   [[ -e "$stable_path" || -L "$stable_path" ]] || return 0
-  local quarantine="${stable_path}.discard-$$-${RANDOM:-0}" selected_identity
+  local selected_identity
   selected_identity="$(verdict_audit_path_identity "$stable_path" 2>/dev/null)" \
     || return 1
   prompt_epoch_is_current || return 1
-  verdict_audit_rename_exact "$stable_path" "$quarantine" 2>/dev/null || return 1
-  if ! verdict_audit_selected_identity_matches \
-      "$quarantine" "$selected_identity" 2>/dev/null; then
-    verdict_audit_restore_no_clobber \
-      "$quarantine" "$stable_path" 2>/dev/null || true
-    return 1
-  fi
-  rm -f "$quarantine"
-  rmdir "$quarantine" 2>/dev/null || true
+  verdict_audit_unlink_if_identity \
+    "$stable_path" "$selected_identity" 2>/dev/null
 }
 
 # Replace a small session record without ever overwriting a pathname that a newer prompt
@@ -759,40 +1312,47 @@ discard_path_for_current_epoch() {  # stable-path
 publish_record_for_current_epoch() {  # record-path body-without-LF
   local record_path="$1" record_body="$2"
   local staged="${record_path}.stage-$$-${RANDOM:-0}"
-  local prior="${record_path}.prior-$$-${RANDOM:-0}" had_prior=false prior_identity=""
+  local prior="${record_path}.prior-$$-${RANDOM:-0}" had_prior=false
+  local staged_identity="" prior_identity="" cleanup_status=0
   prompt_epoch_is_current || return 1
-  if ! printf '%s\n' "$record_body" \
-      | verdict_audit_write_exclusive_regular "$staged" 2>/dev/null; then
+  if ! staged_identity="$(printf '%s\n' "$record_body" \
+      | verdict_audit_write_exclusive_regular_identity "$staged" 2>/dev/null)"; then
     return 1
   fi
   if ! prompt_epoch_is_current; then
-    rm -f "$staged"
+    verdict_audit_unlink_if_identity \
+      "$staged" "$staged_identity" 2>/dev/null || true
     return 1
   fi
   if [[ -e "$record_path" || -L "$record_path" ]]; then
     prior_identity="$(verdict_audit_path_identity "$record_path" 2>/dev/null)" || {
-      rm -f "$staged"
+      verdict_audit_unlink_if_identity \
+        "$staged" "$staged_identity" 2>/dev/null || true
       return 1
     }
     prompt_epoch_is_current || {
-      rm -f "$staged"
+      verdict_audit_unlink_if_identity \
+        "$staged" "$staged_identity" 2>/dev/null || true
       return 1
     }
-    verdict_audit_rename_exact "$record_path" "$prior" 2>/dev/null || {
-      rm -f "$staged"
+    verdict_audit_rename_no_clobber_exact "$record_path" "$prior" 2>/dev/null || {
+      verdict_audit_unlink_if_identity \
+        "$staged" "$staged_identity" 2>/dev/null || true
       return 1
     }
     had_prior=true
     if ! verdict_audit_selected_identity_matches \
         "$prior" "$prior_identity" 2>/dev/null; then
       verdict_audit_restore_no_clobber "$prior" "$record_path" 2>/dev/null || true
-      rm -f "$staged"
+      verdict_audit_unlink_if_identity \
+        "$staged" "$staged_identity" 2>/dev/null || true
       return 1
     fi
     if ! prompt_epoch_is_current; then
-      rm -f "$prior" 2>/dev/null || true
-      rmdir "$prior" 2>/dev/null || true
-      rm -f "$staged"
+      verdict_audit_unlink_if_identity \
+        "$prior" "$prior_identity" 2>/dev/null || true
+      verdict_audit_unlink_if_identity \
+        "$staged" "$staged_identity" 2>/dev/null || true
       return 1
     fi
   fi
@@ -800,31 +1360,44 @@ publish_record_for_current_epoch() {  # record-path body-without-LF
     if [[ "$had_prior" == true ]]; then
       verdict_audit_restore_no_clobber "$prior" "$record_path" 2>/dev/null || true
     fi
-    rm -f "$staged"
+    verdict_audit_unlink_if_identity \
+      "$staged" "$staged_identity" 2>/dev/null || true
     return 1
   fi
   if ! prompt_epoch_is_current; then
-    verdict_audit_unlink_if_same_inode "$record_path" "$staged" 2>/dev/null || true
+    verdict_audit_unlink_if_identity \
+      "$record_path" "$staged_identity" 2>/dev/null || true
     if [[ "$had_prior" == true ]]; then
-      rm -f "$prior" 2>/dev/null || true
-      rmdir "$prior" 2>/dev/null || true
+      verdict_audit_unlink_if_identity \
+        "$prior" "$prior_identity" 2>/dev/null || true
     fi
-    rm -f "$staged"
+    verdict_audit_unlink_if_identity \
+      "$staged" "$staged_identity" 2>/dev/null || true
     return 1
   fi
-  rm -f "$staged"
+  verdict_audit_unlink_if_identity \
+    "$staged" "$staged_identity" 2>/dev/null || cleanup_status=1
   if [[ "$had_prior" == true ]]; then
-    rm -f "$prior" 2>/dev/null || true
-    rmdir "$prior" 2>/dev/null || true
+    verdict_audit_unlink_if_identity \
+      "$prior" "$prior_identity" 2>/dev/null || cleanup_status=1
   fi
-  return 0
+  return "$cleanup_status"
 }
 
 discard_matching_json_generation() {  # json-path expected-generation
-  local json_path="$1" expected="$2" quarantine snapshot json generation
+  local json_path="$1" expected="$2" quarantine snapshot json generation selected_identity
   [[ -e "$json_path" || -L "$json_path" ]] || return 0
   quarantine="${json_path}.discard-$$-${RANDOM:-0}"
-  verdict_audit_rename_exact "$json_path" "$quarantine" 2>/dev/null || return 1
+  selected_identity="$(verdict_audit_path_identity "$json_path" 2>/dev/null)" \
+    || return 1
+  verdict_audit_rename_no_clobber_exact \
+    "$json_path" "$quarantine" 2>/dev/null || return 1
+  if ! verdict_audit_selected_identity_matches \
+      "$quarantine" "$selected_identity" 2>/dev/null; then
+    verdict_audit_restore_no_clobber \
+      "$quarantine" "$json_path" 2>/dev/null || return 2
+    return 1
+  fi
   snapshot="$(verdict_audit_read_json_snapshot "$quarantine" 2>/dev/null)" \
     || snapshot=""
   json=""
@@ -835,8 +1408,9 @@ discard_matching_json_generation() {  # json-path expected-generation
     then .[0].generation else "" end
   ' 2>/dev/null || echo '')"
   if [[ "$generation" == "$expected" ]]; then
-    rm -f "$quarantine"
-    return 0
+    verdict_audit_unlink_if_identity \
+      "$quarantine" "$selected_identity" 2>/dev/null
+    return $?
   fi
   verdict_audit_restore_no_clobber "$quarantine" "$json_path" 2>/dev/null || return 2
   return 1
@@ -903,13 +1477,139 @@ ensure_verdict_request() {
 }
 
 write_payload_transcript() {
-  local payload_body
+  local snapshot_body
   prompt_epoch_is_current || return 1
   mkdir -p "$(dirname "$payload_transcript_file")" 2>/dev/null || return 1
-  payload_body="$(jq -nc --arg text "$last_assistant_message" \
-    '{type:"assistant", source:"codex-stop-payload",
-      message:{content:[{type:"text", text:$text}]}}')" || return 1
-  publish_record_for_current_epoch "$payload_transcript_file" "$payload_body"
+  snapshot_body="$(printf '%s' "$last_assistant_message" \
+    | verdict_audit_message_snapshot "$transcript_turn_max_bytes")" || return 1
+  transcript_snapshot_truncated="$(printf '%s' "$snapshot_body" \
+    | jq -r 'if .truncated == true then "true" else "false" end' \
+      2>/dev/null || echo true)"
+  publish_record_for_current_epoch "$payload_transcript_file" "$snapshot_body"
+}
+
+write_failed_transcript_snapshot() {
+  local snapshot_body
+  snapshot_body="$(verdict_audit_failed_turn_snapshot \
+    "$transcript_turn_max_bytes")" || return 1
+  transcript_snapshot_truncated=true
+  publish_record_for_current_epoch "$payload_transcript_file" "$snapshot_body"
+}
+
+# A custom extractor is executable configuration, but its output is still untrusted.
+# The shared capture facade keeps both bytes and producer lifetime behind one absolute
+# deadline; a producer cannot close stdout and then strand this hook in a later wait.
+capture_bounded_extractor() {  # source-path destination-path max-bytes
+  local source_path="$1" destination="$2" max_bytes="$3"
+  capture_bounded_command /dev/null "$destination" "$max_bytes" 5 override \
+    bash -c "$VERDICT_EXTRACTOR_CMD \"\$1\"" _ "$source_path"
+}
+
+prepare_audit_transcript() {
+  local source_path="${1:-$transcript_path}" refresh_mode="${2:-initial}"
+  local staged extracted snapshot_body raw_snapshot raw_body extracted_snapshot
+  local staged_identity="" extracted_identity="" snapshot_state=""
+  transcript_snapshot_truncated=false
+  if [[ "$refresh_mode" != refresh ]]; then
+    PREEXTRACTED_FINAL_TEXT=""
+    AUDIT_TRANSCRIPT_SOURCE_PATH=""
+    AUDIT_TRANSCRIPT_REFRESHABLE=false
+    AUDIT_TRANSCRIPT_SOURCE_KIND="transcript"
+  fi
+  if [[ -z "$source_path" || "$source_path" == /dev/null \
+     || ( ! -e "$source_path" && ! -L "$source_path" ) ]]; then
+    if [[ -n "$last_assistant_message" ]]; then
+      write_payload_transcript || return 1
+      transcript_path="$payload_transcript_file"
+      AUDIT_TRANSCRIPT_SOURCE_KIND="payload"
+    else
+      transcript_path=""
+      AUDIT_TRANSCRIPT_SOURCE_KIND="none"
+    fi
+    return 0
+  fi
+  if [[ -f "$source_path" && ! -s "$source_path" \
+     && -z "$last_assistant_message" ]]; then
+    transcript_path=""
+    AUDIT_TRANSCRIPT_SOURCE_KIND="none"
+    return 0
+  fi
+  staged="${payload_transcript_file}.stage-$$-${RANDOM:-0}"
+  mkdir -p "$(dirname "$payload_transcript_file")" 2>/dev/null || return 1
+  if [[ -n "${VERDICT_EXTRACTOR_CMD:-}" ]] \
+     && raw_snapshot="$(verdict_audit_read_regular_state \
+          "$source_path" "$transcript_source_max_bytes" json 2>/dev/null)" \
+     && [[ "$raw_snapshot" == *$'\n'* ]]; then
+    raw_body="${raw_snapshot#*$'\n'}"
+    if ! staged_identity="$(printf '%s' "$raw_body" \
+        | verdict_audit_write_exclusive_regular_identity \
+            "$staged" 2>/dev/null)"; then
+      [[ "$staged_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+        && cleanup_bounded_capture_destination \
+            "$staged" "$staged_identity" 2>/dev/null || true
+      write_failed_transcript_snapshot || return 1
+    else
+      extracted="${staged}.extracted"
+      if capture_bounded_extractor \
+          "$staged" "$extracted" "$transcript_turn_max_bytes"; then
+        extracted_identity="$bounded_capture_destination_identity"
+        extracted_snapshot="$(verdict_audit_read_regular_state \
+          "$extracted" "$transcript_turn_max_bytes" json 2>/dev/null)" \
+          || extracted_snapshot=""
+        if [[ "$extracted_snapshot" == *$'\n'* ]]; then
+          PREEXTRACTED_FINAL_TEXT="${extracted_snapshot#*$'\n'}"
+        else
+          PREEXTRACTED_FINAL_TEXT=""
+        fi
+      else
+        extracted_identity="$bounded_capture_destination_identity"
+        PREEXTRACTED_FINAL_TEXT=""
+      fi
+      cleanup_bounded_capture_destination \
+        "$extracted" "$extracted_identity" 2>/dev/null || true
+      cleanup_bounded_capture_destination \
+        "$staged" "$staged_identity" 2>/dev/null || true
+      if [[ -n "$PREEXTRACTED_FINAL_TEXT" ]]; then
+        last_assistant_message="$PREEXTRACTED_FINAL_TEXT"
+        write_payload_transcript || return 1
+        AUDIT_TRANSCRIPT_SOURCE_KIND="transcript"
+      else
+        write_failed_transcript_snapshot || return 1
+        AUDIT_TRANSCRIPT_SOURCE_KIND="failed"
+      fi
+    fi
+  elif staged_identity="$(verdict_audit_snapshot_final_turn_identity \
+      "$source_path" "$staged" \
+      "$transcript_source_max_bytes" "$transcript_turn_max_bytes")"; then
+    snapshot_state="$(verdict_audit_read_regular_state \
+      "$staged" "$transcript_turn_max_bytes" json \
+      "$staged_identity" 2>/dev/null)" || snapshot_state=""
+    if [[ "$snapshot_state" == *$'\n'* ]]; then
+      snapshot_body="${snapshot_state#*$'\n'}"
+      cleanup_bounded_capture_destination \
+        "$staged" "$staged_identity" 2>/dev/null || true
+      publish_record_for_current_epoch \
+        "$payload_transcript_file" "$snapshot_body" || return 1
+      transcript_snapshot_truncated="$(printf '%s' "$snapshot_body" \
+        | jq -r 'if .truncated == true then "true" else "false" end' \
+          2>/dev/null || echo true)"
+      AUDIT_TRANSCRIPT_SOURCE_PATH="$source_path"
+      AUDIT_TRANSCRIPT_REFRESHABLE=true
+      AUDIT_TRANSCRIPT_SOURCE_KIND="transcript"
+    else
+      cleanup_bounded_capture_destination \
+        "$staged" "$staged_identity" 2>/dev/null || true
+      write_failed_transcript_snapshot || return 1
+      AUDIT_TRANSCRIPT_SOURCE_KIND="failed"
+    fi
+  else
+    [[ "$staged_identity" =~ ^[0-9]+:[0-9]+$ ]] \
+      && cleanup_bounded_capture_destination \
+          "$staged" "$staged_identity" 2>/dev/null || true
+    write_failed_transcript_snapshot || return 1
+    AUDIT_TRANSCRIPT_SOURCE_KIND="failed"
+  fi
+  transcript_path="$payload_transcript_file"
 }
 
 block_audit_infrastructure_failure() {  # reason
@@ -925,21 +1625,11 @@ block_audit_infrastructure_failure() {  # reason
 audit_before_stop() {  # trigger-reason
   local trigger_reason="$1" audit_transcript_path="$transcript_path"
   local runner="$tooling_root/.agents/hooks/run-verdict-audit.sh"
-  local runner_status=0
+  local runner_status=0 runner_failure=""
   if ! ensure_verdict_request; then
     block_audit_infrastructure_failure "${trigger_reason}
 
 Verdict audit could not start because its generation-bound request was not recorded."
-  fi
-  if [[ "$FINAL_SOURCE" == "payload" \
-     || ( -n "$last_assistant_message" \
-          && ( -z "$transcript_path" || ! -r "$transcript_path" || ! -s "$transcript_path" ) ) ]]; then
-    if write_payload_transcript; then
-      audit_transcript_path="$payload_transcript_file"
-    else
-      printf 'preflight-verdict-check: could not persist the Stop payload for audit: %s\n' \
-        "$payload_transcript_file" >&2
-    fi
   fi
   prompt_epoch_is_current || allow
   if [[ ! -r "$runner" ]]; then
@@ -1000,8 +1690,8 @@ expire_stale_prev() {
     return 0
   fi
   if ! prompt_epoch_is_current; then
-    rm -f "$parked_quarantine" 2>/dev/null || true
-    rmdir "$parked_quarantine" 2>/dev/null || true
+    verdict_audit_unlink_if_identity \
+      "$parked_quarantine" "$parked_identity" 2>/dev/null || true
     return 0
   fi
   if parked_snapshot="$(verdict_audit_read_json_snapshot \
@@ -1021,22 +1711,38 @@ expire_stale_prev() {
     if verdict_audit_link_no_clobber \
         "$parked_quarantine" "$prev_verdict_file" 2>/dev/null; then
       if prompt_epoch_is_current; then
-        rm -f "$parked_quarantine"
+        verdict_audit_unlink_if_identity \
+          "$parked_quarantine" "$parked_identity" 2>/dev/null || true
         return 0
       fi
       verdict_audit_unlink_if_same_inode \
         "$prev_verdict_file" "$parked_quarantine" 2>/dev/null || true
     fi
   fi
-  rm -f "$parked_quarantine"
-  rmdir "$parked_quarantine" 2>/dev/null || true
+  verdict_audit_unlink_if_identity \
+    "$parked_quarantine" "$parked_identity" 2>/dev/null || true
   return 0
 }
 expire_stale_prev
 
 # Resolve the exact turn before accepting any runtime artifact. A user steer may retain
 # the harness turn id, while the content-derived FINAL_ID necessarily changes.
+if ! prepare_audit_transcript; then
+  block "Verdict gate could not publish a bounded final-turn transcript snapshot. Fix the session state path before ending."
+fi
 resolve_final_message
+if [[ "$transcript_snapshot_truncated" == true ]]; then
+  if [[ -z "$FINAL_TEXT" ]]; then
+    FINAL_TEXT="Verdict evidence is incomplete because the final-turn snapshot exceeded its byte limit."
+    FINAL_SOURCE="transcript"
+    identify_final_message
+  fi
+  if [[ -z "$reentry_prompt_epoch" ]]; then
+    log_decision extract truncated-block
+    audit_before_stop \
+      "Verdict gate requires an independent FAIL dossier because the final-turn evidence snapshot is incomplete or exceeded the ${transcript_turn_max_bytes}-byte limit. The auditor must not infer from omitted records."
+  fi
+fi
 if [[ -z "$FINAL_TEXT" ]]; then
   if [[ "$transcript_had_content" == true ]]; then
     log_decision extract blind-allow
@@ -1079,6 +1785,12 @@ fi
 # canceled auditor may publish a newer dossier at the stable path while the gate
 # is deciding; that newer pathname is never opened, moved, or deleted by this decision.
 dossier_observed_identity=""
+retire_selected_dossier() {
+  [[ -n "${dossier_quarantine:-}" \
+     && "$dossier_observed_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  verdict_audit_unlink_if_identity \
+    "$dossier_quarantine" "$dossier_observed_identity" 2>/dev/null
+}
 if [[ "$request_is_current" == true \
    && ( -e "$verdict_file" || -L "$verdict_file" ) ]]; then
   dossier_observed_identity="$(verdict_audit_path_identity \
@@ -1088,7 +1800,8 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
    && start_decision_lease \
    && current_verdict_authority_matches; then
   dossier_quarantine="${verdict_file}.inspect-$$-${RANDOM:-0}"
-  if verdict_audit_rename_exact "$verdict_file" "$dossier_quarantine" 2>/dev/null; then
+  if verdict_audit_rename_no_clobber_exact \
+      "$verdict_file" "$dossier_quarantine" 2>/dev/null; then
     if ! verdict_audit_selected_identity_matches \
         "$dossier_quarantine" "$dossier_observed_identity" 2>/dev/null; then
       verdict_audit_restore_no_clobber \
@@ -1128,16 +1841,14 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
 
     if [[ "$generation_matches" != true ]]; then
       log_decision dossier discard-generation
-      rm -f "$dossier_quarantine"
-      rmdir "$dossier_quarantine" 2>/dev/null || true
+      retire_selected_dossier || true
     elif [[ "$v_branch" != "$branch" ]] || \
        [[ "$v_head" != "$head" ]] || \
        [[ "$v_tree" != "$cur_tree" ]] || \
        (( age < 0 || age > max_age_seconds )); then
       log_decision dossier discard-stale
       if ! consume_current_verdict_request; then
-        rm -f "$dossier_quarantine"
-        rmdir "$dossier_quarantine" 2>/dev/null || true
+        retire_selected_dossier || true
         [[ "$session_scope" == "-" ]] || request_is_current=false
       elif [[ "$v_verdict" == "FAIL" ]] \
          && prompt_epoch_is_current \
@@ -1148,19 +1859,18 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
         if verdict_audit_link_no_clobber \
             "$dossier_quarantine" "$prev_verdict_file" 2>/dev/null; then
           if prompt_epoch_is_current; then
-            rm -f "$dossier_quarantine"
+            retire_selected_dossier || true
           else
             verdict_audit_unlink_if_same_inode \
               "$prev_verdict_file" "$dossier_quarantine" 2>/dev/null || true
-            rm -f "$dossier_quarantine"
+            retire_selected_dossier || true
           fi
         else
-          rm -f "$dossier_quarantine"
+          retire_selected_dossier || true
         fi
         [[ "$session_scope" == "-" ]] || request_is_current=false
       else
-        rm -f "$dossier_quarantine"
-        rmdir "$dossier_quarantine" 2>/dev/null || true
+        retire_selected_dossier || true
         [[ "$session_scope" == "-" ]] || request_is_current=false
       fi
     else
@@ -1168,15 +1878,13 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
         PASS)
           if consume_current_verdict_request; then
             log_decision dossier PASS-allow
-            rm -f "$dossier_quarantine"
+            retire_selected_dossier || true
             discard_path_for_current_epoch "$prev_verdict_file" >/dev/null 2>&1 || true
             discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
-            rmdir "$dossier_quarantine" 2>/dev/null || true
             allow
           fi
           log_decision dossier discard-revoked
-          rm -f "$dossier_quarantine"
-          rmdir "$dossier_quarantine" 2>/dev/null || true
+          retire_selected_dossier || true
           [[ "$session_scope" == "-" ]] || request_is_current=false
           ;;
         IN_PROGRESS)
@@ -1184,16 +1892,14 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
             | jq -r '.findings[]? | "  - " + .' 2>/dev/null || echo '')"
           if consume_current_verdict_request; then
             log_decision dossier IN_PROGRESS-allow
-            rm -f "$dossier_quarantine"
+            retire_selected_dossier || true
             discard_path_for_current_epoch "$prev_verdict_file" >/dev/null 2>&1 || true
             discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
-            rmdir "$dossier_quarantine" 2>/dev/null || true
             allow_with_note "Verdict: IN_PROGRESS — proof deferred, work not yet complete:
 ${remaining}"
           fi
           log_decision dossier discard-revoked
-          rm -f "$dossier_quarantine"
-          rmdir "$dossier_quarantine" 2>/dev/null || true
+          retire_selected_dossier || true
           [[ "$session_scope" == "-" ]] || request_is_current=false
           ;;
         *)
@@ -1224,8 +1930,7 @@ Stop gate will re-audit the revised answer automatically."
             fi
           fi
           log_decision dossier discard-revoked
-          rm -f "$dossier_quarantine"
-          rmdir "$dossier_quarantine" 2>/dev/null || true
+          retire_selected_dossier || true
           request_is_current=false
           ;;
       esac
@@ -1345,6 +2050,10 @@ if [[ -n "$FINAL_ID" && -n "$recorded_id" && "$FINAL_ID" == "$recorded_id" ]]; t
   if [[ "$FINAL_SOURCE" == "transcript" ]]; then
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       sleep 0.2
+      if [[ "$AUDIT_TRANSCRIPT_REFRESHABLE" == true ]]; then
+        prepare_audit_transcript "$AUDIT_TRANSCRIPT_SOURCE_PATH" refresh \
+          >/dev/null 2>&1 || true
+      fi
       extract_final_message
       [[ "$FINAL_ID" != "$recorded_id" ]] && break
     done
@@ -1379,6 +2088,14 @@ if [[ -n "$asserted" ]]; then
   log_decision assertion match-block
   audit_before_stop "This turn asserts a verdict (\"${asserted}\") but no audited
 dossier backs it. A claim stated as established needs proof attached."
+fi
+
+classifier_bytes="$(LC_ALL=C printf '%s' "$stripped_cited" | wc -c | tr -d ' ')"
+if (( classifier_bytes > classifier_max_bytes )); then
+  log_decision triage oversized-block
+  audit_before_stop "This turn is too large for classifier input
+(${classifier_bytes} bytes; limit ${classifier_max_bytes}). Audit its file-backed
+transcript before treating its conclusions as established."
 fi
 
 triage="$(should_audit "$stripped_cited")"

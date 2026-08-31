@@ -32,6 +32,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CODEX_JSON="$REPO_ROOT/templates/codex-hooks.json"
 CLAUDE_JSON="$REPO_ROOT/templates/claude-settings.json"
 CANONICAL="$REPO_ROOT/plugins/boxlite-agent-tooling/.agents/hooks/rule-recency.sh"
+README="$REPO_ROOT/README.md"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -137,6 +138,71 @@ echo
 echo "## Claude Code — templates/claude-settings.json -> .claude/settings.json"
 # Claude Code exports $CLAUDE_PROJECT_DIR, so it needs no subprocess to find the root.
 check_hooks_file "claude" "$CLAUDE_JSON" '$CLAUDE_PROJECT_DIR'
+
+echo
+echo "## The documented Claude merge preserves existing prompt hooks"
+# Execute the README's copy/merge recipe itself. A structure-only assertion on the
+# template cannot catch `jq` replacing an existing UserPromptSubmit array.
+documented_merge="$(awk '
+  /Claude Code needs a \*\*merge\*\*/ { found = 1 }
+  found && /^```sh$/ { capture = 1; next }
+  capture && /^```$/ { exit }
+  capture { print }
+' "$README")"
+MERGE_CONSUMER="$TMP/merge-consumer"
+mkdir -p "$MERGE_CONSUMER/.claude"
+jq -n '{
+  env: {KEEP_ME: "yes"},
+  hooks: {
+    UserPromptSubmit: [{hooks:[{type:"command",command:"existing-prompt-hook"}]}],
+    PreToolUse: [{matcher:"Bash",hooks:[{type:"command",command:"existing-pretool-hook"}]}]
+  }
+}' > "$MERGE_CONSUMER/.claude/settings.json"
+(
+  cd "$REPO_ROOT" || exit 1
+  # shellcheck disable=SC2034 # consumed by the README snippet through eval
+  consumer="$MERGE_CONSUMER"
+  eval "$documented_merge"
+) >/dev/null 2>"$TMP/documented-merge.err"
+merge_status=$?
+if [[ "$merge_status" -eq 0 ]]; then
+  ok "documented merge executes"
+else
+  bad "documented merge executes (rc=$merge_status err=$(head -c 120 "$TMP/documented-merge.err"))"
+fi
+if jq -e '
+    .env.KEEP_ME == "yes" and
+    (.hooks.PreToolUse | length) == 1 and
+    ([.hooks.UserPromptSubmit[]?.hooks[]?.command] | index("existing-prompt-hook")) != null and
+    ([.hooks.UserPromptSubmit[]?.hooks[]?.command] | index("/usr/bin/env bash \"$CLAUDE_PROJECT_DIR/.agent-tooling/rule-recency.sh\"")) != null
+  ' "$MERGE_CONSUMER/.claude/settings.json" >/dev/null 2>&1; then
+  ok "documented merge retains existing events and appends the prompt rule"
+else
+  bad "documented merge retains existing events and appends the prompt rule"
+fi
+
+# Installation recipes are routinely rerun during refreshes. Replaying the exact
+# documented merge must not register another model-visible prompt hook.
+(
+  cd "$REPO_ROOT" || exit 1
+  # shellcheck disable=SC2034 # consumed by the README snippet through eval
+  consumer="$MERGE_CONSUMER"
+  eval "$documented_merge"
+) >/dev/null 2>"$TMP/documented-merge-second.err"
+second_merge_status=$?
+if [[ "$second_merge_status" -eq 0 \
+   && "$(jq -r '[.hooks.UserPromptSubmit[]?.hooks[]?.command
+        | select(. == "/usr/bin/env bash \"$CLAUDE_PROJECT_DIR/.agent-tooling/rule-recency.sh\"")] | length' \
+        "$MERGE_CONSUMER/.claude/settings.json")" == 1 \
+   && "$(jq -r '[.hooks.UserPromptSubmit[]?.hooks[]?.command
+        | select(. == "existing-prompt-hook")] | length' \
+        "$MERGE_CONSUMER/.claude/settings.json")" == 1 \
+   && "$(jq -r '.hooks.PreToolUse | length' \
+        "$MERGE_CONSUMER/.claude/settings.json")" == 1 ]]; then
+  ok "documented merge is idempotent across refreshes"
+else
+  bad "documented merge is idempotent across refreshes"
+fi
 
 echo
 echo "## The two hosts stay aligned"

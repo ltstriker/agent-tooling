@@ -158,6 +158,16 @@ append_tool_result_string() {
     '{type:"user", message:{role:"user", content:[{type:"tool_result", tool_use_id:"tu1", content:$t}]}}' \
     >> "$1/transcript.jsonl"
 }
+append_tool_result_object() {
+  jq -nc --argjson value "$2" \
+    '{type:"user", message:{role:"user", content:[{type:"tool_result", tool_use_id:"tu1", content:$value}]}}' \
+    >> "$1/transcript.jsonl"
+}
+append_root_tool_record_object() {
+  jq -nc --argjson value "$2" \
+    '{type:"tool_result", tool_use_id:"tu1", message:$value}' \
+    >> "$1/transcript.jsonl"
+}
 
 # Write a dossier; tree_hash defaults to the repo's current working-tree hash.
 write_verdict() {
@@ -174,14 +184,19 @@ write_verdict() {
 AUDITOR_STUB='audit_prompt="$(cat)"
 mkdir -p "$CLAUDE_PROJECT_DIR/.agents/state"
 printf "%s" "$audit_prompt" > "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_PROMPT"
-previous_path=""
-while IFS= read -r prompt_line; do
-  case "$prompt_line" in
-    previous_verdict_file:*) previous_path="${prompt_line#previous_verdict_file: }" ;;
-  esac
-done <<< "$audit_prompt"
+task_input_json="$(printf "%s\n" "$audit_prompt" \
+  | sed -n "/^UNTRUSTED_TASK_INPUT_JSON:$/ { n; p; q; }")"
+printf "%s\n" "$task_input_json" \
+  > "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_TASK_INPUT"
+previous_path="$(printf "%s" "$task_input_json" \
+  | jq -r ".previous_dossier_path // empty")"
+transcript_path="$(printf "%s" "$task_input_json" \
+  | jq -r ".transcript_path // empty")"
 if [[ -n "$previous_path" && -r "$previous_path" ]]; then
   cp "$previous_path" "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_PREVIOUS"
+fi
+if [[ -n "$transcript_path" && -r "$transcript_path" ]]; then
+  cp "$transcript_path" "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_TRANSCRIPT"
 fi
 touch "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_RAN"
 printf "run\\n" >> "$CLAUDE_PROJECT_DIR/.agents/state/SYNC_AUDIT_RUNS"
@@ -264,7 +279,7 @@ check_gone() {  # desc  repo
 # merely that its answer agreed. The stub also answers the OPPOSITE of the tier under
 # test, so a run without the tier reaches the model and lands on the wrong decision.
 # (Same property the in-flight rung needs: it sits ahead of triage.)
-cls_stub()      { printf "cat >/dev/null; touch '%s/CLASSIFIER_RAN'; echo %s" "$1" "$2"; }
+cls_stub()      { printf "while IFS= read -r _line; do :; done; : > '%s/CLASSIFIER_RAN'; printf '%s\\n'" "$1" "$2"; }
 classifier_ran() { [[ -e "$1/CLASSIFIER_RAN" ]] && echo yes || echo no; }
 run_hook() {  # repo  classifier-answer
   jq -nc --arg p "$1/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
@@ -349,7 +364,7 @@ if [[ -z "${VERDICT_EPOCH_BARRIER_OWNER_PID:-}" ]]; then
            && -e "$parked_quarantine" ]] && should_pause=true
         ;;
       prev-replacement)
-        [[ "$BASH_COMMAND" == 'rm -f "$parked_quarantine"' \
+        [[ "$BASH_COMMAND" == verdict_audit_unlink_if_identity* \
            && -n "${parked_quarantine:-}" \
            && -e "$parked_quarantine" ]] && should_pause=true
         ;;
@@ -364,15 +379,16 @@ if [[ -z "${VERDICT_EPOCH_BARRIER_OWNER_PID:-}" ]]; then
            && -n "${invalid_request:-}" ]] && should_pause=true
         ;;
       discard-dossier-select)
-        [[ "$BASH_COMMAND" == verdict_audit_rename_exact* \
-           && "${quarantine:-}" == *.discard-* ]] && should_pause=true
+        [[ "$BASH_COMMAND" == verdict_audit_rename_no_clobber_exact* \
+           && "${stable_path:-}" == "${verdict_file:-}" \
+           && "${selected_path:-}" == *.unlink-* ]] && should_pause=true
         ;;
       prev-select)
         [[ "$BASH_COMMAND" == verdict_audit_rename_exact* \
            && -n "${parked_quarantine:-}" ]] && should_pause=true
         ;;
       dossier-select)
-        [[ "$BASH_COMMAND" == verdict_audit_rename_exact* \
+        [[ "$BASH_COMMAND" == verdict_audit_rename_no_clobber_exact* \
            && "${dossier_quarantine:-}" == *.inspect-* ]] && should_pause=true
         ;;
       park-publish)
@@ -416,6 +432,7 @@ for f in \
   .agents/state/pr-reviewed.json \
   .agents/state/verdict-last-uuid \
   .agents/state/verdict-stop-message.jsonl \
+  .agents/state/verdict-previous-dossier.json \
   .agents/state/verdict-prompt-epoch \
   .agents/state/verdict-audit.lock \
   .agents/state/verdict-audit.lock.mutex \
@@ -432,6 +449,55 @@ echo
 echo "## Detection: no dossier → the turn text decides"
 R="$(setup)"; write_transcript "$R" "The root cause is a race between gvproxy startup and the socket bind."
 check "'root cause is X' → block (verdict asserted, unaudited)"   "$R" "block"; rm -rf "$R"
+
+R="$(setup)"
+mkfifo "$R/transcript.fifo"
+fifo_payload="$(jq -nc --arg p "$R/transcript.fifo" \
+  '{transcript_path:$p, hook_event_name:"Stop"}')"
+fifo_out="$(printf '%s' "$fifo_payload" | (cd "$R" && CLAUDE_PROJECT_DIR="$R" \
+  VERDICT_GATE_HARD_BLOCK=1 perl -e 'alarm 3; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+fifo_rc=$?
+fifo_runs="$(wc -l < "$R/.agents/state/SYNC_AUDIT_RUNS" 2>/dev/null | tr -d ' ')"
+fifo_state="rc=$fifo_rc decision=$(decision_from_output "$fifo_out") runs=${fifo_runs:-0}"
+if [[ "$fifo_state" == "rc=0 decision=block runs=1" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "FIFO transcript fails closed without blocking the hook"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (%s)\n' \
+    "FIFO transcript fails closed without blocking the hook" "$fifo_state"
+fi
+rm -rf "$R"
+
+R="$(setup)"
+perl -e '
+  print qq|{"type":"assistant","message":{"content":[{"type":"text","text":"|;
+  print "OLD_HISTORY_" x 700000;
+  print qq|"}]}}\n|;
+  print qq|{"type":"user","message":{"content":[{"type":"text","text":"new request"}]}}\n|;
+  print qq|{"type":"assistant","message":{"content":[{"type":"text","text":"The root cause is FINAL_SMALL"}]}}\n|;
+  print qq|{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"TOOL_EVIDENCE"}]}}\n|;
+' > "$R/transcript.jsonl"
+history_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop"}')"
+history_out="$(run_payload_hook "$R" "$history_payload")"
+history_snapshot="$R/.agents/state/SYNC_AUDIT_TRANSCRIPT"
+history_task_input="$R/.agents/state/SYNC_AUDIT_TASK_INPUT"
+history_snapshot_bytes="$(wc -c < "$history_snapshot" 2>/dev/null | tr -d ' ')"
+history_recorded_path="$(jq -r '.transcript_path // empty' \
+  "$history_task_input" 2>/dev/null || true)"
+history_snapshot_state="decision=$(decision_from_output "$history_out")"
+history_snapshot_state="$history_snapshot_state bounded=$([[ "$history_snapshot_bytes" =~ ^[0-9]+$ && "$history_snapshot_bytes" -le 262144 ]] && echo yes || echo no)"
+history_snapshot_state="$history_snapshot_state complete=$(jq -r '.truncated == false' "$history_snapshot" 2>/dev/null || echo false)"
+history_snapshot_state="$history_snapshot_state final=$(grep -q 'FINAL_SMALL' "$history_snapshot" 2>/dev/null && echo yes || echo no)"
+history_snapshot_state="$history_snapshot_state tool=$(grep -q 'TOOL_EVIDENCE' "$history_snapshot" 2>/dev/null && echo yes || echo no)"
+history_snapshot_state="$history_snapshot_state old=$(grep -q 'OLD_HISTORY_' "$history_snapshot" 2>/dev/null && echo yes || echo no)"
+history_snapshot_state="$history_snapshot_state routed=$([[ -n "$history_recorded_path" ]] && echo yes || echo no)"
+if [[ "$history_snapshot_state" == "decision=block bounded=yes complete=true final=yes tool=yes old=no routed=yes" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "synchronous route shares one bounded complete final-turn snapshot"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (%s)\n' \
+    "synchronous route lost the bounded final-turn snapshot" "$history_snapshot_state"
+fi
+rm -rf "$R"
 
 R="$(setup)"; write_transcript "$R" "The root cause is the stale socket path."
 payload="$(jq -nc --arg p "$R/transcript.jsonl" \
@@ -664,7 +730,7 @@ if [[ -z "${VERDICT_CANCELED_CONSUME_OWNER_PID:-}" ]]; then
     [[ "$$" == "$VERDICT_CANCELED_CONSUME_OWNER_PID" ]] || return 0
     [[ "${VERDICT_CANCELED_CONSUME_SEEN:-false}" == false ]] || return 0
     case "$BASH_COMMAND" in
-      *'verdict_audit_rename_exact "$record_path" "$quarantine"'*)
+      *'verdict_audit_rename_no_clobber_exact'*'"$record_path" "$quarantine"'*)
         [[ "$record_path" == *verdict-request* ]] || return 0
         VERDICT_CANCELED_CONSUME_SEEN=true
         mkdir "$quarantine"
@@ -764,7 +830,7 @@ fi; rm -rf "$R"
 R="$(setup)"; write_transcript "$R" "Noted, I'll wait for your call on the API shape."
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
   | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
-      VERDICT_CLASSIFIER_CMD='cat >/dev/null; printf "Let me think about this.\nYES\n"' \
+      VERDICT_CLASSIFIER_CMD='while IFS= read -r _line; do :; done; printf "Let me think about this.\nYES\n"' \
       bash "$HOOK" ) 2>/dev/null)"
 if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "trailing classifier answer still read"
@@ -780,7 +846,7 @@ R="$(setup)"
 write_transcript "$R" 'Root cause is the stale socket path, at `src/proxy.rs:412`, per `tests pass` in the docs.'
 jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
   | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
-      VERDICT_CLASSIFIER_CMD="cat > '$R/seen.txt'; echo NO" bash "$HOOK" ) >/dev/null 2>&1
+      VERDICT_CLASSIFIER_CMD="_text=''; IFS= read -r -d '' _text || :; printf '%s' \"\$_text\" > '$R/seen.txt'; printf 'NO\\n'" bash "$HOOK" ) >/dev/null 2>&1
 seen="$(cat "$R/seen.txt" 2>/dev/null || echo MISSING)"
 kept="no";      printf '%s' "$seen" | grep -q 'src/proxy.rs:412' && kept="yes"
 dropped="no";   printf '%s' "$seen" | grep -q 'tests pass'       || dropped="yes"
@@ -800,7 +866,7 @@ rm -rf "$R"
 R="$(setup)"; write_transcript "$R" "Noted, I'll wait for your call on the API shape."
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
   | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
-      VERDICT_CLASSIFIER_CMD='cat >/dev/null; printf "YES\nbecause the turn declares the fix works\n"' \
+      VERDICT_CLASSIFIER_CMD='while IFS= read -r _line; do :; done; printf "YES\nbecause the turn declares the fix works\n"' \
       bash "$HOOK" ) 2>/dev/null)"
 if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "explanatory classifier answer still read as YES"
@@ -831,17 +897,22 @@ expected_id="$(cksum_of "All tests pass.")"
 recorded_id="$(cat "$R/.agents/state/verdict-last-uuid" 2>/dev/null || echo MISSING)"
 fallback_transcript="$R/.agents/state/verdict-stop-message.jsonl"
 fallback_transcript="$(cd "$R" && pwd -P)/.agents/state/verdict-stop-message.jsonl"
-fallback_text="$(jq -r '.message.content[0].text // ""' "$fallback_transcript" 2>/dev/null || echo MISSING)"
-runner_prompt="$(cat "$R/.agents/state/SYNC_AUDIT_PROMPT" 2>/dev/null || echo MISSING)"
+fallback_text="$(jq -r '[.records[]? | select(.kind == "assistant") | .texts[]?] | join("\n\n")' \
+  "$fallback_transcript" 2>/dev/null || echo MISSING)"
+runner_text="$(jq -r '[.records[]? | select(.kind == "assistant") | .texts[]?] | join("\n\n")' \
+  "$R/.agents/state/SYNC_AUDIT_TRANSCRIPT" 2>/dev/null || echo MISSING)"
+runner_transcript_path="$(jq -r '.transcript_path // empty' \
+  "$R/.agents/state/SYNC_AUDIT_TASK_INPUT" 2>/dev/null || true)"
 if [[ "$got" == "block" && "$recorded_id" == "$expected_id" \
    && "$fallback_text" == "All tests pass." \
-   && "$runner_prompt" == *"transcript_path: ${fallback_transcript}"* ]]; then
+   && "$runner_text" == "All tests pass." \
+   && -n "$runner_transcript_path" ]]; then
   pass=$((pass+1)); printf '  PASS  %s\n' \
     "null transcript + Stop message → block with content identity and auditable handoff"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (got=%s id=%s expected=%s fallback=%s handed-off=%s)\n' \
     "null transcript fallback" "$got" "$recorded_id" "$expected_id" "$fallback_text" \
-    "$([[ "$runner_prompt" == *"transcript_path: ${fallback_transcript}"* ]] && echo yes || echo no)"
+    "$([[ "$runner_text" == "All tests pass." && -n "$runner_transcript_path" ]] && echo yes || echo no)"
 fi
 
 # A recursive Stop for the message just judged is stale, but only when Codex marks
@@ -991,6 +1062,46 @@ check_gone "IN_PROGRESS dossier consumed on allow"                "$R"; rm -rf "
 R="$(setup)"; write_transcript "$R" "The fix works."; write_verdict "$R" "FAIL" '["Test: no reproducer for the claimed fix"]'
 check "FAIL → block (finding-driven loop)"                        "$R" "block"
 check "FAIL again (unaddressed) → still block"                    "$R" "block"; rm -rf "$R"
+
+# Findings are auditor-controlled strings. Bound the actual public Stop response after
+# the concise failure wrapper is added; bounding only classifier input leaves this path
+# unbounded.
+R="$(setup)"; write_transcript "$R" "The fix works."
+oversized_finding="$(awk 'BEGIN {
+  for (i = 0; i < 16000; i++) printf "f"
+  printf "END_UNBOUNDED_VERDICT_FINDING"
+}')"
+oversized_findings="$(jq -nc --arg f "$oversized_finding" '[$f]')"
+write_verdict "$R" "FAIL" "$oversized_findings"
+oversized_fail_out="$(run_payload_hook "$R" \
+  "$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p,hook_event_name:"Stop"}')")"
+oversized_fail_reason="$(printf '%s' "$oversized_fail_out" | jq -r '.reason // ""')"
+oversized_fail_bytes="$(LC_ALL=C printf '%s' "$oversized_fail_reason" | wc -c | tr -d ' ')"
+if [[ "$(decision_from_output "$oversized_fail_out")" == block ]] \
+   && (( oversized_fail_bytes <= 8192 )) \
+   && [[ "$oversized_fail_reason" != *"END_UNBOUNDED_VERDICT_FINDING"* ]] \
+   && [[ "$oversized_fail_reason" == *"8192-byte safety limit"* ]] \
+   && [[ "$oversized_fail_reason" == *"remains blocked"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "oversized FAIL reason stays blocked and bounded ($oversized_fail_bytes bytes)"
+else
+  fail=$((fail+1)); printf '  FAIL  %s\n' "oversized FAIL reason escaped the final-output bound ($oversized_fail_bytes bytes)"
+fi; rm -rf "$R"
+
+R="$(setup)"; write_transcript "$R" "Proof is still in progress."
+write_verdict "$R" "IN_PROGRESS" "$oversized_findings"
+oversized_progress_out="$(run_payload_hook "$R" \
+  "$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p,hook_event_name:"Stop"}')")"
+oversized_progress_note="$(printf '%s' "$oversized_progress_out" | jq -r '.systemMessage // ""')"
+oversized_progress_bytes="$(LC_ALL=C printf '%s' "$oversized_progress_note" | wc -c | tr -d ' ')"
+if [[ "$(decision_from_output "$oversized_progress_out")" == allow ]] \
+   && (( oversized_progress_bytes <= 8192 )) \
+   && [[ "$oversized_progress_note" != *"END_UNBOUNDED_VERDICT_FINDING"* ]] \
+   && [[ "$oversized_progress_note" == *"IN_PROGRESS"* ]] \
+   && [[ "$oversized_progress_note" == *"details omitted"* ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "oversized IN_PROGRESS note stays bounded ($oversized_progress_bytes bytes)"
+else
+  fail=$((fail+1)); printf '  FAIL  %s\n' "oversized IN_PROGRESS note escaped the final-output bound ($oversized_progress_bytes bytes)"
+fi; rm -rf "$R"
 
 # A carried legacy FAIL is handled before message extraction and blocks once with only
 # its findings. With no session/message binding it must not launch or retain an audit.
@@ -1608,12 +1719,12 @@ for classifier_epoch_mode in regular unsafe-epoch-path; do
   epoch_path="$(session_state_path "$R" verdict-prompt-epoch session-a)"
   cat > "$R/classifier-barrier.sh" <<'CLASSIFIER_BARRIER'
 #!/usr/bin/env bash
-cat >/dev/null
-touch "$CLAUDE_PROJECT_DIR/.agents/state/classifier-barrier-ready"
+while IFS= read -r _line; do :; done
+: > "$CLAUDE_PROJECT_DIR/.agents/state/classifier-barrier-ready"
 while [[ ! -e "$CLAUDE_PROJECT_DIR/.agents/state/classifier-barrier-release" ]]; do
-  sleep 0.01
+  :
 done
-echo YES
+printf 'YES\n'
 CLASSIFIER_BARRIER
   chmod +x "$R/classifier-barrier.sh"
   payload="$(jq -nc --arg p "$R/transcript.jsonl" --arg s session-a \
@@ -2206,7 +2317,9 @@ dossier_path="$(session_state_path "$R" last-verdict.json session-a)"
 mkfifo "$dossier_path"
 ( run_session_hook "$R" session-a YES > "$R/fifo-dossier.out" ) & fifo_dossier_job=$!
 fifo_dossier_bounded=yes
-for (( poll_index=0; poll_index<50; poll_index++ )); do kill -0 "$fifo_dossier_job" 2>/dev/null || break; sleep 0.02; done
+# The malformed-file rejection is followed by a synchronous audit. Bound the whole
+# transition, not the pre-audit substep that used to be the hook's terminal action.
+for (( poll_index=0; poll_index<250; poll_index++ )); do kill -0 "$fifo_dossier_job" 2>/dev/null || break; sleep 0.02; done
 if kill -0 "$fifo_dossier_job" 2>/dev/null; then
   fifo_dossier_bounded=no
   ( [[ -p "$dossier_path" ]] && printf '{}\n' > "$dossier_path" ) \
@@ -2214,7 +2327,7 @@ if kill -0 "$fifo_dossier_job" 2>/dev/null; then
 else
   fifo_dossier_unblock_job=0
 fi
-( sleep 3; kill -KILL "$fifo_dossier_job" 2>/dev/null || true ) & watchdog=$!
+( sleep 8; kill -KILL "$fifo_dossier_job" 2>/dev/null || true ) & watchdog=$!
 wait "$fifo_dossier_job" 2>/dev/null; fifo_dossier_rc=$?
 [[ "$fifo_dossier_unblock_job" =~ ^[1-9][0-9]*$ ]] \
   && kill -TERM "$fifo_dossier_unblock_job" 2>/dev/null || true
@@ -2455,8 +2568,8 @@ fi; rm -rf "$R"
 
 # Parking is inert unless the findings actually reach the auditor.
 R="$(setup)"; write_transcript "$R" "The root cause is the stale index."
-mkdir -p "$R/.agents/state"
-printf '{"verdict":"FAIL","findings":["tests-pass: no command named"]}' > "$R/.agents/state/last-verdict.prev.json"
+write_verdict "$R" "FAIL" '["tests-pass: no command named"]'
+mv "$R/.agents/state/last-verdict.json" "$R/.agents/state/last-verdict.prev.json"
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
   | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 bash "$HOOK" ) 2>/dev/null)"
 prior_seen="$(cat "$R/.agents/state/SYNC_AUDIT_PREVIOUS" 2>/dev/null || echo MISSING)"
@@ -2535,11 +2648,112 @@ fi; rm -rf "$R"
 
 echo
 echo "## Triage (intelligent trigger): classifier decides; regex is the fallback"
+triage_prompt_words="$(sed -n "/^triage_prompt='/,/^# The old parse/p" "$HOOK" \
+  | sed '$d' | wc -w | tr -d ' ')"
+if [[ "$triage_prompt_words" -le 70 ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "classifier instruction stays within 70 words ($triage_prompt_words)"
+else
+  fail=$((fail+1)); printf '  FAIL  %s\n' "classifier instruction exceeds 70 words ($triage_prompt_words)"
+fi
+
+# The default Claude Code print route is a full coding-agent request: project/user
+# instructions, plugins, auto-memory, hooks, and every built-in tool schema. This fake
+# is the Claude CLI boundary, so the request budget is derived from the production
+# argv rather than a test-only classifier seam. It deliberately models the ambient
+# payload when the isolating flags are absent and a second title request when --name
+# is absent; both shapes were observed against a local dummy Anthropic endpoint.
+R="$(setup)"; write_transcript "$R" "The culprit was a stale socket path."
+mkdir -p "$R/bin"
+cat > "$R/bin/claude" <<'CLASSIFIER_CLI'
+#!/usr/bin/env bash
+set -uo pipefail
+is_safe=false
+has_name=false
+has_no_persistence=false
+effort=""
+system_prompt=""
+tools_mode="default"
+while (( $# > 0 )); do
+  case "$1" in
+    --safe-mode) is_safe=true; shift ;;
+    --name) has_name=true; shift 2 ;;
+    --no-session-persistence) has_no_persistence=true; shift ;;
+    --effort) effort="${2:-}"; shift 2 ;;
+    --system-prompt) system_prompt="${2:-}"; shift 2 ;;
+    --tools) tools_mode="${2-default}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+message="$(cat)"
+if [[ "$is_safe" != true ]]; then
+  system_prompt="$(awk 'BEGIN { for (i=0; i<30000; i++) printf "s" }')"
+fi
+if [[ "$tools_mode" == "" ]]; then
+  tools='[]'
+else
+  tools="$(jq -nc '[range(0;30) | {name:("tool_" + tostring), description:("schema_" + ("x" * 700))}]')"
+fi
+calls=2
+[[ "$has_name" == true ]] && calls=1
+jq -nc --arg system "$system_prompt" --arg message "$message" --arg effort "$effort" \
+  --argjson tools "$tools" --argjson calls "$calls" --argjson safe "$is_safe" \
+  --argjson persistence "$has_no_persistence" \
+  '{system:$system,messages:[{role:"user",content:$message}],tools:$tools,
+    calls:$calls,safe_mode:$safe,no_session_persistence:$persistence,effort:$effort}' \
+  > "$CLAUDE_PROJECT_DIR/classifier-request.json"
+printf 'NO\n'
+CLASSIFIER_CLI
+chmod +x "$R/bin/claude"
+classifier_budget_out="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p, hook_event_name:"Stop"}' \
+  | ( cd "$R" && env -u VERDICT_CLASSIFIER_CMD PATH="$R/bin:$PATH" \
+      CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 bash "$HOOK" ) 2>/dev/null)"
+classifier_request_bytes="$(wc -c < "$R/classifier-request.json" | tr -d ' ')"
+classifier_system_bytes="$(jq -r '.system | length' "$R/classifier-request.json")"
+classifier_tool_count="$(jq -r '.tools | length' "$R/classifier-request.json")"
+if [[ "$classifier_request_bytes" -le 4096 \
+   && "$classifier_system_bytes" -le 1024 \
+   && "$classifier_tool_count" == 0 \
+   && "$(jq -r '.calls' "$R/classifier-request.json")" == 1 \
+   && "$(jq -r '.safe_mode' "$R/classifier-request.json")" == true \
+   && "$(jq -r '.no_session_persistence' "$R/classifier-request.json")" == true \
+   && "$(jq -r '.effort' "$R/classifier-request.json")" == low \
+   && "$(decision_from_output "$classifier_budget_out")" == allow ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "classifier request stays isolated and bounded (${classifier_request_bytes}B, ${classifier_tool_count} tools, one call)"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (bytes=%s system=%s tools=%s request=%s out=%.120s)\n' \
+    "classifier inherited coding-agent context" "$classifier_request_bytes" \
+    "$classifier_system_bytes" "$classifier_tool_count" \
+    "$(jq -c '{calls,safe_mode,no_session_persistence,effort}' "$R/classifier-request.json")" \
+    "$classifier_budget_out"
+fi
+rm -rf "$R"
+
+# Oversized turns must not be copied into a second model request. They block safely
+# and let the file-backed auditor inspect the transcript instead.
+R="$(setup)"
+oversized_message="$(awk 'BEGIN { for (i=0; i<12100; i++) printf "a" }')"
+write_transcript "$R" "$oversized_message"
+out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+      VERDICT_CLASSIFIER_CMD=': > "$CLAUDE_PROJECT_DIR/classifier-called"; printf "NO\n"' bash "$HOOK" ) 2>/dev/null)"
+if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1 \
+   && [[ ! -e "$R/classifier-called" ]] \
+   && [[ -e "$R/.agents/state/SYNC_AUDIT_RAN" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "oversized turn skips classifier and runs the file-backed audit"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (out=%.120s classifier=%s audit=%s)\n' \
+    "oversized turn bypassed the synchronous audit boundary" "$out" \
+    "$([[ -e "$R/classifier-called" ]] && echo called || echo skipped)" \
+    "$([[ -e "$R/.agents/state/SYNC_AUDIT_RAN" ]] && echo ran || echo missing)"
+fi
+rm -rf "$R"
 # The classifier stub receives the stripped message on stdin and answers YES/NO.
 # YES on a message the regex would MISS → the intelligence adds recall.
-R="$(setup)"; write_transcript "$R" "The culprit was the stale socket path all along."
+R="$(setup)"; write_transcript "$R" "The culprit involved an unusual interaction."
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
-  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='cat >/dev/null; echo YES' bash "$HOOK" ) 2>/dev/null)"
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='while IFS= read -r _line; do :; done; printf "YES\n"' bash "$HOOK" ) 2>/dev/null)"
 if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "classifier YES on regex-miss phrasing → block"
 else
@@ -2550,7 +2764,7 @@ fi; rm -rf "$R"
 # the static false positive.
 R="$(setup)"; write_transcript "$R" "In prose people write things like tests pass or root cause is X when they conclude."
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
-  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='cat >/dev/null; echo NO' bash "$HOOK" ) 2>/dev/null)"
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='while IFS= read -r _line; do :; done; printf "NO\n"' bash "$HOOK" ) 2>/dev/null)"
 if printf '%s' "$out" | jq -e '(.decision // "") != "block" and .continue == true and (.systemMessage | test("triage: NO"))' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "classifier NO → allow, announced to the human only"
 else
@@ -2560,11 +2774,66 @@ fi; rm -rf "$R"
 # Classifier unavailable / garbage → UNKNOWN → deterministic regex fallback still gates.
 R="$(setup)"; write_transcript "$R" "All tests pass: 23/23 on the hook suite."
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
-  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='cat >/dev/null; echo MAYBE' bash "$HOOK" ) 2>/dev/null)"
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD='while IFS= read -r _line; do :; done; printf "MAYBE\n"' bash "$HOOK" ) 2>/dev/null)"
 if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "classifier garbage → regex fallback → block"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "garbage → regex fallback" "$out"
+fi; rm -rf "$R"
+
+# Closing stdout is not process completion. A classifier can make the answer pipe
+# reach EOF and then stay alive forever; the Stop hook must still apply the same
+# classifier deadline to that producer and reap it. The DEBUG fixture shortens the
+# existing production timeout variable to one second so this regression stays fast.
+R="$(setup)"; write_transcript "$R" "The culprit was the stale socket path all along."
+classifier_timeout_env="$R/classifier-timeout-env.sh"
+cat > "$classifier_timeout_env" <<'CLASSIFIER_TIMEOUT_ENV'
+if [[ -z "${VERDICT_CLASSIFIER_TIMEOUT_OWNER_PID:-}" ]]; then
+  export VERDICT_CLASSIFIER_TIMEOUT_OWNER_PID="$$"
+  verdict_classifier_timeout_debug() {
+    [[ "$$" == "$VERDICT_CLASSIFIER_TIMEOUT_OWNER_PID" ]] || return 0
+    [[ "$BASH_COMMAND" == triage=*should_audit* ]] || return 0
+    trap - DEBUG
+    classifier_timeout_seconds=1
+    : > "$CLAUDE_PROJECT_DIR/classifier-timeout-shortened"
+  }
+  set -T
+  trap verdict_classifier_timeout_debug DEBUG
+fi
+CLASSIFIER_TIMEOUT_ENV
+classifier_sleep_cmd='printf "%s\n" "$$" > "$CLAUDE_PROJECT_DIR/classifier-sleeper.pid"; : > "$CLAUDE_PROJECT_DIR/classifier-sleeper-ready"; exec 1>&-; exec sleep 6'
+classifier_sleep_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+classifier_sleep_started=$SECONDS
+classifier_sleep_out="$(printf '%s' "$classifier_sleep_payload" \
+  | (cd "$R" && BASH_ENV="$classifier_timeout_env" CLAUDE_PROJECT_DIR="$R" \
+      VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD="$classifier_sleep_cmd" \
+      perl -e 'alarm 4; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+classifier_sleep_rc=$?
+classifier_sleep_elapsed=$(( SECONDS - classifier_sleep_started ))
+classifier_sleep_pid="$(cat "$R/classifier-sleeper.pid" 2>/dev/null || true)"
+classifier_sleep_live=no
+if [[ "$classifier_sleep_pid" =~ ^[1-9][0-9]*$ ]] \
+   && kill -0 "$classifier_sleep_pid" 2>/dev/null; then
+  classifier_sleep_live=yes
+fi
+kill_test_pids TERM "$classifier_sleep_pid"
+sleep 0.05
+kill_test_pids KILL "$classifier_sleep_pid"
+if [[ "$classifier_sleep_rc" -eq 0 \
+   && -e "$R/classifier-timeout-shortened" \
+   && -e "$R/classifier-sleeper-ready" \
+   && "$classifier_sleep_elapsed" -lt 4 \
+   && "$classifier_sleep_live" == no ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "classifier timeout reaps a producer that closed stdout early"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s elapsed=%ss timeout_hook=%s ready=%s child_live=%s out=%.80s)\n' \
+    "classifier waited past its deadline after producer stdout closed" \
+    "$classifier_sleep_rc" "$classifier_sleep_elapsed" \
+    "$([[ -e "$R/classifier-timeout-shortened" ]] && echo hit || echo missed)" \
+    "$([[ -e "$R/classifier-sleeper-ready" ]] && echo yes || echo no)" \
+    "$classifier_sleep_live" "$classifier_sleep_out"
 fi; rm -rf "$R"
 
 echo
@@ -2602,7 +2871,7 @@ echo "## Turn-level extraction: mid-turn findings cannot hide behind closing nar
 # text (not just the trailing fragment) is what triage judges. This is the class
 # a sibling session's decision log caught escaping: finding asserted mid-turn,
 # turn ends on "let me check X".
-GREP_STUB='text="$(cat)"; printf "%s" "$text" | grep -q "1:1 port" && echo YES || echo NO'
+GREP_STUB='text=""; IFS= read -r -d "" text || :; [[ "$text" == *"1:1 port"* ]] && printf "YES\n" || printf "NO\n"'
 
 R="$(setup)"; write_transcript "$R" "The activity service is a 1:1 port of upstream; there is no auto-start in the proxy."
 append_assistant "$R" "Let me check what the standalone proxy serves next."
@@ -2637,6 +2906,42 @@ if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "string tool_result mid-turn does not split the turn → block"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "string tool_result mid-turn" "$out"
+fi; rm -rf "$R"
+
+# Tool output is untrusted structured data. User- or assistant-shaped objects nested
+# inside it are neither a prompt boundary nor an assistant claim.
+R="$(setup)"; write_transcript "$R" "The activity service is a 1:1 port of upstream; there is no auto-start in the proxy."
+append_tool_result_object "$R" '{"role":"user","content":"nested tool data"}'
+append_assistant "$R" "Let me check what the standalone proxy serves next."
+out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD="$GREP_STUB" bash "$HOOK" ) 2>/dev/null)"
+if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "nested user-shaped tool data does not split the turn → block"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "nested user-shaped tool data" "$out"
+fi; rm -rf "$R"
+
+NESTED_ASSISTANT_STUB='text=""; IFS= read -r -d "" text || :; [[ "$text" == *"NESTED_ASSISTANT_CLAIM"* ]] && printf "YES\n" || printf "NO\n"'
+R="$(setup)"; write_transcript "$R" "Want me to inspect the remaining boundary?"
+append_tool_result_object "$R" '{"role":"assistant","content":[{"type":"text","text":"NESTED_ASSISTANT_CLAIM"}]}'
+append_assistant "$R" "I am still checking."
+out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD="$NESTED_ASSISTANT_STUB" bash "$HOOK" ) 2>/dev/null)"
+if ! printf '%s' "$out" | jq -e '(.decision // "") == "block"' >/dev/null 2>&1; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "nested assistant-shaped tool data is evidence, not a claim → allow"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "nested assistant-shaped tool data" "$out"
+fi; rm -rf "$R"
+
+R="$(setup)"; write_transcript "$R" "Want me to inspect the remaining boundary?"
+append_root_tool_record_object "$R" '{"role":"assistant","content":[{"type":"text","text":"NESTED_ASSISTANT_CLAIM"}]}'
+append_assistant "$R" "I am still checking."
+out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_CLASSIFIER_CMD="$NESTED_ASSISTANT_STUB" bash "$HOOK" ) 2>/dev/null)"
+if ! printf '%s' "$out" | jq -e '(.decision // "") == "block"' >/dev/null 2>&1; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "root tool records cannot supply assistant claims → allow"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "root tool record with assistant-shaped message" "$out"
 fi; rm -rf "$R"
 
 # Same finding but in a PREVIOUS turn (real user message between): the final
@@ -2695,12 +3000,972 @@ check "invented future-agent schema, chat → allow"               "$R" "allow";
 # VERDICT_EXTRACTOR_CMD: the escape hatch for a truly alien (non-JSONL) format.
 R="$(setup)"; printf 'PLAIN TEXT LOG. verdict: tests pass\n' > "$R/transcript.jsonl"
 out="$(jq -nc --arg p "$R/transcript.jsonl" '{transcript_path:$p, hook_event_name:"Stop"}' \
-  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 VERDICT_EXTRACTOR_CMD='tail -n1' bash "$HOOK" ) 2>/dev/null)"
+  | ( cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+      VERDICT_EXTRACTOR_CMD='last=""; while IFS= read -r line || [[ -n "$line" ]]; do last="$line"; done < "$1"; printf "%s\n" "$last"' \
+      bash "$HOOK" ) 2>/dev/null)"
 if printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
   pass=$((pass+1)); printf '  PASS  %s\n' "custom extractor (non-JSONL format) → block"
 else
   fail=$((fail+1)); printf '  FAIL  %s  (out=%s)\n' "custom extractor" "$out"
 fi; rm -rf "$R"
+
+# The extractor is an external producer, so the snapshot cap must close its pipe before
+# Bash materializes all stdout in a command-substitution variable. Four MiB is small
+# enough for the suite but well beyond the 256 KiB model-visible transcript ceiling.
+R="$(setup)"; printf 'ALIEN TRANSCRIPT\n' > "$R/transcript.jsonl"
+extractor_script="$R/oversized-extractor"
+extractor_progress="$R/extractor-progress"
+extractor_complete="$R/extractor-complete"
+printf '%s\n' '#!/usr/bin/env perl' \
+  'use strict; use warnings;' \
+  '$SIG{PIPE} = sub { exit 0 };' \
+  'binmode STDOUT; $| = 1;' \
+  'for my $index (1 .. 64) {' \
+  '  my $chunk = "x" x 65536;' \
+  '  my $written = syswrite(STDOUT, $chunk);' \
+  '  exit 0 unless defined($written) && $written == length($chunk);' \
+  '  open(my $mark, ">", $ENV{EXTRACTOR_PROGRESS}) or exit 2;' \
+  '  print {$mark} $index; close($mark) or exit 2;' \
+  '}' \
+  'open(my $done, ">", $ENV{EXTRACTOR_COMPLETE}) or exit 2;' \
+  'print {$done} "complete\n"; close($done) or exit 2;' > "$extractor_script"
+chmod +x "$extractor_script"
+oversized_extractor_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+oversized_extractor_out="$(printf '%s' "$oversized_extractor_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+      EXTRACTOR_PROGRESS="$extractor_progress" \
+      EXTRACTOR_COMPLETE="$extractor_complete" \
+      VERDICT_EXTRACTOR_CMD="$extractor_script" \
+      perl -e 'alarm 5; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+oversized_extractor_rc=$?
+oversized_extractor_chunks="$(cat "$extractor_progress" 2>/dev/null || echo 0)"
+if [[ "$oversized_extractor_rc" -eq 0 && ! -e "$extractor_complete" \
+   && "$oversized_extractor_chunks" =~ ^[0-9]+$ \
+   && "$oversized_extractor_chunks" -lt 64 ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "custom extractor stdout is cut off before unbounded Bash materialization"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s chunks=%s complete=%s out=%.120s)\n' \
+    "custom extractor stdout bypassed the snapshot resource bound" \
+    "$oversized_extractor_rc" "$oversized_extractor_chunks" \
+    "$([[ -e "$extractor_complete" ]] && echo yes || echo no)" \
+    "$oversized_extractor_out"
+fi; rm -rf "$R"
+
+# The five-second alarm covers the FIFO reader, not just receipt of EOF. An
+# extractor that closes stdout and keeps running must be terminated at the same
+# absolute deadline instead of sending capture_bounded_extractor into an
+# unbounded wait after its reader has already disarmed the alarm. The re-entry marker
+# isolates that capture deadline from the independent audit that an initial Stop would
+# correctly run after receiving an incomplete snapshot.
+R="$(setup)"; printf 'ALIEN TRANSCRIPT\n' > "$R/transcript.jsonl"
+closed_extractor="$R/closed-stdout-extractor"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "%s\n" "$$" > "$EXTRACTOR_SLEEP_PID_FILE"' \
+  ': > "$EXTRACTOR_SLEEP_READY"' \
+  'exec 1>&-' \
+  'exec sleep 10' > "$closed_extractor"
+chmod +x "$closed_extractor"
+closed_extractor_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+closed_extractor_started=$SECONDS
+closed_extractor_out="$(printf '%s' "$closed_extractor_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+      EXTRACTOR_SLEEP_PID_FILE="$R/closed-extractor.pid" \
+      EXTRACTOR_SLEEP_READY="$R/closed-extractor-ready" \
+      VERDICT_EXTRACTOR_CMD="$closed_extractor" \
+      VERDICT_STOP_REENTRY_EPOCH=- \
+      perl -e 'alarm 10; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+closed_extractor_rc=$?
+closed_extractor_elapsed=$(( SECONDS - closed_extractor_started ))
+closed_extractor_pid="$(cat "$R/closed-extractor.pid" 2>/dev/null || true)"
+closed_extractor_live=no
+if [[ "$closed_extractor_pid" =~ ^[1-9][0-9]*$ ]] \
+   && kill -0 "$closed_extractor_pid" 2>/dev/null; then
+  closed_extractor_live=yes
+fi
+kill_test_pids TERM "$closed_extractor_pid"
+sleep 0.05
+kill_test_pids KILL "$closed_extractor_pid"
+if [[ "$closed_extractor_rc" -eq 0 \
+   && -e "$R/closed-extractor-ready" \
+   && "$closed_extractor_elapsed" -le 8 \
+   && "$closed_extractor_live" == no ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "custom extractor deadline reaps a producer that closed stdout early"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s elapsed=%ss ready=%s child_live=%s out=%.80s)\n' \
+    "custom extractor waited past its five-second deadline after stdout closed" \
+    "$closed_extractor_rc" "$closed_extractor_elapsed" \
+    "$([[ -e "$R/closed-extractor-ready" ]] && echo yes || echo no)" \
+    "$closed_extractor_live" "$closed_extractor_out"
+fi; rm -rf "$R"
+
+echo
+echo "## Bounded capture: publication, escaped descendants, and exact cleanup"
+
+if [[ "$(uname -s)" == Darwin ]]; then
+  # Explicit overrides may still use pure shell logic under the macOS fork-denial
+  # boundary. This is the positive half of the containment contract: the override is
+  # restricted, not disabled wholesale.
+  R="$(setup)"; write_transcript "$R" \
+    "In prose people write things like tests pass when they conclude."
+  override_builtin_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+    '{transcript_path:$p,hook_event_name:"Stop"}')"
+  override_builtin_out="$(printf '%s' "$override_builtin_payload" \
+    | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_CLASSIFIER_CMD='while IFS= read -r _line; do :; done; printf "NO\n"' \
+        bash "$HOOK") 2>/dev/null)"
+  if [[ "$(decision_from_output "$override_builtin_out")" == allow \
+     && "$override_builtin_out" == *"triage: NO"* ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "macOS containment permits a builtin-only classifier override"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (out=%.120s)\n' \
+      "macOS containment disabled a non-spawning override" "$override_builtin_out"
+  fi
+  rm -rf "$R"
+
+  # A helper process would be able to double-fork, close ownership descriptors, and
+  # leave the process group. macOS denies that first fork; its output is discarded and
+  # regex fallback remains fail-closed.
+  R="$(setup)"; write_transcript "$R" \
+    "In prose people write things like tests pass when they conclude."
+  override_spawn_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+    '{transcript_path:$p,hook_event_name:"Stop"}')"
+  override_spawn_cmd='perl -e '\''open(my $f, ">", $ENV{CLAUDE_PROJECT_DIR}."/override-spawned") or exit 2; close($f)'\''; printf "NO\n"'
+  override_spawn_out="$(printf '%s' "$override_spawn_payload" \
+    | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_CLASSIFIER_CMD="$override_spawn_cmd" bash "$HOOK") 2>/dev/null)"
+  if [[ "$(decision_from_output "$override_spawn_out")" == block \
+     && ! -e "$R/override-spawned" ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "macOS containment rejects a child-spawning classifier override"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (spawned=%s out=%.120s)\n' \
+      "macOS override escaped the fork-denial boundary" \
+      "$([[ -e "$R/override-spawned" ]] && echo yes || echo no)" \
+      "$override_spawn_out"
+  fi
+  rm -rf "$R"
+
+  # Linux hosts without usable unshare must reject only the explicit override. A fake
+  # kernel identity exercises that branch on the macOS release host without moving or
+  # replacing any system binary.
+  R="$(setup)"; write_transcript "$R" "All tests pass."
+  linux_unavailable_env="$R/linux-unavailable-env.sh"
+  cat > "$linux_unavailable_env" <<'LINUX_UNAVAILABLE_ENV'
+if [[ -z "${VERDICT_LINUX_UNAVAILABLE_ENV_LOADED:-}" ]]; then
+  export VERDICT_LINUX_UNAVAILABLE_ENV_LOADED=1
+  uname() { printf 'Linux\n'; }
+fi
+LINUX_UNAVAILABLE_ENV
+  linux_unavailable_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+    '{transcript_path:$p,hook_event_name:"Stop"}')"
+  printf '%s' "$linux_unavailable_payload" \
+    | (cd "$R" && BASH_ENV="$linux_unavailable_env" CLAUDE_PROJECT_DIR="$R" \
+        VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_CLASSIFIER_CMD=': > "$CLAUDE_PROJECT_DIR/linux-override-ran"; printf "NO\n"' \
+        bash "$HOOK") > "$R/linux-unavailable.out" 2> "$R/linux-unavailable.err"
+  linux_unavailable_rc=$?
+  linux_unavailable_out="$(cat "$R/linux-unavailable.out" 2>/dev/null || true)"
+  linux_unavailable_err="$(cat "$R/linux-unavailable.err" 2>/dev/null || true)"
+  if [[ "$linux_unavailable_rc" -eq 0 \
+     && "$(decision_from_output "$linux_unavailable_out")" == block \
+     && ! -e "$R/linux-override-ran" \
+     && "$linux_unavailable_err" == *"Linux user/PID namespace support is unavailable"* ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "Linux without unshare rejects only the explicit override with a diagnostic"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (rc=%s ran=%s err=%.120s out=%.100s)\n' \
+      "Linux containment failure was silent or launched the override" \
+      "$linux_unavailable_rc" \
+      "$([[ -e "$R/linux-override-ran" ]] && echo yes || echo no)" \
+      "$linux_unavailable_err" "$linux_unavailable_out"
+  fi
+  rm -rf "$R"
+fi
+
+# DEBUG runs after the background fork and before the next simple command assigns
+# $! to active_bounded_capture_pgid. TERM in that exact gap must not leave the
+# unpublished sentinel group behind. BASH_ENV scopes the barrier to this hook.
+R="$(setup)"; write_transcript "$R" "The culprit was the stale socket path all along."
+capture_gap_env="$R/capture-gap-env.sh"
+cat > "$capture_gap_env" <<'CAPTURE_GAP_ENV'
+if [[ -z "${VERDICT_CAPTURE_GAP_ENV_LOADED:-}" ]]; then
+  export VERDICT_CAPTURE_GAP_ENV_LOADED=1
+  export VERDICT_CAPTURE_GAP_OWNER_PID="$$"
+  printf '%s\n' "$$" > "$VERDICT_CAPTURE_GAP_HOOK_PID_FILE"
+  verdict_capture_gap_debug() {
+    [[ "$$" == "$VERDICT_CAPTURE_GAP_OWNER_PID" ]] || return 0
+    [[ "$BASH_COMMAND" == 'active_bounded_capture_pgid=$!' ]] || return 0
+    trap - DEBUG
+    printf '%s\n' "$!" > "$VERDICT_CAPTURE_GAP_PGID_FILE"
+    : > "$VERDICT_CAPTURE_GAP_READY"
+    while [[ ! -e "$VERDICT_CAPTURE_GAP_RELEASE" ]]; do
+      perl -e 'select undef, undef, undef, 0.01'
+    done
+  }
+  set -T
+  trap verdict_capture_gap_debug DEBUG
+fi
+CAPTURE_GAP_ENV
+capture_gap_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+capture_gap_extractor='printf "%s\n" "$$" > "$VERDICT_CAPTURE_GAP_CHILD_PID_FILE"; : > "$VERDICT_CAPTURE_GAP_CHILD_READY"; exec 1>&-; exec sleep 20 #'
+(
+  printf '%s' "$capture_gap_payload" \
+    | (cd "$R" && BASH_ENV="$capture_gap_env" CLAUDE_PROJECT_DIR="$R" \
+        VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_CAPTURE_GAP_HOOK_PID_FILE="$R/capture-gap-hook.pid" \
+        VERDICT_CAPTURE_GAP_PGID_FILE="$R/capture-gap-pgid" \
+        VERDICT_CAPTURE_GAP_READY="$R/capture-gap-ready" \
+        VERDICT_CAPTURE_GAP_RELEASE="$R/capture-gap-release" \
+        VERDICT_CAPTURE_GAP_CHILD_PID_FILE="$R/capture-gap-child.pid" \
+        VERDICT_CAPTURE_GAP_CHILD_READY="$R/capture-gap-child-ready" \
+        VERDICT_EXTRACTOR_CMD="$capture_gap_extractor" bash "$HOOK")
+) > "$R/capture-gap.out" 2> "$R/capture-gap.err" &
+capture_gap_job=$!
+capture_gap_ready_deadline=$(( SECONDS + 4 ))
+while (( SECONDS < capture_gap_ready_deadline )); do
+  [[ -e "$R/capture-gap-ready" ]] && break
+  kill -0 "$capture_gap_job" 2>/dev/null || break
+  perl -e 'select undef, undef, undef, 0.01'
+done
+capture_gap_hook_pid="$(cat "$R/capture-gap-hook.pid" 2>/dev/null || true)"
+capture_gap_pgid="$(cat "$R/capture-gap-pgid" 2>/dev/null || true)"
+capture_gap_child_pid="$(cat "$R/capture-gap-child.pid" 2>/dev/null || true)"
+capture_gap_barrier=missed
+[[ -e "$R/capture-gap-ready" \
+   && "$capture_gap_hook_pid" =~ ^[1-9][0-9]*$ \
+   && "$capture_gap_pgid" =~ ^[1-9][0-9]*$ ]] \
+  && capture_gap_barrier=hit
+capture_gap_started=$SECONDS
+kill_test_pids TERM "$capture_gap_hook_pid"
+: > "$R/capture-gap-release"
+capture_gap_deadline=$(( SECONDS + 3 ))
+while (( SECONDS < capture_gap_deadline )) \
+   && kill -0 "$capture_gap_job" 2>/dev/null; do
+  perl -e 'select undef, undef, undef, 0.02'
+done
+capture_gap_elapsed=$(( SECONDS - capture_gap_started ))
+capture_gap_hook_live=no
+capture_gap_group_live=no
+kill -0 "$capture_gap_hook_pid" 2>/dev/null && capture_gap_hook_live=yes
+if [[ "$capture_gap_pgid" =~ ^[1-9][0-9]*$ ]] \
+   && kill -0 -- "-$capture_gap_pgid" 2>/dev/null; then
+  capture_gap_group_live=yes
+fi
+if [[ "$capture_gap_pgid" =~ ^[1-9][0-9]*$ ]]; then
+  kill -TERM -- "-$capture_gap_pgid" 2>/dev/null || true
+  kill -KILL -- "-$capture_gap_pgid" 2>/dev/null || true
+fi
+kill_test_pids KILL "$capture_gap_hook_pid" "$capture_gap_child_pid"
+wait "$capture_gap_job" 2>/dev/null; capture_gap_rc=$?
+if [[ "$capture_gap_barrier" == hit \
+   && "$capture_gap_hook_live/$capture_gap_group_live" == no/no \
+   && "$capture_gap_elapsed" -le 3 ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "TERM across capture fork publication leaves no process group"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (barrier=%s rc=%s elapsed=%ss hook=%s group=%s pgid=%s)\n' \
+    "TERM beat bounded-capture ownership publication" \
+    "$capture_gap_barrier" "$capture_gap_rc" "$capture_gap_elapsed" \
+    "$capture_gap_hook_live" "$capture_gap_group_live" "$capture_gap_pgid"
+fi
+rm -rf "$R"
+
+# A configurable command can try to create a new session and escape the supervisor's
+# process group. The kernel boundary may prevent that fork/session transition outright;
+# if a child did start, the legacy marker witness must still account for it before the
+# bounded run returns.
+escaped_capture_root="$(mktemp -d)"
+escaped_capture_script="$escaped_capture_root/escape-capture.sh"
+cat > "$escaped_capture_script" <<'ESCAPED_CAPTURE_SCRIPT'
+#!/usr/bin/env bash
+mode="$1"
+perl -MPOSIX -e '
+  my ($pid_path, $ready_path) = @ARGV;
+  POSIX::setsid() >= 0 or exit 2;
+  $SIG{TERM} = "IGNORE";
+  $SIG{INT} = "IGNORE";
+  open(STDOUT, ">", "/dev/null") or exit 2;
+  open(STDERR, ">", "/dev/null") or exit 2;
+  open(my $pid, ">", $pid_path) or exit 2;
+  print {$pid} "$$\n"; close($pid) or exit 2;
+  open(my $ready, ">", $ready_path) or exit 2;
+  print {$ready} "ready\n"; close($ready) or exit 2;
+  sleep 20;
+' "$ESCAPED_CAPTURE_PID_FILE" "$ESCAPED_CAPTURE_READY" &
+for (( escape_wait = 0; escape_wait < 300; escape_wait++ )); do
+  [[ -e "$ESCAPED_CAPTURE_READY" ]] && break
+  perl -e 'select undef, undef, undef, 0.01'
+done
+[[ -e "$ESCAPED_CAPTURE_READY" ]] || exit 9
+case "$mode" in
+  classifier) printf 'NO\n' ;;
+  extractor) printf 'PLAIN TEXT LOG. verdict: tests pass\n' ;;
+  *) exit 9 ;;
+esac
+exit 0
+ESCAPED_CAPTURE_SCRIPT
+chmod +x "$escaped_capture_script"
+for escaped_capture_mode in classifier extractor; do
+  R="$(setup)"
+  if [[ "$escaped_capture_mode" == classifier ]]; then
+    write_transcript "$R" \
+      "In prose people write things like tests pass when they conclude."
+    escaped_capture_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+      '{transcript_path:$p,hook_event_name:"Stop"}')"
+    escaped_capture_command_env="VERDICT_CLASSIFIER_CMD"
+  else
+    printf 'ALIEN TRANSCRIPT\n' > "$R/transcript.jsonl"
+    escaped_capture_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+      '{transcript_path:$p,hook_event_name:"Stop"}')"
+    escaped_capture_command_env="VERDICT_EXTRACTOR_CMD"
+  fi
+  escaped_capture_started=$SECONDS
+  if [[ "$escaped_capture_command_env" == VERDICT_CLASSIFIER_CMD ]]; then
+    escaped_capture_out="$(printf '%s' "$escaped_capture_payload" \
+      | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+          ESCAPED_CAPTURE_PID_FILE="$R/escaped-capture.pid" \
+          ESCAPED_CAPTURE_READY="$R/escaped-capture-ready" \
+          VERDICT_CLASSIFIER_CMD="$escaped_capture_script classifier" \
+          perl -e 'alarm 8; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+  else
+    escaped_capture_out="$(printf '%s' "$escaped_capture_payload" \
+      | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+          ESCAPED_CAPTURE_PID_FILE="$R/escaped-capture.pid" \
+          ESCAPED_CAPTURE_READY="$R/escaped-capture-ready" \
+          VERDICT_EXTRACTOR_CMD="$escaped_capture_script extractor" \
+          perl -e 'alarm 8; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+  fi
+  escaped_capture_rc=$?
+  escaped_capture_elapsed=$(( SECONDS - escaped_capture_started ))
+  escaped_capture_pid="$(cat "$R/escaped-capture.pid" 2>/dev/null || true)"
+  escaped_capture_live=no
+  if [[ "$escaped_capture_pid" =~ ^[1-9][0-9]*$ ]] \
+     && kill -0 "$escaped_capture_pid" 2>/dev/null; then
+    escaped_capture_live=yes
+  fi
+  kill_test_pids KILL "$escaped_capture_pid"
+  escaped_capture_safe=no
+  if [[ ! -e "$R/escaped-capture-ready" && -z "$escaped_capture_pid" ]] \
+     || [[ -e "$R/escaped-capture-ready" && "$escaped_capture_live" == no ]]; then
+    escaped_capture_safe=yes
+  fi
+  if [[ "$escaped_capture_rc" -eq 0 \
+     && "$escaped_capture_elapsed" -lt 8 \
+     && "$escaped_capture_safe" == yes ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "$escaped_capture_mode prevents or reaps a setsid TERM-ignoring descendant"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (rc=%s elapsed=%ss ready=%s child_live=%s pid=%s out=%.80s)\n' \
+      "$escaped_capture_mode process group lost an escaped descendant" \
+      "$escaped_capture_rc" "$escaped_capture_elapsed" \
+      "$([[ -e "$R/escaped-capture-ready" ]] && echo yes || echo no)" \
+      "$escaped_capture_live" "$escaped_capture_pid" "$escaped_capture_out"
+  fi
+  rm -rf "$R"
+done
+rm -rf "$escaped_capture_root"
+
+# A normal daemonization sequence closes every inherited ownership channel after
+# escaping the original process group. The hook must either prevent that escape at
+# launch or retain a kernel-verifiable lifetime boundary; accepting classifier output
+# while the close_fds daemon survives is never a successful bounded capture.
+R="$(setup)"; write_transcript "$R" "All tests pass."
+closed_marker_script="$R/close-marker-daemon.sh"
+cat > "$closed_marker_script" <<'CLOSED_MARKER_SCRIPT'
+#!/usr/bin/env bash
+perl -MPOSIX -MFcntl=:DEFAULT -e '
+  my ($pid_path, $ready_path) = @ARGV;
+  my $first = fork();
+  exit 2 unless defined($first);
+  exit 0 if $first;
+  POSIX::setsid() >= 0 or exit 2;
+  my $second = fork();
+  exit 2 unless defined($second);
+  exit 0 if $second;
+  $SIG{TERM} = "IGNORE";
+  $SIG{INT} = "IGNORE";
+  POSIX::close($_) for (0, 1, 2, 9);
+  sysopen(my $pid, $pid_path, O_WRONLY | O_CREAT | O_EXCL, 0600) or exit 2;
+  print {$pid} "$$\n"; close($pid) or exit 2;
+  sysopen(my $ready, $ready_path, O_WRONLY | O_CREAT | O_EXCL, 0600) or exit 2;
+  print {$ready} "ready\n"; close($ready) or exit 2;
+  sleep 20;
+' "$CLOSED_MARKER_PID_FILE" "$CLOSED_MARKER_READY" || exit $?
+for (( close_wait = 0; close_wait < 300; close_wait++ )); do
+  [[ -e "$CLOSED_MARKER_READY" ]] && break
+  perl -e 'select undef, undef, undef, 0.01'
+done
+[[ -e "$CLOSED_MARKER_READY" ]] || exit 9
+printf 'NO\n'
+CLOSED_MARKER_SCRIPT
+chmod +x "$closed_marker_script"
+closed_marker_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+closed_marker_started=$SECONDS
+closed_marker_out="$(printf '%s' "$closed_marker_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+      CLOSED_MARKER_PID_FILE="$R/closed-marker.pid" \
+      CLOSED_MARKER_READY="$R/closed-marker-ready" \
+      VERDICT_CLASSIFIER_CMD="$closed_marker_script" \
+      perl -e 'alarm 8; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+closed_marker_rc=$?
+closed_marker_elapsed=$(( SECONDS - closed_marker_started ))
+closed_marker_decision="$(decision_from_output "$closed_marker_out")"
+closed_marker_pid="$(cat "$R/closed-marker.pid" 2>/dev/null || true)"
+closed_marker_live=no
+if [[ "$closed_marker_pid" =~ ^[1-9][0-9]*$ ]] \
+   && kill -0 "$closed_marker_pid" 2>/dev/null; then
+  closed_marker_live=yes
+fi
+kill_test_pids KILL "$closed_marker_pid"
+if [[ "$closed_marker_rc" -eq 0 \
+   && "$closed_marker_elapsed" -lt 8 \
+   && "$closed_marker_decision" == block \
+   && "$closed_marker_live" == no ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "bounded capture fails closed on a close_fds daemon escape"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s elapsed=%ss ready=%s decision=%s child_live=%s pid=%s out=%.80s)\n' \
+    "bounded capture accepted output after losing all daemon ownership channels" \
+    "$closed_marker_rc" "$closed_marker_elapsed" \
+    "$([[ -e "$R/closed-marker-ready" ]] && echo yes || echo no)" \
+    "$closed_marker_decision" "$closed_marker_live" "$closed_marker_pid" \
+    "$closed_marker_out"
+fi
+rm -rf "$R"
+
+# A TERM handler must not create an unowned late descendant. The isolation boundary
+# normally denies the fork; marker rescans remain the defense on a backend where that
+# child was already created before teardown froze the producer.
+R="$(setup)"; printf 'ALIEN TRANSCRIPT\n' > "$R/transcript.jsonl"
+late_escape_script="$R/late-term-escape.sh"
+cat > "$late_escape_script" <<'LATE_ESCAPE_SCRIPT'
+#!/usr/bin/env bash
+late_escape_on_term() {
+  trap - TERM
+  perl -MPOSIX -e '
+    my ($pid_path, $ready_path) = @ARGV;
+    POSIX::setsid() >= 0 or exit 2;
+    $SIG{TERM} = "IGNORE";
+    $SIG{INT} = "IGNORE";
+    open(STDOUT, ">", "/dev/null") or exit 2;
+    open(STDERR, ">", "/dev/null") or exit 2;
+    open(my $pid, ">", $pid_path) or exit 2;
+    print {$pid} "$$\n"; close($pid) or exit 2;
+    open(my $ready, ">", $ready_path) or exit 2;
+    print {$ready} "ready\n"; close($ready) or exit 2;
+    sleep 20;
+  ' "$LATE_ESCAPE_PID_FILE" "$LATE_ESCAPE_READY" &
+  for (( late_wait = 0; late_wait < 100; late_wait++ )); do
+    [[ -e "$LATE_ESCAPE_READY" ]] && break
+    perl -e 'select undef, undef, undef, 0.005'
+  done
+}
+trap late_escape_on_term TERM
+exec 1>&-
+sleep 20
+LATE_ESCAPE_SCRIPT
+chmod +x "$late_escape_script"
+late_escape_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+late_escape_started=$SECONDS
+late_escape_out="$(printf '%s' "$late_escape_payload" \
+  | (cd "$R" && CLAUDE_PROJECT_DIR="$R" VERDICT_GATE_HARD_BLOCK=1 \
+      LATE_ESCAPE_PID_FILE="$R/late-escape.pid" \
+      LATE_ESCAPE_READY="$R/late-escape-ready" \
+      VERDICT_EXTRACTOR_CMD="$late_escape_script" \
+      perl -e 'alarm 10; exec @ARGV' bash "$HOOK") 2>/dev/null)"
+late_escape_rc=$?
+late_escape_elapsed=$(( SECONDS - late_escape_started ))
+late_escape_pid="$(cat "$R/late-escape.pid" 2>/dev/null || true)"
+late_escape_live=no
+if [[ "$late_escape_pid" =~ ^[1-9][0-9]*$ ]] \
+   && kill -0 "$late_escape_pid" 2>/dev/null; then
+  late_escape_live=yes
+fi
+kill_test_pids KILL "$late_escape_pid"
+late_escape_safe=no
+if [[ ! -e "$R/late-escape-ready" && -z "$late_escape_pid" ]] \
+   || [[ -e "$R/late-escape-ready" && "$late_escape_live" == no ]]; then
+  late_escape_safe=yes
+fi
+if [[ "$late_escape_rc" -eq 0 \
+   && "$late_escape_elapsed" -lt 10 \
+   && "$late_escape_safe" == yes ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "teardown prevents or reaps a TERM-spawned setsid descendant"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s elapsed=%ss ready=%s child_live=%s pid=%s out=%.80s)\n' \
+    "bounded capture retired its marker before a late holder was reaped" \
+    "$late_escape_rc" "$late_escape_elapsed" \
+    "$([[ -e "$R/late-escape-ready" ]] && echo yes || echo no)" \
+    "$late_escape_live" "$late_escape_pid" "$late_escape_out"
+fi
+rm -rf "$R"
+
+# Transcript staging owns the inode created by its exclusive writer, not the pathname
+# forever. Swap each relevant filesystem type into the stable stage name immediately
+# before cleanup; the replacement must survive and the selected inode may be retired
+# only through its recorded device/inode authority.
+for transcript_stage_replacement_kind in regular directory symlink fifo; do
+  R="$(setup)"; write_transcript "$R" "All tests pass."
+  transcript_stage_env="$R/transcript-stage-replace-env.sh"
+  cat > "$transcript_stage_env" <<'TRANSCRIPT_STAGE_REPLACE_ENV'
+if [[ -z "${VERDICT_TRANSCRIPT_STAGE_REPLACE_ENV_LOADED:-}" ]]; then
+  export VERDICT_TRANSCRIPT_STAGE_REPLACE_ENV_LOADED=1
+  export VERDICT_TRANSCRIPT_STAGE_REPLACE_OWNER_PID="$$"
+  verdict_transcript_stage_replace_debug() {
+    [[ "$$" == "$VERDICT_TRANSCRIPT_STAGE_REPLACE_OWNER_PID" ]] || return 0
+    [[ "$BASH_COMMAND" == 'rm -f "$staged"'* \
+       || "$BASH_COMMAND" == 'cleanup_bounded_capture_destination "$staged"'* ]] \
+      || return 0
+    [[ "${staged:-}" == */verdict-stop-message.jsonl*.stage-* \
+       && -f "$staged" && ! -L "$staged" ]] || return 0
+    trap - DEBUG
+    mv "$staged" "${staged}.selected" || return 0
+    case "$VERDICT_TRANSCRIPT_STAGE_REPLACE_KIND" in
+      regular) printf 'replacement-sentinel\n' > "$staged" ;;
+      directory) mkdir "$staged" ;;
+      symlink) ln -s replacement-target "$staged" ;;
+      fifo) mkfifo "$staged" ;;
+      *) return 0 ;;
+    esac
+    printf '%s\n' "$staged" > "$VERDICT_TRANSCRIPT_STAGE_REPLACE_PATH"
+    : > "$VERDICT_TRANSCRIPT_STAGE_REPLACE_READY"
+  }
+  set -T
+  trap verdict_transcript_stage_replace_debug DEBUG
+fi
+TRANSCRIPT_STAGE_REPLACE_ENV
+  transcript_stage_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+    '{transcript_path:$p,hook_event_name:"Stop"}')"
+  transcript_stage_out="$(printf '%s' "$transcript_stage_payload" \
+    | (cd "$R" && BASH_ENV="$transcript_stage_env" CLAUDE_PROJECT_DIR="$R" \
+        VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_TRANSCRIPT_STAGE_REPLACE_KIND="$transcript_stage_replacement_kind" \
+        VERDICT_TRANSCRIPT_STAGE_REPLACE_PATH="$R/transcript-stage.path" \
+        VERDICT_TRANSCRIPT_STAGE_REPLACE_READY="$R/transcript-stage.ready" \
+        VERDICT_EXTRACTOR_CMD='printf "All tests pass.\n"' \
+        bash "$HOOK") 2>/dev/null)"
+  transcript_stage_rc=$?
+  transcript_stage_path="$(cat "$R/transcript-stage.path" 2>/dev/null || true)"
+  transcript_stage_preserved=no
+  case "$transcript_stage_replacement_kind" in
+    regular) [[ -f "$transcript_stage_path" && ! -L "$transcript_stage_path" \
+      && "$(cat "$transcript_stage_path" 2>/dev/null)" == replacement-sentinel ]] \
+      && transcript_stage_preserved=yes ;;
+    directory) [[ -d "$transcript_stage_path" && ! -L "$transcript_stage_path" ]] \
+      && transcript_stage_preserved=yes ;;
+    symlink) [[ -L "$transcript_stage_path" \
+      && "$(readlink "$transcript_stage_path")" == replacement-target ]] \
+      && transcript_stage_preserved=yes ;;
+    fifo) [[ -p "$transcript_stage_path" ]] && transcript_stage_preserved=yes ;;
+  esac
+  if [[ "$transcript_stage_rc" -eq 0 \
+     && -e "$R/transcript-stage.ready" \
+     && "$transcript_stage_preserved" == yes ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "transcript cleanup preserves a $transcript_stage_replacement_kind pathname replacement"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (rc=%s barrier=%s preserved=%s path=%s out=%.80s)\n' \
+      "transcript cleanup removed a $transcript_stage_replacement_kind replacement" \
+      "$transcript_stage_rc" \
+      "$([[ -e "$R/transcript-stage.ready" ]] && echo hit || echo missed)" \
+      "$transcript_stage_preserved" "$transcript_stage_path" "$transcript_stage_out"
+  fi
+  if [[ -n "$transcript_stage_path" ]]; then
+    rm -f "$transcript_stage_path" 2>/dev/null || rmdir "$transcript_stage_path" 2>/dev/null || true
+    rm -f "${transcript_stage_path}.selected" 2>/dev/null || true
+  fi
+  rm -rf "$R"
+done
+
+# Failure cleanup may retire only the exact output inode it selected. Swap that
+# inode for a sentinel immediately before the cleanup command, then inspect the
+# boundary at the following return before the caller performs its own teardown.
+R="$(setup)"; write_transcript "$R" "The culprit was the stale socket path all along."
+capture_replace_env="$R/capture-replace-env.sh"
+cat > "$capture_replace_env" <<'CAPTURE_REPLACE_ENV'
+if [[ -z "${VERDICT_CAPTURE_REPLACE_ENV_LOADED:-}" ]]; then
+  export VERDICT_CAPTURE_REPLACE_ENV_LOADED=1
+  capture_replace_state=waiting
+  verdict_capture_replacement_debug() {
+    if [[ "$capture_replace_state" == waiting \
+       && ( "$BASH_COMMAND" == 'rm -f "$destination"'* \
+         || "$BASH_COMMAND" == 'cleanup_bounded_capture_destination "$destination"'* ) \
+       && "${destination:-}" == */boxlite-verdict-classifier.*/output \
+       && -f "$destination" && ! -L "$destination" ]]; then
+      trap - DEBUG
+      mv "$destination" "${destination}.selected" || return 0
+      printf 'replacement-sentinel\n' > "$destination"
+      printf '%s\n' "$destination" > "$VERDICT_CAPTURE_REPLACE_PATH"
+      : > "$VERDICT_CAPTURE_REPLACE_READY"
+      capture_replace_state=swapped
+      trap verdict_capture_replacement_debug DEBUG
+      return 0
+    fi
+    if [[ "$capture_replace_state" == swapped \
+       && "$BASH_COMMAND" == 'return 1' ]]; then
+      trap - DEBUG
+      if [[ -f "$destination" \
+         && "$(cat "$destination" 2>/dev/null)" == replacement-sentinel ]]; then
+        printf 'preserved\n' > "$VERDICT_CAPTURE_REPLACE_RESULT"
+      else
+        printf 'removed\n' > "$VERDICT_CAPTURE_REPLACE_RESULT"
+      fi
+    fi
+  }
+  set -T
+  trap verdict_capture_replacement_debug DEBUG
+fi
+CAPTURE_REPLACE_ENV
+capture_replace_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+capture_replace_out="$(printf '%s' "$capture_replace_payload" \
+  | (cd "$R" && BASH_ENV="$capture_replace_env" CLAUDE_PROJECT_DIR="$R" \
+      VERDICT_GATE_HARD_BLOCK=1 \
+      VERDICT_CAPTURE_REPLACE_PATH="$R/capture-replace.path" \
+      VERDICT_CAPTURE_REPLACE_READY="$R/capture-replace.ready" \
+      VERDICT_CAPTURE_REPLACE_RESULT="$R/capture-replace.result" \
+      VERDICT_CLASSIFIER_CMD='printf "NO\n"; exit 7' \
+      bash "$HOOK") 2>/dev/null)"
+capture_replace_rc=$?
+capture_replace_result="$(cat "$R/capture-replace.result" 2>/dev/null || echo missing)"
+capture_replace_path="$(cat "$R/capture-replace.path" 2>/dev/null || true)"
+if [[ "$capture_replace_rc" -eq 0 \
+   && -e "$R/capture-replace.ready" \
+   && "$capture_replace_result" == preserved ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "capture failure cleanup preserves a pathname replacement"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s barrier=%s replacement=%s path=%s out=%.80s)\n' \
+    "capture failure cleanup unlinked a replacement inode" \
+    "$capture_replace_rc" \
+    "$([[ -e "$R/capture-replace.ready" ]] && echo hit || echo missed)" \
+    "$capture_replace_result" "$capture_replace_path" "$capture_replace_out"
+fi
+[[ -z "$capture_replace_path" ]] \
+  || rm -f "$capture_replace_path" "${capture_replace_path}.selected"
+rm -rf "$R"
+
+# Exact unlink must reject a pre-existing pathname replacement before selecting it.
+# This is type-independent: directories cannot be hardlinked back from quarantine,
+# while symlinks and FIFOs must likewise remain byte/type stable at the public path.
+for unlink_replacement_kind in directory symlink fifo; do
+  R="$(mktemp -d)"
+  unlink_target="$R/output"
+  printf 'owned\n' > "$unlink_target"
+  unlink_expected_identity="$(
+    source "$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+    verdict_audit_path_identity "$unlink_target"
+  )"
+  mv "$unlink_target" "$R/original"
+  case "$unlink_replacement_kind" in
+    directory) mkdir "$unlink_target" ;;
+    symlink)   ln -s replacement-target "$unlink_target" ;;
+    fifo)      mkfifo "$unlink_target" ;;
+  esac
+  (
+    source "$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+    verdict_audit_unlink_if_identity \
+      "$unlink_target" "$unlink_expected_identity" >/dev/null 2>&1
+  )
+  unlink_replacement_rc=$?
+  unlink_replacement_preserved=no
+  case "$unlink_replacement_kind" in
+    directory) [[ -d "$unlink_target" && ! -L "$unlink_target" ]] \
+      && unlink_replacement_preserved=yes ;;
+    symlink) [[ -L "$unlink_target" \
+      && "$(readlink "$unlink_target")" == replacement-target ]] \
+      && unlink_replacement_preserved=yes ;;
+    fifo) [[ -p "$unlink_target" ]] && unlink_replacement_preserved=yes ;;
+  esac
+  unlink_quarantine_count="$(find "$R" -maxdepth 1 \
+    -name 'output.unlink-*' -print | wc -l | tr -d ' ')"
+  if [[ "$unlink_replacement_rc" -eq 1 \
+     && "$unlink_replacement_preserved" == yes \
+     && "$unlink_quarantine_count" -eq 0 ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "exact unlink preserves a $unlink_replacement_kind replacement in place"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (rc=%s preserved=%s quarantine=%s)\n' \
+      "exact unlink selected a mismatched $unlink_replacement_kind" \
+      "$unlink_replacement_rc" "$unlink_replacement_preserved" \
+      "$unlink_quarantine_count"
+  fi
+  rm -rf "$R"
+done
+
+# A replacement that lands at the checked path immediately before selection must be
+# restored without clobbering. Wrap the production rename boundary deterministically;
+# the production identity/unlink protocol remains the code under test.
+R="$(mktemp -d)"
+unlink_target="$R/output"
+printf 'owned\n' > "$unlink_target"
+(
+  source "$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+  unlink_expected_identity="$(verdict_audit_path_identity "$unlink_target")"
+  unlink_selection_race_debug() {
+    if [[ "$BASH_COMMAND" == verdict_audit_rename_no_clobber_exact* \
+       && "${stable_path:-}" == "$unlink_target" \
+       && ! -e "$R/race-fired" ]]; then
+      trap - DEBUG
+      mv "$unlink_target" "$R/original"
+      printf 'replacement\n' > "$unlink_target"
+      : > "$R/race-fired"
+    fi
+  }
+  set -T
+  trap unlink_selection_race_debug DEBUG
+  verdict_audit_unlink_if_identity \
+    "$unlink_target" "$unlink_expected_identity" >/dev/null 2>&1
+  printf '%s\n' "$?" > "$R/race-rc"
+)
+unlink_race_rc="$(cat "$R/race-rc" 2>/dev/null || echo missing)"
+unlink_race_body="$(cat "$unlink_target" 2>/dev/null || echo missing)"
+if [[ -e "$R/race-fired" && "$unlink_race_rc" -eq 1 \
+   && "$unlink_race_body" == replacement ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "exact unlink restores a replacement swapped at selection"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (barrier=%s rc=%s body=%s)\n' \
+    "exact unlink lost a selection-race replacement" \
+    "$([[ -e "$R/race-fired" ]] && echo hit || echo missed)" \
+    "$unlink_race_rc" "$unlink_race_body"
+fi
+rm -rf "$R"
+
+# Identity validation is not deletion authority by itself. Swap each pathname type
+# into the selected quarantine immediately after the production validator returns
+# success. Cleanup must fail closed, preserve that replacement, and never report that
+# the displaced owned inode was consumed.
+for unlink_postcheck_kind in regular symlink fifo directory; do
+  R="$(mktemp -d)"
+  unlink_target="$R/output"
+  printf 'owned\n' > "$unlink_target"
+  (
+    source "$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+    unlink_expected_identity="$(verdict_audit_path_identity "$unlink_target")"
+    verdict_audit_selected_identity_matches() {
+      local selected_path="$1" expected_identity="$2" selected_rc
+      perl -e '
+        my ($path, $expected) = @ARGV;
+        exit 1 unless $expected =~ /\A[0-9]+:[0-9]+\z/;
+        my @selected = lstat($path);
+        exit 1 unless @selected;
+        exit(($selected[0] . ":" . $selected[1]) eq $expected ? 0 : 1);
+      ' "$selected_path" "$expected_identity"
+      selected_rc=$?
+      if [[ "$selected_rc" -eq 0 \
+         && "$selected_path" == "$unlink_target".unlink-* \
+         && ! -e "$R/postcheck-fired" ]]; then
+        mv "$selected_path" "$R/displaced-owned"
+        case "$unlink_postcheck_kind" in
+          regular) printf 'replacement\n' > "$selected_path" ;;
+          symlink) ln -s replacement-target "$selected_path" ;;
+          fifo) mkfifo "$selected_path" ;;
+          directory) mkdir "$selected_path" ;;
+        esac
+        printf '%s\n' "$selected_path" > "$R/replacement-path"
+        : > "$R/postcheck-fired"
+      fi
+      return "$selected_rc"
+    }
+    verdict_audit_unlink_if_identity \
+      "$unlink_target" "$unlink_expected_identity" >/dev/null 2>&1
+    printf '%s\n' "$?" > "$R/postcheck-rc"
+  )
+  unlink_postcheck_rc="$(cat "$R/postcheck-rc" 2>/dev/null || echo missing)"
+  unlink_postcheck_path="$(cat "$R/replacement-path" 2>/dev/null || true)"
+  # Failed retirement restores the selected replacement to the API's stable name.
+  # If restoration itself cannot publish, it remains at the selected quarantine.
+  [[ -e "$unlink_postcheck_path" || -L "$unlink_postcheck_path" ]] \
+    || unlink_postcheck_path="$unlink_target"
+  unlink_postcheck_preserved=no
+  case "$unlink_postcheck_kind" in
+    regular) [[ -f "$unlink_postcheck_path" && ! -L "$unlink_postcheck_path" \
+      && "$(cat "$unlink_postcheck_path" 2>/dev/null)" == replacement ]] \
+      && unlink_postcheck_preserved=yes ;;
+    symlink) [[ -L "$unlink_postcheck_path" \
+      && "$(readlink "$unlink_postcheck_path")" == replacement-target ]] \
+      && unlink_postcheck_preserved=yes ;;
+    fifo) [[ -p "$unlink_postcheck_path" ]] && unlink_postcheck_preserved=yes ;;
+    directory) [[ -d "$unlink_postcheck_path" && ! -L "$unlink_postcheck_path" ]] \
+      && unlink_postcheck_preserved=yes ;;
+  esac
+  if [[ -e "$R/postcheck-fired" \
+     && "$unlink_postcheck_rc" -ne 0 \
+     && "$unlink_postcheck_preserved" == yes \
+     && "$(cat "$R/displaced-owned" 2>/dev/null)" == owned ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "exact unlink preserves a post-validation $unlink_postcheck_kind replacement"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (barrier=%s rc=%s preserved=%s owned=%s path=%s)\n' \
+      "exact unlink removed a post-validation $unlink_postcheck_kind replacement" \
+      "$([[ -e "$R/postcheck-fired" ]] && echo hit || echo missed)" \
+      "$unlink_postcheck_rc" "$unlink_postcheck_preserved" \
+      "$(cat "$R/displaced-owned" 2>/dev/null || echo missing)" \
+      "$unlink_postcheck_path"
+  fi
+  rm -rf "$R"
+done
+
+# The epoch-bound publisher owns both its new staging inode and the prior record it
+# selected. Race a regular replacement into each checked cleanup name after validation;
+# the replacement must remain published at that private pathname and the hook must not
+# claim successful retirement of the displaced inode.
+for publish_cleanup_kind in staged prior; do
+  R="$(setup)"; write_transcript "$R" "Which retry policy do you prefer here?"
+  mkdir -p "$R/.agents/state"
+  if [[ "$publish_cleanup_kind" == prior ]]; then
+    printf 'old-identity\n' > "$R/.agents/state/verdict-last-uuid"
+  fi
+  publish_cleanup_env="$R/publish-cleanup-env.sh"
+  cat > "$publish_cleanup_env" <<'PUBLISH_CLEANUP_ENV'
+if [[ -z "${VERDICT_PUBLISH_CLEANUP_ENV_LOADED:-}" ]]; then
+  export VERDICT_PUBLISH_CLEANUP_ENV_LOADED=1
+  export VERDICT_PUBLISH_CLEANUP_OWNER_PID="$$"
+  verdict_publish_cleanup_debug() {
+    [[ "$$" == "$VERDICT_PUBLISH_CLEANUP_OWNER_PID" ]] || return 0
+    [[ "$BASH_COMMAND" == verdict_audit_unlink_selected_identity* \
+       && -n "${stable_path:-}" && -n "${selected_path:-}" \
+       && -e "$selected_path" && ! -L "$selected_path" ]] || return 0
+    case "$VERDICT_PUBLISH_CLEANUP_KIND" in
+      staged) [[ "$stable_path" == *.stage-* ]] || return 0 ;;
+      prior) [[ "$stable_path" == *.prior-* ]] || return 0 ;;
+      *) return 0 ;;
+    esac
+    trap - DEBUG
+    mv "$selected_path" "$VERDICT_PUBLISH_CLEANUP_OWNED" || return 0
+    printf 'replacement\n' > "$selected_path"
+    printf '%s\n' "$stable_path" > "$VERDICT_PUBLISH_CLEANUP_PATH"
+    : > "$VERDICT_PUBLISH_CLEANUP_READY"
+  }
+  set -T
+  trap verdict_publish_cleanup_debug DEBUG
+fi
+PUBLISH_CLEANUP_ENV
+  publish_cleanup_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+    '{transcript_path:$p,hook_event_name:"Stop"}')"
+  publish_cleanup_out="$(printf '%s' "$publish_cleanup_payload" \
+    | (cd "$R" && BASH_ENV="$publish_cleanup_env" CLAUDE_PROJECT_DIR="$R" \
+        VERDICT_GATE_HARD_BLOCK=1 \
+        VERDICT_PUBLISH_CLEANUP_KIND="$publish_cleanup_kind" \
+        VERDICT_PUBLISH_CLEANUP_OWNED="$R/publish-cleanup-owned" \
+        VERDICT_PUBLISH_CLEANUP_PATH="$R/publish-cleanup.path" \
+        VERDICT_PUBLISH_CLEANUP_READY="$R/publish-cleanup.ready" \
+        VERDICT_CLASSIFIER_CMD=false bash "$HOOK") 2>/dev/null)"
+  publish_cleanup_rc=$?
+  publish_cleanup_path="$(cat "$R/publish-cleanup.path" 2>/dev/null || true)"
+  if [[ "$publish_cleanup_rc" -eq 0 \
+     && -e "$R/publish-cleanup.ready" \
+     && -f "$publish_cleanup_path" && ! -L "$publish_cleanup_path" \
+     && "$(cat "$publish_cleanup_path" 2>/dev/null)" == replacement \
+     && -f "$R/publish-cleanup-owned" ]]; then
+    pass=$((pass+1)); printf '  PASS  %s\n' \
+      "epoch publisher preserves a post-validation $publish_cleanup_kind replacement"
+  else
+    fail=$((fail+1)); printf '  FAIL  %s  (rc=%s barrier=%s path=%s preserved=%s out=%.80s)\n' \
+      "epoch publisher deleted a post-validation $publish_cleanup_kind replacement" \
+      "$publish_cleanup_rc" \
+      "$([[ -e "$R/publish-cleanup.ready" ]] && echo hit || echo missed)" \
+      "$publish_cleanup_path" \
+      "$([[ -f "$publish_cleanup_path" ]] && cat "$publish_cleanup_path" || echo missing)" \
+      "$publish_cleanup_out"
+  fi
+  rm -rf "$R"
+done
+
+# Identity publication is part of the exclusive writer transaction. If its stdout is
+# closed, the writer must fail and retract only the exact inode it opened.
+R="$(mktemp -d)"
+identity_stdout_target="$R/output"
+(
+  source "$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+  printf 'captured\n' \
+    | verdict_audit_write_exclusive_regular_identity \
+        "$identity_stdout_target" >&-
+) 2>/dev/null
+identity_stdout_rc=$?
+if [[ "$identity_stdout_rc" -ne 0 && ! -e "$identity_stdout_target" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "identity writer retracts its inode when identity publication fails"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s destination=%s)\n' \
+    "identity writer reported success without cleanup authority" \
+    "$identity_stdout_rc" \
+    "$([[ -e "$identity_stdout_target" ]] && echo leaked || echo absent)"
+fi
+rm -rf "$R"
+
+# Snapshot identity publication is the caller's sole cleanup authority. If that
+# sidecar cannot cross stdout, the producer must retract its exact stage inode rather
+# than leave a pathname the failed caller cannot safely own.
+R="$(setup)"; write_transcript "$R" "All tests pass."
+snapshot_identity_stdout_target="$R/snapshot-output"
+(
+  source "$REPO_ROOT/.agents/lib/verdict-audit-state.sh"
+  verdict_audit_snapshot_final_turn_identity \
+    "$R/transcript.jsonl" "$snapshot_identity_stdout_target" \
+    67108864 262144 >&-
+) 2>/dev/null
+snapshot_identity_stdout_rc=$?
+if [[ "$snapshot_identity_stdout_rc" -ne 0 \
+   && ! -e "$snapshot_identity_stdout_target" ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "snapshot writer retracts its inode when identity publication fails"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (rc=%s destination=%s)\n' \
+    "snapshot writer leaked an inode without cleanup authority" \
+    "$snapshot_identity_stdout_rc" \
+    "$([[ -e "$snapshot_identity_stdout_target" ]] && echo leaked || echo absent)"
+fi
+rm -rf "$R"
+
+# The capture facade may succeed only with a valid identity sidecar. Corrupt that
+# private record at the exact read boundary: classifier NO must be discarded and the
+# regex fallback must still block the verdict.
+R="$(setup)"; write_transcript "$R" "All tests pass."
+identity_sidecar_env="$R/identity-sidecar-env.sh"
+cat > "$identity_sidecar_env" <<'IDENTITY_SIDECAR_ENV'
+if [[ -z "${VERDICT_IDENTITY_SIDECAR_ENV_LOADED:-}" ]]; then
+  export VERDICT_IDENTITY_SIDECAR_ENV_LOADED=1
+  identity_sidecar_debug() {
+    [[ "$BASH_COMMAND" == 'destination_identity="$(verdict_audit_read_single_record '* ]] \
+      || return 0
+    trap - DEBUG
+    : > "$destination_identity_file"
+    : > "$VERDICT_IDENTITY_SIDECAR_READY"
+  }
+  set -T
+  trap identity_sidecar_debug DEBUG
+fi
+IDENTITY_SIDECAR_ENV
+identity_sidecar_payload="$(jq -nc --arg p "$R/transcript.jsonl" \
+  '{transcript_path:$p,hook_event_name:"Stop"}')"
+identity_sidecar_out="$(printf '%s' "$identity_sidecar_payload" \
+  | (cd "$R" && BASH_ENV="$identity_sidecar_env" CLAUDE_PROJECT_DIR="$R" \
+      VERDICT_GATE_HARD_BLOCK=1 \
+      VERDICT_IDENTITY_SIDECAR_READY="$R/identity-sidecar-ready" \
+      VERDICT_CLASSIFIER_CMD='printf "NO\n"' bash "$HOOK") 2>/dev/null)"
+identity_sidecar_decision="$(decision_from_output "$identity_sidecar_out")"
+if [[ -e "$R/identity-sidecar-ready" \
+   && "$identity_sidecar_decision" == block ]]; then
+  pass=$((pass+1)); printf '  PASS  %s\n' \
+    "capture rejects a missing destination identity sidecar"
+else
+  fail=$((fail+1)); printf '  FAIL  %s  (barrier=%s decision=%s out=%.100s)\n' \
+    "capture accepted output without cleanup authority" \
+    "$([[ -e "$R/identity-sidecar-ready" ]] && echo hit || echo missed)" \
+    "$identity_sidecar_decision" "$identity_sidecar_out"
+fi
+rm -rf "$R"
 
 echo
 echo "## Chinese fallback patterns"

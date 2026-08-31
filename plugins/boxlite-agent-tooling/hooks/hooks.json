@@ -6,10 +6,6 @@
           {
             "type": "command",
             "command": "/usr/bin/env bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/.agents/hooks/cancel-verdict-audit.sh\""
-          },
-          {
-            "type": "command",
-            "command": "/usr/bin/env bash \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/.agents/hooks/rule-recency.sh\""
           }
         ]
       }

@@ -63,6 +63,13 @@ quarantine_counter=0
 audit_verified_file=""
 audit_verified_identity=""
 audit_success_pending=false
+transcript_snapshot_dir=""
+transcript_snapshot_path=""
+transcript_source_max_bytes=67108864
+transcript_turn_max_bytes=262144
+previous_dossier_max_bytes=65536
+previous_dossier_input_path=""
+previous_dossier_snapshot_path=""
 
 audit_state_lib="$tooling_root/.agents/lib/verdict-audit-state.sh"
 if [[ ! -r "$audit_state_lib" ]]; then
@@ -373,6 +380,18 @@ stop_request_monitor() {
 cleanup_audit_lock() {
   local original_status=$? body owner_pid owner_token extra _ lease_status=0
   local control_cleanup_failed=false
+  if [[ -n "$transcript_snapshot_path" ]]; then
+    rm -f "$transcript_snapshot_path" 2>/dev/null || true
+    transcript_snapshot_path=""
+  fi
+  if [[ -n "$transcript_snapshot_dir" ]]; then
+    rmdir "$transcript_snapshot_dir" 2>/dev/null || true
+    transcript_snapshot_dir=""
+  fi
+  if [[ -n "$previous_dossier_snapshot_path" ]]; then
+    rm -f "$previous_dossier_snapshot_path" 2>/dev/null || true
+    previous_dossier_snapshot_path=""
+  fi
   if [[ "$auditor_control_started" == true ]]; then
     control_terminal="${audit_verdict:-unavailable}"
     (( original_status == 0 )) || control_terminal=unavailable
@@ -687,6 +706,76 @@ request_cancel() {  # exit-code reason [publish-tombstone]
   cancel_audit "$1" "$2" "${3:-false}"
 }
 
+# Select one stable regular transcript inode and give the auditor a private bounded
+# snapshot. This keeps a live transcript append, pathname swap, FIFO, or symlink from
+# changing what the prompt names after the boundary check.
+snapshot_transcript() {
+  local created_snapshot_dir selected_snapshot selected_json normalized_snapshot
+  local normalized_bytes
+  created_snapshot_dir="$(mktemp -d \
+    "${TMPDIR:-/tmp}/boxlite-verdict-transcript.XXXXXX" 2>/dev/null)" || return 1
+  transcript_snapshot_dir="$created_snapshot_dir"
+  chmod 700 "$transcript_snapshot_dir" 2>/dev/null || return 1
+  transcript_snapshot_dir="$(cd "$transcript_snapshot_dir" && pwd -P)" || return 1
+  transcript_snapshot_path="$transcript_snapshot_dir/transcript.jsonl"
+  selected_snapshot="$(verdict_audit_read_regular_state \
+    "$transcript_path" "$transcript_turn_max_bytes" json 2>/dev/null)" \
+    || selected_snapshot=""
+  selected_json=""
+  [[ "$selected_snapshot" == *$'\n'* ]] \
+    && selected_json="${selected_snapshot#*$'\n'}"
+  normalized_snapshot="$(printf '%s' "$selected_json" \
+    | verdict_audit_normalize_turn_snapshot \
+        "$transcript_turn_max_bytes" 2>/dev/null || true)"
+  if [[ -n "$normalized_snapshot" ]]; then
+    normalized_bytes="$(LC_ALL=C printf '%s\n' "$normalized_snapshot" \
+      | wc -c | tr -d ' ')"
+    if [[ ! "$normalized_bytes" =~ ^[0-9]+$ \
+       || "$normalized_bytes" -gt "$transcript_turn_max_bytes" ]] \
+       || ! printf '%s\n' "$normalized_snapshot" \
+            | verdict_audit_write_exclusive_regular \
+                "$transcript_snapshot_path" 2>/dev/null; then
+      return 1
+    fi
+  elif ! verdict_audit_snapshot_final_turn \
+        "$transcript_path" "$transcript_snapshot_path" \
+        "$transcript_source_max_bytes" "$transcript_turn_max_bytes"; then
+    printf 'run-verdict-audit.sh: transcript must be stable, regular JSONL no larger than %s bytes; auditor was not started.\n' \
+      "$transcript_source_max_bytes" >&2
+    return 1
+  fi
+  transcript_path="$transcript_snapshot_path"
+}
+
+snapshot_previous_dossier() {
+  local previous_snapshot previous_json previous_input
+  previous_dossier_snapshot_path="${previous_verdict_file}.input-${audit_token}"
+  if [[ -e "$previous_verdict_file" || -L "$previous_verdict_file" ]]; then
+    previous_snapshot="$(verdict_audit_read_regular_state \
+      "$previous_verdict_file" "$previous_dossier_max_bytes" json 2>/dev/null)" \
+      || previous_snapshot=""
+    previous_json=""
+    [[ "$previous_snapshot" == *$'\n'* ]] \
+      && previous_json="${previous_snapshot#*$'\n'}"
+    previous_json="$(printf '%s' "$previous_json" \
+      | verdict_audit_normalize_dossier 2>/dev/null || true)"
+    if [[ -z "$previous_json" ]]; then
+      previous_input="$(verdict_audit_failed_prior_snapshot)" || return 1
+    else
+      previous_input="$previous_json"
+    fi
+  else
+    previous_input="$(verdict_audit_absent_prior_snapshot)" || return 1
+  fi
+  if ! printf '%s\n' "$previous_input" \
+      | verdict_audit_write_exclusive_regular \
+          "$previous_dossier_snapshot_path" 2>/dev/null; then
+    previous_dossier_snapshot_path=""
+    return 1
+  fi
+  previous_dossier_input_path="$previous_dossier_snapshot_path"
+}
+
 take_audit_lock() {
   local status
   trap cleanup_audit_lock EXIT
@@ -712,6 +801,13 @@ take_audit_lock() {
 take_audit_lock
 if ! audit_request_is_current; then
   cancel_audit 130 "the audit generation was revoked before launch"
+fi
+if ! snapshot_transcript; then
+  exit 2
+fi
+if ! snapshot_previous_dossier; then
+  printf 'run-verdict-audit.sh: could not publish a bounded prior-dossier snapshot.\n' >&2
+  exit 2
 fi
 if [[ "$session_scope" != "-" ]]; then
   audit_prompt_epoch="$(verdict_audit_read_single_record \
@@ -796,11 +892,22 @@ if [[ ! -r "$subagent_lib" ]]; then
 fi
 # shellcheck source=../lib/subagent.sh
 source "$subagent_lib"
+expected_branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || printf '')"
+expected_head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf '')"
+task_input_json="$(jq -nc \
+  --arg repo_root "$repo_root" \
+  --arg transcript_path "$transcript_path" \
+  --arg dossier_path "$audit_output_file" \
+  --arg previous_dossier_path "$previous_dossier_input_path" \
+  --arg audit_generation "$audit_generation" \
+  --arg expected_branch "$expected_branch" \
+  --arg expected_head "$expected_head" \
+  '{repo_root:$repo_root, transcript_path:$transcript_path,
+    dossier_path:$dossier_path, previous_dossier_path:$previous_dossier_path,
+    audit_generation:$audit_generation, expected_branch:$expected_branch,
+    expected_head:$expected_head}')"
 if ! audit_prompt="$(subagent_prompt verdict-runner "$tooling_root" \
-                      "verdict_file=${audit_output_file}" \
-                      "previous_verdict_file=${previous_verdict_file}" \
-                      "audit_generation=${audit_generation}" \
-                      "transcript_path=${transcript_path}")"; then
+                      "task_input_json=${task_input_json}")"; then
   printf 'run-verdict-audit.sh: could not load .agents/prompts/verdict-runner.md.\n' >&2
   exit 2
 fi
@@ -1003,6 +1110,15 @@ fail_audit_publication() {  # diagnostic
 export VERDICT_AUDITOR_OUTPUT_FILE="$audit_output_file"
 export VERDICT_AUDITOR_GENERATION="$audit_generation"
 if [[ -n "${VERDICT_AUDITOR_CMD:-}" ]]; then
+  if [[ ! -r "$spec_file" ]]; then
+    printf 'run-verdict-audit.sh: missing %s — cannot load the audit procedure.\n' \
+      "$spec_file" >&2
+    exit 2
+  fi
+  spec_body="$(strip_frontmatter "$spec_file")"
+  # The stable procedure comes first so repeated headless audits can reuse that prefix;
+  # only the bounded runner task and its JSON input vary by generation.
+  audit_prompt="${spec_body}"$'\n\n'"${audit_prompt}"
   audit_started=true
   remove_owned_verdict
   rm -f "$audit_output_file"
@@ -1020,15 +1136,16 @@ elif command -v claude >/dev/null 2>&1 && [[ -r "$spec_file" ]]; then
   remove_owned_verdict
   rm -f "$audit_output_file"
   spec_body="$(strip_frontmatter "$spec_file")"
-  # perl alarm = portable timeout; disableAllHooks so the audit run cannot recurse
-  # into this repo's own gates.
+  # Safe mode retains OAuth/keychain auth while dropping project/plugin/memory/hook
+  # context. Replace the coding-agent prompt with the stripped auditor procedure and
+  # expose only its three required tools; --name suppresses a separate title request.
+  # perl alarm remains the portable outer timeout for the complete agent/tool loop.
   if ! run_in_audit_group \
       "$audit_prompt" \
       perl -e 'alarm shift; exec @ARGV' "$audit_timeout_seconds" \
-        claude -p --model "$auditor_model" \
-          --append-system-prompt "$spec_body" \
-          --allowedTools "Read" "Bash" "Write" \
-          --settings '{"disableAllHooks":true}'; then
+        claude -p --safe-mode --system-prompt "$spec_body" \
+          --tools Read Bash Write --effort xhigh --name verdict-auditor \
+          --no-session-persistence --model "$auditor_model"; then
     rm -f "$audit_output_file"
     remove_owned_verdict while-current
     echo "run-verdict-audit.sh: auditor process group ended without a usable completion" >&2
