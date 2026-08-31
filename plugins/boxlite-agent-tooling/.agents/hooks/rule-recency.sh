@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Standalone UserPromptSubmit text hook. Full plugin manifests intentionally do not
 # wire it; consumers opt in through templates/{codex-hooks,claude-settings}.json.
-# Bare acknowledgements are silent. Every substantive prompt gets the same compact
-# reminder. No counter, session state, model call, plugin path, or sibling file.
+# Bare acknowledgements, answers, and controls add no reminder. Every substantive
+# prompt gets the same compact reminder. No counter, session state, model call,
+# plugin path, or sibling file.
 # Best effort: this hook never blocks a prompt and always exits zero.
 
 payload="$(cat)"
 prompt="$(printf '%s' "$payload" \
   | sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)"
-ack="$(printf '%s' "$prompt" \
+bare_reply="$(printf '%s' "$prompt" \
   | tr '[:upper:]' '[:lower:]' \
   | tr -d '[:punct:]' \
   | tr -s '[:space:]' ' ' \
@@ -19,7 +20,7 @@ prompt_has_escaped_quote=false
 [[ "$payload" == *'\"'* ]] && prompt_has_escaped_quote=true
 
 if [[ "$prompt_has_escaped_quote" == false ]]; then
-  case " $ack " in
+  case " $bare_reply " in
   " ok "|" okay "|" k "|" kk "|" yes "|" yep "|" yeah "|" ya "|" yup "| \
   " no "|" nope "|" sure "|" cool "|" nice "|" got it "|" thanks "| \
   " thank you "|" ty "|" thx "|" proceed "|" continue "|" go "| \
@@ -31,11 +32,12 @@ fi
 
 cat <<'EOF'
 REPLY SHAPE:
-- <=80 prose words. Exempt code, diagrams, tables, paths, uncertainty, risk, and failing tests.
-- No preamble, recap, praise, or closing offer.
-- Draw any relationship or 3+ entities; code hops: `fn (Type, file:LOC) - role`, then one Key line.
-- Render only fenced ASCII or narrow tables; no Mermaid, images, or task boxes.
+- <=80 prose words; exempt code, visuals, tables, paths, uncertainty, risk, failing tests.
+- No preamble, recap, praise, repetition, or closing offer.
+- Prefer a renderable diagram, graph, image, or table over prose when clearer.
+- Visualize relationships or 3+ entities. Code: `fn (Type, file:LOC) - role`; one Key line.
+- Any subject: if abstract, unfamiliar, or unclear, use a brief concrete example tied to the general rule; skip it when unhelpful.
 - Explicit depth requests lift the cap; bare why does not.
-- For non-trivial work follow the repository Workflow and research prior art before design.
+- Non-trivial work: follow repository Workflow; research prior art before design.
 EOF
 exit 0

@@ -32,12 +32,24 @@ assert_contains() {
   esac
 }
 
-printf '## Bare acknowledgements are silent\n'
+assert_not_contains() {
+  case "$2" in
+    *"$3"*) bad "$1 (unexpected: $3)" ;;
+    *) ok "$1" ;;
+  esac
+}
+
+printf '## Bare acknowledgements, answers, and controls are silent\n'
 i=0
-for prompt in ok okay yes yep sure proceed continue thanks "thank you" thx \
-              "go ahead" "done" next nvm "OK." "Thanks!" "  proceed  "; do
+for prompt in ok okay k kk yes yep yeah ya yup no nope sure cool nice "got it" \
+              thanks "thank you" ty thx proceed continue go "go ahead" "go on" \
+              "done" next stop nvm; do
   i=$((i + 1))
   assert_skip "skip '$prompt'" "$(emit "ack-$i" "$prompt")"
+done
+for prompt in "OK." "Thanks!" "  proceed  "; do
+  i=$((i + 1))
+  assert_skip "skip normalized '$prompt'" "$(emit "normalized-$i" "$prompt")"
 done
 
 printf '\n## Substantive prompts get the same compact, stateless reminder\n'
@@ -53,6 +65,11 @@ if [[ "$first" == "$second" ]]; then
 else
   bad "output is independent of session cadence"
 fi
+for prompt in "ok explain it" "yes because it failed" "stop the server" \
+              "next invoice" "thanks, explain invoices"; do
+  assert_contains "do not suppress substantive near-match '$prompt'" \
+    "$(emit "near-match" "$prompt")" "REPLY SHAPE:"
+done
 
 bytes="$(LC_ALL=C printf '%s' "$first" | wc -c | tr -d ' ')"
 if (( bytes <= 640 )); then
@@ -63,10 +80,26 @@ fi
 
 assert_contains "keeps reply-shape marker" "$first" "REPLY SHAPE:"
 assert_contains "keeps prose budget" "$first" "<=80"
-assert_contains "keeps evidence exemptions" "$first" "uncertainty, risk, and failing tests"
-assert_contains "keeps no-preamble rule" "$first" "No preamble"
-assert_contains "keeps relationship drawing rule" "$first" "relationship or 3+ entities"
-assert_contains "keeps renderable-output rule" "$first" "fenced ASCII or narrow tables"
+assert_contains "keeps evidence exemptions" "$first" \
+  "code, visuals, tables, paths, uncertainty, risk, failing tests"
+assert_contains "keeps concise-prose rule" "$first" \
+  "No preamble, recap, praise, repetition, or closing offer."
+assert_contains "prefers renderable visuals when clearer" "$first" \
+  "renderable diagram, graph, image, or table over prose when clearer"
+assert_contains "visualizes relationships first" "$first" \
+  "Visualize relationships or 3+ entities"
+assert_contains "examples apply to any subject" "$first" "Any subject:"
+assert_contains "uses examples for difficult ideas" "$first" \
+  "if abstract, unfamiliar, or unclear"
+assert_contains "requires a brief concrete example" "$first" \
+  "use a brief concrete example"
+assert_contains "connects examples to the general rule" "$first" \
+  "tied to the general rule"
+assert_contains "skips unhelpful examples" "$first" "skip it when unhelpful"
+assert_not_contains "does not force examples into every explanation" "$first" \
+  "Ground every explanation"
+assert_not_contains "does not ban supported render formats" "$first" \
+  "no Mermaid, images, or task boxes"
 assert_contains "keeps depth escape hatch" "$first" "bare why does not"
 assert_contains "keeps host-neutral workflow pointer" "$first" "repository Workflow"
 assert_contains "keeps research-before-design" "$first" "research prior art before design"
