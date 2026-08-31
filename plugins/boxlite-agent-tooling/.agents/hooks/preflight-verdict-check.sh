@@ -14,12 +14,13 @@
 #
 # Flow:
 #   1. Dossier present, binding fresh + matching:
-#        PASS         -> allow (consumed)
+#        PASS         -> allow silently (consumed)
 #        IN_PROGRESS  -> allow with note (consumed)
 #        FAIL         -> block with the findings — THE one legitimate loop: it
 #                        persists until the findings are addressed and a re-audit
 #                        passes. A loop driven by real findings is the point.
-#   1b. No dossier, but run-verdict-audit.sh is RUNNING — audit_in_flight() decides,
+#   1b. No dossier, but an older/asynchronous run-verdict-audit.sh is RUNNING —
+#        audit_in_flight() decides,
 #        on the lock's presence, its PID's liveness AND its freshness bound:
 #        allow — the answer is being computed and no amount of re-blocking speeds it
 #        up. Its verdict gates the NEXT turn end.
@@ -40,7 +41,8 @@
 #           must take on trust, with nothing shown that produced it?" A
 #           fast model (haiku) answers YES/NO; when no model is reachable the static
 #           pattern list below decides (deterministic fallback, e.g. sessions without
-#           a model CLI). YES -> block with the audit instruction; NO -> allow
+#           a model CLI). YES -> run the independent audit inside this Stop invocation;
+#           PASS emits nothing, FAIL blocks with concise findings. NO -> allow
 #           (announced to the human via systemMessage, invisible to the model).
 #           Turns over 12 KB skip this duplicate model input and block for the
 #           file-backed auditor instead.
@@ -81,16 +83,12 @@
 #   VERDICT_CLASSIFIER_CMD overrides the classifier (tests use stubs; set it to
 #   `false` to force the regex path).
 #
-# * KNOWN TRAP, unfixed: "never toward a trap" covers CLASSIFIER failure only. When the
-#   AUDITOR is unreachable, run-verdict-audit.sh exits 1 with no dossier and no rung
-#   tells that apart from "no audit attempted", so the turn cannot end until the API
-#   recovers. Needs the runner to signal unavailability.
-#
 # * Why no loop can form: validation runs BEFORE detection, binding mismatches discard,
-#   and audit_in_flight() allows while the bash runner works. FAIL-with-findings is the
-#   only repeating block, which is the requirement. A Task-launched auditor leaves no
-#   process to observe and so still re-blocks. Do NOT re-derive this from "the audit is
-#   synchronous" — that instructs the model, and the harness ignores it.
+#   and detection invokes the runner synchronously. The runner owns cancellation and
+#   publishes a generation-bound dossier; this hook re-enters its hardened validator.
+#   PASS consumes the dossier with empty stdout. FAIL-with-findings is the only repeating
+#   block, and unchanged session-scoped text reuses that FAIL instead of re-running the
+#   model. A revised message receives a new generation and a new audit.
 #
 # * Tree-hash binding: at stop time the work is usually UNCOMMITTED (HEAD has not
 #   moved), so HEAD alone can't tell "audited" from "changed since audit". The dossier
@@ -101,8 +99,9 @@
 #   while a chat ending after the tree moved is not trapped.
 #
 # * One-shot consumption: the dossier is `rm -f`'d on every exit path except a
-#   fresh+matching FAIL (kept so the finding-driven block persists across attempts
-#   to end without addressing it).
+#   fresh+matching session-scoped FAIL (kept so the finding-driven block persists across
+#   unchanged retries). A legacy caller has no message binding, so its FAIL is one-shot;
+#   retaining it would poison unrelated later turns.
 #
 # * Soft mode is NOT enforcement: the Stop hook's systemMessage is shown to the HUMAN
 #   only — the model never sees it (documented hook contract; only a block's `reason`
@@ -217,7 +216,6 @@ decision_log="$(verdict_audit_state_path "$state_dir/verdict-decisions.log" "$se
 # shape the independent auditor already consumes. This is gitignored runtime state,
 # not evidence invented by the gate: the text is copied byte-for-byte from the event.
 payload_transcript_file="$(verdict_audit_state_path "$state_dir/verdict-stop-message.jsonl" "$session_scope")"
-prior_audit_input_file="$(verdict_audit_state_path "$state_dir/verdict-previous-dossier.json" "$session_scope")"
 prompt_epoch_file="$(verdict_audit_state_path "$state_dir/verdict-prompt-epoch" "$session_scope")"
 # Published by run-verdict-audit.sh while it holds the adjacent kernel lease. The first
 # two fields are runner PID + deadline; later fields bind session, owner, and generation.
@@ -236,9 +234,7 @@ classifier_output_max_bytes=4096
 verdict_output_max_bytes=8192
 transcript_source_max_bytes=67108864
 transcript_turn_max_bytes=262144
-previous_dossier_max_bytes=65536
 transcript_snapshot_truncated=false
-prior_dossier_present=false
 
 # UserPromptSubmit atomically advances this session epoch before it waits for any gate
 # mutex. This Stop invocation may trust authority only while the entry snapshot remains
@@ -255,6 +251,7 @@ read_prompt_epoch() {
   printf '%s' "$epoch"
 }
 entry_prompt_epoch="$(read_prompt_epoch 2>/dev/null)" || entry_prompt_epoch=""
+reentry_prompt_epoch="${VERDICT_STOP_REENTRY_EPOCH:-}"
 prompt_epoch_is_current() {
   [[ "$session_scope" == "-" ]] && return 0
   [[ -n "$entry_prompt_epoch" ]] || return 1
@@ -671,6 +668,18 @@ block() {
   fi
   exit 0
 }
+
+# audit_before_stop() re-enters this validator after the runner returns. Bind that child
+# to the outer Stop's prompt epoch: a prompt arriving in the narrow fork/exec gap must
+# release the abandoned Stop, not let the child adopt the new epoch and re-audit old text.
+if [[ -n "$reentry_prompt_epoch" ]]; then
+  if [[ "$reentry_prompt_epoch" != "-" \
+     && ! "$reentry_prompt_epoch" =~ ^[1-9][0-9]*-[1-9][0-9]*-[0-9]+$ ]]; then
+    printf 'preflight-verdict-check: invalid Stop re-entry prompt epoch.\n' >&2
+    exit 1
+  fi
+  [[ "$entry_prompt_epoch" == "$reentry_prompt_epoch" ]] || allow
+fi
 
 # Content-addressed hash of the full working tree (tracked + untracked, full
 # content), via a throwaway index. Deterministic and read-only w.r.t. the real
@@ -1211,37 +1220,15 @@ verdict_patterns+='|没有(问题|异常|回归)'
 verdict_patterns+='|已(修复|解决|完成|验证)'
 verdict_patterns+='|(部署|服务|线上)(正常|健康|稳定)'
 
-# ── Shared re-audit instruction (used by every block path) ───────────────────
-# The block `reason`s below are the gate's UX + anti-cheating contract — what Claude
-# reads when a verdict is detected unaudited, or a declared verdict FAILed. Invariants:
-#   • Direct Claude to invoke the verdict-auditor subagent SYNCHRONOUSLY (Task with
-#     run_in_background: false) — a background audit's completion event is what
-#     created the #892 loop; a synchronous audit keeps audit and verdict in one turn.
-#   • The AUDITOR — not Claude — writes ${verdict_file}. Claude must not write or
-#     hand-edit the dossier (that is grading its own homework / confabulating proof).
-#   • Offer the honest exits: IN_PROGRESS if not actually done; a `blocked` proof
-#     entry (with residual risk) if proof genuinely can't be produced in this env.
-#   • After the auditor reports, deliver the intended user-facing answer again. PASS
-#     repeats the blocked text so its checksum stays bound; FAIL revises and re-audits.
-#     Hook feedback and audit metadata are control-plane output, not the conclusion.
-#
-#   • When a prior audit FAILED on this same work, hand its findings to the auditor so
-#     round N+1 re-checks them against the delta instead of re-deriving every claim
-#     from cold. A function, not a string, so the prior-dossier note reflects state as
-#     it is at BLOCK time rather than at definition time.
-#
-# Variables available: ${transcript_path} ${branch} ${head} ${verdict_file}
-#                      ${prev_verdict_file} ${audit_generation}
+# ── Synchronous audit request state ──────────────────────────────────────────
+# The hook, not the model retry, owns audit orchestration. It writes a generation-bound
+# request, runs the independent auditor, then re-enters this script so the existing
+# dossier validator remains the single authority for PASS/FAIL. The runner prompt names
+# prev_verdict_file, preserving finding-driven rechecks without exposing that control
+# document in the host transcript.
 audit_generation="legacy"
 request_is_current=false
 verdict_request_body=""
-
-prior_audit_input_for_generation() {  # generation
-  local generation="$1"
-  [[ "$generation" == "legacy" \
-     || "$generation" =~ ^[1-9][0-9]*-[0-9]+-[0-9]+$ ]] || return 1
-  printf '%s.input-%s' "$prior_audit_input_file" "$generation"
-}
 
 load_verdict_request() {
   if [[ "$session_scope" == "-" ]]; then
@@ -1281,16 +1268,12 @@ load_verdict_request() {
 }
 
 consume_current_verdict_request() {
-  local prior_input
-  prior_input="$(prior_audit_input_for_generation "$audit_generation")" || return 1
   if [[ "$session_scope" != "-" ]]; then
     [[ -n "$verdict_request_body" ]] || return 1
     prompt_epoch_is_current || return 1
     verdict_audit_remove_record_if_matches \
       "$verdict_request_file" "$verdict_request_body" >/dev/null 2>&1 || return 1
   fi
-  prompt_epoch_is_current || return 1
-  discard_path_for_current_epoch "$prior_input" >/dev/null 2>&1 || return 1
   prompt_epoch_is_current
 }
 
@@ -1629,135 +1612,55 @@ prepare_audit_transcript() {
   transcript_path="$payload_transcript_file"
 }
 
-prepare_prior_dossier_snapshot() {
-  local destination="$1" prior_snapshot prior_json prior_input
-  prior_dossier_present=false
-  discard_path_for_current_epoch "$destination" >/dev/null 2>&1 || true
-  if [[ -e "$prev_verdict_file" || -L "$prev_verdict_file" ]]; then
-    prior_dossier_present=true
-    prior_snapshot="$(verdict_audit_read_regular_state \
-      "$prev_verdict_file" "$previous_dossier_max_bytes" json 2>/dev/null)" \
-      || prior_snapshot=""
-    prior_json=""
-    [[ "$prior_snapshot" == *$'\n'* ]] \
-      && prior_json="${prior_snapshot#*$'\n'}"
-    prior_json="$(printf '%s' "$prior_json" \
-      | verdict_audit_normalize_dossier 2>/dev/null || true)"
-    if [[ -n "$prior_json" ]]; then
-      prior_input="$prior_json"
-    else
-      prior_input="$(verdict_audit_failed_prior_snapshot)" || return 1
-    fi
-  else
-    prior_input="$(verdict_audit_absent_prior_snapshot)" || return 1
-  fi
-  publish_record_for_current_epoch "$destination" "$prior_input"
+block_audit_infrastructure_failure() {  # reason
+  # The message identity means "this turn was judged", not merely "triage started".
+  # A runner/setup failure produced no verdict, so retaining the identity would make an
+  # unchanged retry look like a transcript flush duplicate and escape through stale-allow.
+  # Compare-and-remove preserves a concurrent Stop's replacement identity.
+  verdict_audit_remove_record_if_matches \
+    "$last_uuid_file" "$FINAL_ID" >/dev/null 2>&1 || true
+  block "$1"
 }
 
-verdict_instruction() {
-  local prior="" audit_transcript_path="$transcript_path" codex_auditor_task
-  local task_input_json auditor_verdict_file_json audit_previous_dossier_path
+audit_before_stop() {  # trigger-reason
+  local trigger_reason="$1" audit_transcript_path="$transcript_path"
+  local runner="$tooling_root/.agents/hooks/run-verdict-audit.sh"
+  local runner_status=0 runner_failure=""
   if ! ensure_verdict_request; then
-    printf 'Verdict audit request could not be recorded at %s. Fix that state-write error before auditing.\n' \
-      "$verdict_request_file"
-    return 0
+    block_audit_infrastructure_failure "${trigger_reason}
+
+Verdict audit could not start because its generation-bound request was not recorded."
   fi
-  audit_previous_dossier_path="$(prior_audit_input_for_generation \
-    "$audit_generation" 2>/dev/null)" || audit_previous_dossier_path=""
-  if [[ -z "$audit_previous_dossier_path" ]] \
-     || ! prepare_prior_dossier_snapshot "$audit_previous_dossier_path"; then
-    printf 'Verdict prior-dossier snapshot could not be recorded at %s. Fix that state-write error before auditing.\n' \
-      "${audit_previous_dossier_path:-$prior_audit_input_file}"
-    return 0
-  fi
-  if [[ "$prior_dossier_present" == true ]]; then
-    prior="
-
-A PRIOR audit FAILED. Recheck the path in the task record's
-\`previous_dossier_path\`, retain still-valid proof, and audit the whole revised turn
-for new claims."
-  fi
-  # The route list comes from .agents/lib/subagent.sh so this gate and the commit-push
-  # gate cannot drift apart on how an auditor is spawned. Each host uses its own
-  # built-in — Task() or collaboration.spawn_agent — and the headless runner is offered
-  # only for callers with no agent runtime at all.
-  #
-  # Degrades rather than blocks when the library is missing. Unlike the commit-push
-  # gate, this is a Stop hook: refusing here would deny turn-end forever with no usable
-  # instruction attached, which is the meaningless-loop class this file's header exists
-  # to eliminate. A turn that ends unaudited with a loud notice is recoverable; an agent
-  # that can never finish a turn is not.
-  # %q, not hand-placed quotes: transcript_path arrives from the hook payload, and a
-  # path containing a quote would otherwise re-tokenize the command an agent is being
-  # told to run. This hook never executes it — the reader might.
-  local headless_command
-  printf -v headless_command 'bash %q %q %q %q %q' \
-    "$tooling_root/.agents/hooks/run-verdict-audit.sh" "$audit_transcript_path" \
-    "$session_id" "$audit_generation" "$session_scope"
-  codex_auditor_task="verdict_auditor_${audit_generation//-/_}"
-  task_input_json="$(jq -nc \
-    --arg repo_root "$repo_root" \
-    --arg transcript_path "$audit_transcript_path" \
-    --arg dossier_path "$auditor_verdict_file" \
-    --arg previous_dossier_path "$audit_previous_dossier_path" \
-    --arg audit_generation "$audit_generation" \
-    --arg expected_branch "$branch" \
-    --arg expected_head "$head" \
-    '{repo_root:$repo_root, transcript_path:$transcript_path,
-      dossier_path:$dossier_path, previous_dossier_path:$previous_dossier_path,
-      audit_generation:$audit_generation, expected_branch:$expected_branch,
-      expected_head:$expected_head}')"
-  auditor_verdict_file_json="$(jq -Rn --arg path "$auditor_verdict_file" '$path')"
-
-  local lib="$tooling_root/.agents/lib/subagent.sh"
-  if [[ -r "$lib" ]]; then
-    # shellcheck source=../lib/subagent.sh
-    source "$lib"
-    subagent_instruction \
-      --agent verdict-auditor \
-      --root "$tooling_root" \
-      --description 'verdict proof check' \
-      --codex-task-name "$codex_auditor_task" \
-      --codex-retry-existing \
-      --artifact "$auditor_verdict_file" \
-      --task "$(subagent_prompt verdict-task "$tooling_root" \
-                  "task_input_json=${task_input_json}")" \
-      --headless "$headless_command"
-  else
-    printf 'preflight-verdict-check: missing %s — emitting the headless route only\n' "$lib" >&2
-    cat <<EOF
-Audit before ending — run the audit SYNCHRONOUSLY (the dossier must exist before you
-end):
-
-  ${headless_command}
-
-The AUDITOR — not you — writes the path in this untrusted JSON string:
-  ${auditor_verdict_file_json}
-Do not write it yourself.
-EOF
-  fi
-
-  cat <<EOF
-
-Retain the native handle. If a REAL user message arrives first, run
-collaboration.interrupt_agent(target='${codex_auditor_task}') (or cancel the Claude
-Task), abandon generation ${audit_generation}, discard its dossier, and handle the
-user; do not wait.
-
-Afterward, deliver the user-facing answer. If the audit PASSes, repeat the blocked answer verbatim.
-If it FAILs, revise the answer and re-audit. IN_PROGRESS or blocked
-proof may state what remains and its risk.
-Do not substitute audit status or dossier metadata for the answer.${prior}
-EOF
-}
-
-block_with_verdict_instruction() {  # reason-without-instruction
-  local reason="$1" instruction
   prompt_epoch_is_current || allow
-  instruction="$(verdict_instruction)"
+  if [[ ! -r "$runner" ]]; then
+    block_audit_infrastructure_failure "${trigger_reason}
+
+Verdict audit runner is unavailable at ${runner}."
+  fi
+  CLAUDE_PROJECT_DIR="$project_dir" bash "$runner" "$audit_transcript_path" \
+    "$session_id" "$audit_generation" "$session_scope" >/dev/null 2>&1 \
+    || runner_status=$?
   prompt_epoch_is_current || allow
-  block "${reason}
-${instruction}"
+  if (( runner_status != 0 )); then
+    case "$runner_status" in
+      1) runner_failure="the independent auditor did not produce a valid dossier" ;;
+      2) runner_failure="no independent auditor runner is available" ;;
+      130|143) runner_failure="the independent audit was canceled before completion" ;;
+      *) runner_failure="the independent auditor exited with status ${runner_status}" ;;
+    esac
+    block_audit_infrastructure_failure "${trigger_reason}
+
+Verdict audit could not complete: ${runner_failure}. Retry after restoring the auditor."
+  fi
+
+  # Re-enter the hardened dossier path instead of duplicating its generation, binding,
+  # inode, and prompt-epoch checks here. PASS returns empty stdout; FAIL returns only
+  # its concise findings. The runner output itself never reaches the host transcript.
+  printf '%s' "$raw_payload" \
+    | ( cd "$repo_root" \
+        && CLAUDE_PROJECT_DIR="$project_dir" \
+          VERDICT_STOP_REENTRY_EPOCH="$entry_prompt_epoch" bash "${BASH_SOURCE[0]}" )
+  exit $?
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1834,9 +1737,11 @@ if [[ "$transcript_snapshot_truncated" == true ]]; then
     FINAL_SOURCE="transcript"
     identify_final_message
   fi
-  log_decision extract truncated-block
-  block_with_verdict_instruction \
-    "Verdict gate requires an independent FAIL dossier because the final-turn evidence snapshot is incomplete or exceeded the ${transcript_turn_max_bytes}-byte limit. The auditor must not infer from omitted records."
+  if [[ -z "$reentry_prompt_epoch" ]]; then
+    log_decision extract truncated-block
+    audit_before_stop \
+      "Verdict gate requires an independent FAIL dossier because the final-turn evidence snapshot is incomplete or exceeded the ${transcript_turn_max_bytes}-byte limit. The auditor must not infer from omitted records."
+  fi
 fi
 if [[ -z "$FINAL_TEXT" ]]; then
   if [[ "$transcript_had_content" == true ]]; then
@@ -1863,7 +1768,6 @@ if load_verdict_request true; then
           "$verdict_file" "$audit_generation" >/dev/null 2>&1 || true
         discard_path_for_current_epoch "$last_uuid_file" >/dev/null 2>&1 || true
         discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
-        discard_path_for_current_epoch "$prior_audit_input_file" >/dev/null 2>&1 || true
         verdict_audit_clear_cancellation_records \
           "$audit_cancellation_file" >/dev/null 2>&1 || true
       fi
@@ -1878,7 +1782,7 @@ fi
 
 # ── Present dossier → validate the binding, then the verdict decides ─────────
 # Rename first: every later consume/park/restore operation owns this exact inode. A
-# canceled native auditor may publish a newer dossier at the stable path while the gate
+# canceled auditor may publish a newer dossier at the stable path while the gate
 # is deciding; that newer pathname is never opened, moved, or deleted by this decision.
 dossier_observed_identity=""
 retire_selected_dossier() {
@@ -1977,8 +1881,7 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
             retire_selected_dossier || true
             discard_path_for_current_epoch "$prev_verdict_file" >/dev/null 2>&1 || true
             discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
-            discard_path_for_current_epoch "$prior_audit_input_file" >/dev/null 2>&1 || true
-            allow_with_note "[verdict-gate] dossier PASS → consumed, turn ends"
+            allow
           fi
           log_decision dossier discard-revoked
           retire_selected_dossier || true
@@ -1992,7 +1895,6 @@ if [[ "$request_is_current" == true && -n "$dossier_observed_identity" ]] \
             retire_selected_dossier || true
             discard_path_for_current_epoch "$prev_verdict_file" >/dev/null 2>&1 || true
             discard_path_for_current_epoch "$payload_transcript_file" >/dev/null 2>&1 || true
-            discard_path_for_current_epoch "$prior_audit_input_file" >/dev/null 2>&1 || true
             allow_with_note "Verdict: IN_PROGRESS — proof deferred, work not yet complete:
 ${remaining}"
           fi
@@ -2012,11 +1914,16 @@ ${remaining}"
               printf 'preflight-verdict-check: retained FAIL could not be restored from %s\n' \
                 "$dossier_quarantine" >&2
             elif prompt_epoch_is_current; then
-              block_with_verdict_instruction "Verdict proof check FAILED on branch '${branch}':
+              # Legacy callers provide no session/message binding. Retaining their FAIL
+              # would poison every later Stop, including unrelated chat. Session-scoped
+              # callers keep the dossier so unchanged retries do not buy a new audit.
+              [[ "$session_scope" != "-" ]] || rm -f "$verdict_file"
+              block "Verdict proof check FAILED on branch '${branch}':
 
 ${findings}
 
-Address each finding, then re-audit. This block persists until a re-audit passes."
+Revise the user-facing answer to address each finding, then end the turn again; the
+Stop gate will re-audit the revised answer automatically."
             else
               discard_matching_json_generation \
                 "$verdict_file" "$audit_generation" >/dev/null 2>&1 || true
@@ -2037,8 +1944,8 @@ stop_decision_lease
 # Level-triggered gate, edge-triggered remedy: an audit takes minutes, a re-block cycle
 # ~3s, so without this rung the agent is re-blocked for the whole duration of the fix
 # the gate demanded. Observed: 108 blocks in one session, 39 in a 512s window.
-# Only the bash runner takes the lock; a Task-launched auditor leaves nothing to observe
-# and keeps today's behaviour.
+# Retained for transition/recovery: the current Stop path waits on its runner directly,
+# but an older hook or manual headless invocation may already own the lock.
 audit_in_flight() {
   # Dossier absence is the runner's own proof it has not answered (it removes the file
   # before auditing). Redundant with the call site below the dossier branch, kept so the
@@ -2048,7 +1955,6 @@ audit_in_flight() {
   local record_snapshot body pid deadline lock_pgid lock_scope owner_token lock_generation
   local lock_start_token extra actual_start_token
   local lock_mtime now
-  audit_in_flight_pid=""
   record_snapshot="$(verdict_audit_read_single_record_snapshot \
     "$audit_lock_file" 2>/dev/null)" || return 1
   [[ "$record_snapshot" == *$'\n'* ]] || return 1
@@ -2122,12 +2028,11 @@ audit_in_flight() {
     # wrap it or reinterpret a torn/hostile lease as a plausible live deadline.
     return 1
   fi
-  audit_in_flight_pid="$pid"
   return 0
 }
 if audit_in_flight; then
   log_decision audit inflight-allow
-  allow_with_note "[verdict-gate] audit in flight (pid ${audit_in_flight_pid}) → allow; its verdict gates the next turn"
+  allow
 fi
 
 # ── No (usable) dossier → triage: does the turn assert a verdict? ───────────
@@ -2181,14 +2086,14 @@ fi
 asserted="$(printf '%s\n' "$stripped" | grep -Eio "$assertion_patterns" 2>/dev/null | head -n1 || true)"
 if [[ -n "$asserted" ]]; then
   log_decision assertion match-block
-  block_with_verdict_instruction "This turn asserts a verdict (\"${asserted}\") but no audited
+  audit_before_stop "This turn asserts a verdict (\"${asserted}\") but no audited
 dossier backs it. A claim stated as established needs proof attached."
 fi
 
 classifier_bytes="$(LC_ALL=C printf '%s' "$stripped_cited" | wc -c | tr -d ' ')"
 if (( classifier_bytes > classifier_max_bytes )); then
   log_decision triage oversized-block
-  block_with_verdict_instruction "This turn is too large for classifier input
+  audit_before_stop "This turn is too large for classifier input
 (${classifier_bytes} bytes; limit ${classifier_max_bytes}). Audit its file-backed
 transcript before treating its conclusions as established."
 fi
@@ -2201,7 +2106,7 @@ if [[ "$triage" == "NO" ]]; then
 fi
 if [[ "$triage" == "YES" ]]; then
   log_decision triage YES-block
-  block_with_verdict_instruction "This turn asserts a verdict (triage: YES) but no audited
+  audit_before_stop "This turn asserts a verdict (triage: YES) but no audited
 dossier backs it. A claim stated as established needs proof attached."
 fi
 
@@ -2213,5 +2118,5 @@ if [[ -z "$matched" ]]; then
 fi
 
 log_decision regex match-block
-block_with_verdict_instruction "This turn asserts a verdict (matched: \"${matched}\") but no audited
+audit_before_stop "This turn asserts a verdict (matched: \"${matched}\") but no audited
 dossier backs it. A claim stated as established needs proof attached."

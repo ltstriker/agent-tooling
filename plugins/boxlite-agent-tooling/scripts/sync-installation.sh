@@ -23,17 +23,24 @@ plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 spawn_refresh() {
   [[ "${AGENT_TOOLING_REFRESH:-1}" != "0" ]] || return 0
   [[ ! -e "$repo_root/.agent-tooling/hold" ]] || return 0
-  local common cache minutes
+  local common cache minutes refresh_pid
   common="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
   cache="$common/agent-tooling"
   [[ -d "$cache" ]] || return 0
   minutes="${AGENT_TOOLING_REFRESH_MINUTES:-15}"
-  [[ -z "$(find "$cache" -maxdepth 1 -name last-check -mmin "-$minutes" 2>/dev/null)" ]] || return 0
+  if [[ "$minutes" != "0" ]]; then
+    [[ -z "$(find "$cache" -maxdepth 1 -name last-check -mmin "-$minutes" 2>/dev/null)" ]] || return 0
+  fi
   # nohup + disown, not setsid: macOS ships no setsid. Redirecting both streams to a
   # file keeps git from waiting on an inherited pipe (same pattern as arm_pr_watch).
   nohup bash "$plugin_root/scripts/refresh-installation.sh" "$repo_root" \
     >> "$cache/refresh.log" 2>&1 &
-  disown 2>/dev/null || true
+  refresh_pid=$!
+  if [[ "${AGENT_TOOLING_REFRESH_WAIT:-0}" == "1" ]]; then
+    wait "$refresh_pid" || true
+  else
+    disown 2>/dev/null || true
+  fi
 }
 
 if "$plugin_root/scripts/verify-installation.sh" "$repo_root" >/dev/null 2>&1; then

@@ -2697,5 +2697,87 @@ check_eq "headless Claude request replaces ambient context within a hard budget"
 rm -rf "$R" "$BIN"
 
 echo
+echo "## Codex CLI fallback: a Codex-only host still has an independent runner"
+R="$(setup)"
+BIN="$(mktemp -d)"; CAP="$R/captured-codex-prompt.txt"; ARGS="$R/codex-args.txt"
+cat > "$BIN/codex" <<'FAKE_CODEX'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'codex-cli test\n'
+  exit 0
+fi
+printf '%s\n' "$@" > "$CODEX_ARGS_CAPTURE"
+cat > "$CODEX_PROMPT_CAPTURE"
+output_file=""; approval=""; sandbox=""; config_ignored=no; hooks_disabled=no
+previous=""
+for argument in "$@"; do
+  [[ "$previous" == "--output-last-message" ]] && output_file="$argument"
+  [[ "$previous" == "--ask-for-approval" ]] && approval="$argument"
+  [[ "$previous" == "--sandbox" ]] && sandbox="$argument"
+  [[ "$previous" == "--disable" && "$argument" == "hooks" ]] && hooks_disabled=yes
+  [[ "$argument" == "--ignore-user-config" ]] && config_ignored=yes
+  previous="$argument"
+done
+[[ -n "$output_file" && "$approval" == never && "$sandbox" == read-only \
+   && "$config_ignored" == yes && "$hooks_disabled" == yes ]] || exit 2
+printf '{"branch":"main","head":"h","tree_hash":"t","generation":"%s","verdict":"PASS","proof":[],"findings":[]}' \
+  "$VERDICT_AUDITOR_GENERATION" > "$output_file"
+FAKE_CODEX
+chmod +x "$BIN/codex"
+( cd "$R" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$R" \
+    CODEX_BIN="$BIN/codex" CODEX_ARGS_CAPTURE="$ARGS" CODEX_PROMPT_CAPTURE="$CAP" \
+    PATH="/opt/homebrew/bin:/usr/bin:/bin" bash "$RUNNER" "$R/transcript.jsonl" \
+      >/dev/null 2>&1 )
+codex_fallback_rc=$?
+codex_fallback_contract="rc=$codex_fallback_rc hooks=no config=no readonly=no capture=no ephemeral=no approval=no body=no frontmatter=no delivery=no"
+grep -qx -- '--disable' "$ARGS" 2>/dev/null && grep -qx -- 'hooks' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/hooks=no/hooks=yes}"
+grep -qx -- '--ignore-user-config' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/config=no/config=yes}"
+grep -qx -- 'read-only' "$ARGS" 2>/dev/null \
+  && ! grep -qx -- 'workspace-write' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/readonly=no/readonly=yes}"
+grep -qx -- '--output-last-message' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/capture=no/capture=yes}"
+grep -qx -- '--ephemeral' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/ephemeral=no/ephemeral=yes}"
+grep -qx -- 'never' "$ARGS" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/approval=no/approval=yes}"
+grep -q '^## Procedure' "$CAP" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/body=no/body=yes}"
+if ! grep -qE '^(name|description|tools|model|effort):' "$CAP" 2>/dev/null; then
+  codex_fallback_contract="${codex_fallback_contract/frontmatter=no/frontmatter=yes}"
+fi
+grep -q 'Do not write or modify any file' "$CAP" 2>/dev/null \
+  && grep -q 'but do not$' "$CAP" 2>/dev/null \
+  && grep -q 'temporary Git index' "$CAP" 2>/dev/null \
+  && grep -qE '^  [0-9a-f]{40}([0-9a-f]{24})?$' "$CAP" 2>/dev/null \
+  && grep -q 'do not create another worktree' "$CAP" 2>/dev/null \
+  && grep -q 'blocked-proof form' "$CAP" 2>/dev/null \
+  && grep -q 'return ONLY the dossier JSON object' "$CAP" 2>/dev/null \
+  && codex_fallback_contract="${codex_fallback_contract/delivery=no/delivery=yes}"
+check_eq "Codex-only fallback is read-only and returns JSON through a host-owned channel" \
+  "$codex_fallback_contract" \
+  "rc=0 hooks=yes config=yes readonly=yes capture=yes ephemeral=yes approval=yes body=yes frontmatter=yes delivery=yes"
+
+D="$(mktemp -d)"
+git -C "$D" init -q
+mkdir -p "$D/.agents/state"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"tests pass"}]}}\n' \
+  > "$D/transcript.jsonl"
+( cd "$D" && env -u VERDICT_AUDITOR_CMD CLAUDE_PROJECT_DIR="$D" \
+    CODEX_BIN="$BIN/codex" CODEX_ARGS_CAPTURE="$ARGS" CODEX_PROMPT_CAPTURE="$CAP" \
+    PATH="/opt/homebrew/bin:/usr/bin:/bin" bash "$RUNNER" "$D/transcript.jsonl" \
+      >/dev/null 2>"$D/error" )
+codex_missing_head_rc=$?
+codex_missing_head_error=no
+grep -q 'could not capture the working-tree hash' "$D/error" 2>/dev/null \
+  && codex_missing_head_error=yes
+check_eq "Codex fallback fails closed when the parent cannot bind the working tree" \
+  "rc=$codex_missing_head_rc error=$codex_missing_head_error" "rc=1 error=yes"
+rm -rf "$D"
+rm -rf "$R" "$BIN"
+
+echo
 echo "RESULT: $pass passed, $fail failed"
 exit $(( fail > 0 ? 1 : 0 ))
