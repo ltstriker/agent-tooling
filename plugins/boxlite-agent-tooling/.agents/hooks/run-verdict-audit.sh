@@ -16,7 +16,10 @@
 #      must leave a dossier behind. Per-harness config, tests stub it.
 #   2. claude CLI — headless with the auditor spec as system prompt, tools
 #      whitelisted, hooks disabled (no nested gates), 10-minute cap.
-#   3. Neither → exit 2 with instructions (the caller sees why).
+#   3. Codex CLI — read-only, hooks disabled, ephemeral, same timeout. Codex writes
+#      only its final response through the host-owned --output-last-message channel;
+#      the parent runner validates and publishes those bytes.
+#   4. Neither → exit 2 with instructions (the caller sees why).
 #
 # Exit codes: 0 dossier written · 1 audit ran but no dossier · 2 no runner available ·
 #             130 canceled by a newer user prompt/INT · 143 canceled by TERM.
@@ -738,6 +741,44 @@ strip_frontmatter() {  # $1 = spec file
   awk 'BEGIN{fm=0} NR==1 && /^---$/{fm=1; next} fm==1 && /^---$/{fm=2; next} fm!=1' "$1"
 }
 
+find_codex_bin() {
+  if [[ -n "${CODEX_BIN:-}" ]]; then
+    [[ -x "$CODEX_BIN" ]] || return 1
+    "$CODEX_BIN" --version >/dev/null 2>&1 || return 1
+    printf '%s\n' "$CODEX_BIN"
+    return 0
+  fi
+
+  local candidate from_path=""
+  from_path="$(command -v codex 2>/dev/null || true)"
+  for candidate in "$from_path" /Applications/Codex.app/Contents/Resources/codex; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    if "$candidate" --version >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Codex's read-only sandbox deliberately cannot create the throwaway Git index used by
+# the auditor procedure. Capture that one write-requiring value in the parent, before
+# launch, so the auditor can keep the whole workspace read-only without guessing the
+# dossier binding.
+compute_audit_tree_hash() {
+  local index_file tree_hash="" command_status=0
+  index_file="$(mktemp)" || return 1
+  GIT_INDEX_FILE="$index_file" git -C "$project_dir" read-tree HEAD >/dev/null 2>&1 \
+    && GIT_INDEX_FILE="$index_file" git -C "$project_dir" add -A >/dev/null 2>&1 \
+    && tree_hash="$(GIT_INDEX_FILE="$index_file" \
+         git -C "$project_dir" write-tree 2>/dev/null)" \
+    || command_status=$?
+  rm -f "$index_file"
+  (( command_status == 0 )) && [[ "$tree_hash" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] \
+    || return 1
+  printf '%s\n' "$tree_hash"
+}
+
 # The prompt is a document, not a string literal: .agents/prompts/verdict-runner.md.
 # Loaded through the shared library so this runner and the Stop gate that offers the
 # in-agent route cannot drift apart on what "proven" means.
@@ -877,7 +918,8 @@ publish_audit_group_completion() {  # command-status
 }
 
 run_in_audit_group() {
-  local runner_pid="$$" command_status="" monitor_status=0
+  local command_prompt="$1" runner_pid="$$" command_status="" monitor_status=0
+  shift
   # Job control gives this one background sentinel a fresh process group on Bash 3,
   # available on both macOS and Linux. The sentinel runs and reaps the model pipeline,
   # publishes completion over a parent-owned unlinked FIFO, then remains alive so
@@ -906,7 +948,7 @@ run_in_audit_group() {
     if ! cd "$project_dir"; then
       command_status=125
     else
-      printf '%s' "$audit_prompt" | "$@" 8>&- 9>&-
+      printf '%s' "$command_prompt" | "$@" 8>&- 9>&-
       command_status=$?
     fi
     if ! publish_audit_group_completion "$command_status"; then
@@ -965,6 +1007,7 @@ if [[ -n "${VERDICT_AUDITOR_CMD:-}" ]]; then
   remove_owned_verdict
   rm -f "$audit_output_file"
   if ! run_in_audit_group \
+      "$audit_prompt" \
       perl -e 'alarm shift; exec @ARGV' "$audit_timeout_seconds" \
         bash -c "$VERDICT_AUDITOR_CMD"; then
     rm -f "$audit_output_file"
@@ -980,6 +1023,7 @@ elif command -v claude >/dev/null 2>&1 && [[ -r "$spec_file" ]]; then
   # perl alarm = portable timeout; disableAllHooks so the audit run cannot recurse
   # into this repo's own gates.
   if ! run_in_audit_group \
+      "$audit_prompt" \
       perl -e 'alarm shift; exec @ARGV' "$audit_timeout_seconds" \
         claude -p --model "$auditor_model" \
           --append-system-prompt "$spec_body" \
@@ -990,11 +1034,54 @@ elif command -v claude >/dev/null 2>&1 && [[ -r "$spec_file" ]]; then
     echo "run-verdict-audit.sh: auditor process group ended without a usable completion" >&2
     exit 1
   fi
+elif codex_bin="$(find_codex_bin)" && [[ -r "$spec_file" ]]; then
+  audit_started=true
+  remove_owned_verdict
+  rm -f "$audit_output_file"
+  spec_body="$(strip_frontmatter "$spec_file")"
+  if ! codex_tree_hash="$(compute_audit_tree_hash)"; then
+    remove_owned_verdict while-current
+    printf 'run-verdict-audit.sh: could not capture the working-tree hash for the read-only Codex auditor.\n' >&2
+    exit 1
+  fi
+  codex_prompt="${spec_body}
+
+${audit_prompt}
+
+READ-ONLY DELIVERY OVERRIDE FOR THIS CODEX INVOCATION:
+- Do not write or modify any file, including verdict_file.
+- In procedure step 2, run the two read-only branch and HEAD commands, but do not
+  create the temporary Git index. Use this parent-captured tree_hash exactly:
+  ${codex_tree_hash}
+- For Tier-2, inspect any existing isolated red-to-green evidence in the transcript;
+  do not create another worktree. If required evidence is absent, use step 5's
+  blocked-proof form and state that residual risk.
+- Replace procedure steps 6 and 7 with: return ONLY the dossier JSON object as your
+  final response, with no Markdown fence or commentary.
+- The Codex host captures that final response into a generation-owned staging file.
+  The parent runner alone validates and publishes the authoritative dossier."
+  if ! run_in_audit_group \
+      "$codex_prompt" \
+      perl -e 'alarm shift; exec @ARGV' "$audit_timeout_seconds" \
+        "$codex_bin" --ask-for-approval never \
+          exec \
+          --disable hooks \
+          --ignore-user-config \
+          --sandbox read-only \
+          --cd "$project_dir" \
+          --ephemeral \
+          --output-last-message "$audit_output_file" \
+          - >/dev/null 2>&1; then
+    rm -f "$audit_output_file"
+    remove_owned_verdict while-current
+    echo "run-verdict-audit.sh: auditor process group ended without a usable completion" >&2
+    exit 1
+  fi
 else
   cat >&2 <<'EOF'
 run-verdict-audit.sh: no auditor runner available.
 Set VERDICT_AUDITOR_CMD (stdin = audit prompt; it must write the requested dossier path)
-or install the claude CLI. As a last resort, execute the procedure in
+or install the Claude or Codex CLI. As a last resort, execute the procedure in
 .claude/agents/verdict-auditor.md with any capable model and have IT write the dossier.
 EOF
   exit 2
