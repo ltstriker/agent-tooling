@@ -346,7 +346,9 @@ block() {
   # env, so the Codex registration in .codex/hooks.json and any direct invocation
   # got a non-blocking note instead. Set VERDICT_GATE_HARD_BLOCK=0 to roll back.
   if [[ "${VERDICT_GATE_HARD_BLOCK:-1}" != "0" ]]; then
-    jq -nc --arg r "$1" '{decision:"block", reason:$r}'
+    # The host still feeds reason back to the model, but must not render that
+    # control prompt as Hook feedback in the user's main transcript.
+    jq -nc --arg r "$1" '{decision:"block", reason:$r, suppressOutput:true}'
   else
     jq -nc --arg r "$1" '{continue:true, systemMessage:("[verdict-gate] " + $r)}'
   fi

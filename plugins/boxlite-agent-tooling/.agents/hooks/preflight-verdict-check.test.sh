@@ -428,9 +428,16 @@ else
   fail=$((fail+1)); printf '  FAIL  %s\n' "native verdict instruction lacks a fresh cancelable handle"
 fi
 
-# Codex renders a Stop denial as hook feedback and retries with that feedback in the
-# user slot. The retry must still deliver the answer the user asked for; an audit status
-# or dossier path is workflow metadata, not a replacement conclusion.
+if printf '%s' "$out" \
+    | jq -e '.decision == "block" and .suppressOutput == true' >/dev/null 2>&1; then
+  pass=$((pass+1)); printf '  PASS  %s\n' "hard Stop feedback stays out of the main transcript"
+else
+  fail=$((fail+1)); printf '  FAIL  %s\n' "hard Stop feedback is exposed in the main transcript"
+fi
+
+# Codex retries the model with the Stop reason even when suppressOutput keeps that
+# control prompt out of the main transcript. The retry must still deliver the answer
+# the user asked for; audit status or dossier paths are workflow metadata, not answers.
 if [[ "$native_reason" == *"If the audit PASSes, repeat the blocked answer verbatim"* \
    && "$native_reason" == *"If it FAILs, revise the answer"* \
    && "$native_reason" == *"Do not substitute audit status or dossier metadata"* ]]; then
