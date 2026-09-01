@@ -33,10 +33,10 @@ fi
 cat <<'EOF'
 REPLY SHAPE:
 - <=80 prose words; exempt code, visuals, tables, paths, uncertainty, risk, failing tests.
-- No preamble, recap, praise, repetition, or closing offer.
+- Any subject: whenever possible, use a brief concrete example tied to the general rule; omit one only when no useful example applies.
 - Prefer a renderable diagram, graph, image, or table over prose when clearer.
+- No preamble, recap, praise, repetition, or closing offer.
 - Visualize relationships or 3+ entities. Code: `fn (Type, file:LOC) - role`; one Key line.
-- Any subject: if abstract, unfamiliar, or unclear, use a brief concrete example tied to the general rule; skip it when unhelpful.
 - Explicit depth requests lift the cap; bare why does not.
 - Non-trivial work: follow repository Workflow; research prior art before design.
 EOF
